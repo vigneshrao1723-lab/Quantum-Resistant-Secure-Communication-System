@@ -1,27 +1,55 @@
 """
-Basic TCP Client
-Quantum-Resistant Secure Communication System
+Multi-Client Chat Client with Usernames
 """
 
 import socket
+import threading
+
 from config import HOST, PORT, BUFFER_SIZE, ENCODING
 
 
-def start_client():
-    """Connect to the server and send messages."""
+def receive_messages(client_socket):
+    """
+    Receive messages from the server.
+    """
+    while True:
+        try:
+            message = client_socket.recv(BUFFER_SIZE).decode(ENCODING)
 
-    # Create a TCP socket
+            print(f"\n{message}")
+            print("You: ", end="", flush=True)
+
+        except:
+            print("\nDisconnected from server.")
+            break
+
+
+def start_client():
+
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    # Connect to the server
     client_socket.connect((HOST, PORT))
 
     print("=" * 50)
-    print(" Connected to Secure Communication Server")
-    print(" Type 'exit' to disconnect.")
+    print(" Secure Communication Client")
     print("=" * 50)
 
+    # Ask for username
+    username = input("Enter your username: ")
+
+    # Send username to server
+    client_socket.send(username.encode(ENCODING))
+
+    receive_thread = threading.Thread(
+        target=receive_messages,
+        args=(client_socket,),
+        daemon=True
+    )
+
+    receive_thread.start()
+
     while True:
+
         message = input("You: ")
 
         if message.lower() == "exit":
@@ -30,7 +58,6 @@ def start_client():
         client_socket.send(message.encode(ENCODING))
 
     client_socket.close()
-    print("Disconnected from server.")
 
 
 if __name__ == "__main__":

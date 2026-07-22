@@ -1,47 +1,101 @@
 """
-Basic TCP Server
+Multi-Client Broadcast Server
 Quantum-Resistant Secure Communication System
 """
 
 import socket
+import threading
+
 from config import HOST, PORT, BUFFER_SIZE, ENCODING
 
+# List to store connected clients
+clients = {}
+
+def broadcast(message, sender_socket):
+    """
+    Send a message to every connected client except the sender.
+    """
+
+    for client in clients:
+
+        if client != sender_socket:
+
+            try:
+                client.send(message.encode(ENCODING))
+
+            except:
+
+                client.close()
+
+                del clients[client]
+
+def handle_client(client_socket, client_address):
+
+    try:
+
+        username = client_socket.recv(BUFFER_SIZE).decode(ENCODING)
+
+        clients[client_socket] = username
+
+        print(f"[CONNECTED] {username} ({client_address})")
+
+        broadcast(f"{username} joined the chat.", client_socket)
+
+        while True:
+
+            message = client_socket.recv(BUFFER_SIZE).decode(ENCODING)
+
+            if not message:
+                break
+
+            print(f"{username}: {message}")
+
+            broadcast(f"{username}: {message}", client_socket)
+
+    except Exception as e:
+
+        print(e)
+
+    finally:
+
+        if client_socket in clients:
+
+            username = clients[client_socket]
+
+            del clients[client_socket]
+
+            broadcast(f"{username} left the chat.", client_socket)
+
+        client_socket.close()
+
+        print(f"[DISCONNECTED] {client_address}")
 
 def start_server():
-    """Start the TCP server."""
 
-    # Create a TCP socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    # Bind the socket to host and port
     server_socket.bind((HOST, PORT))
 
-    # Listen for incoming connections
-    server_socket.listen(1)
+    server_socket.listen()
 
-    print("=" * 50)
-    print(" Secure Communication Server Started")
+    print("=" * 60)
+    print(" Quantum-Resistant Secure Communication Server")
     print(f" Listening on {HOST}:{PORT}")
-    print(" Waiting for client connection...")
-    print("=" * 50)
-
-    # Accept a client connection
-    client_socket, client_address = server_socket.accept()
-
-    print(f"\n Client connected: {client_address}")
+    print(" Waiting for clients...")
+    print("=" * 60)
 
     while True:
-        message = client_socket.recv(BUFFER_SIZE).decode(ENCODING)
 
-        if not message:
-            break
+        client_socket, client_address = server_socket.accept()
 
-        print(f"Client: {message}")
+        thread = threading.Thread(
+            target=handle_client,
+            args=(client_socket, client_address)
+        )
 
-    print("Client disconnected.")
+        thread.start()
 
-    client_socket.close()
-    server_socket.close()
+        print(f"Active Connections: {len(clients)}")
 
 
 if __name__ == "__main__":
