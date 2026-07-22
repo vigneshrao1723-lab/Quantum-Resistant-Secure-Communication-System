@@ -5,11 +5,17 @@ Quantum-Resistant Secure Communication System
 
 import socket
 import threading
+import sys
+from pathlib import Path
+
 
 from config import HOST, PORT, BUFFER_SIZE, ENCODING
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from logger_config import setup_logger
 
 # List to store connected clients
 clients = {}
+logger = setup_logger("server_logger", "server.log")
 
 def broadcast(message, sender_socket):
     """
@@ -38,6 +44,7 @@ def handle_client(client_socket, client_address):
         clients[client_socket] = username
 
         print(f"[CONNECTED] {username} ({client_address})")
+        logger.info(f"{username} connected")
 
         broadcast(f"{username} joined the chat.", client_socket)
 
@@ -49,6 +56,7 @@ def handle_client(client_socket, client_address):
                 break
 
             print(f"{username}: {message}")
+            logger.info(f"{username}: {message}")
 
             broadcast(f"{username}: {message}", client_socket)
 
@@ -69,6 +77,7 @@ def handle_client(client_socket, client_address):
         client_socket.close()
 
         print(f"[DISCONNECTED] {client_address}")
+        logger.info(f"{username} disconnected")
 
 def start_server():
 
@@ -82,6 +91,7 @@ def start_server():
     print(" Quantum-Resistant Secure Communication Server")
     print(f" Listening on {HOST}:{PORT}")
     print(" Waiting for clients...")
+    logger.info(f"Server started on {HOST}:{PORT}")
     print("=" * 60)
 
     while True:
