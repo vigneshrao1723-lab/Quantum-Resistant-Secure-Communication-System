@@ -8,78 +8,115 @@ import threading
 import sys
 from pathlib import Path
 
-
-from config import HOST, PORT, BUFFER_SIZE, ENCODING
+from config import HOST, PORT
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from logger_config import setup_logger
 
-# List to store connected clients
+from logger_config import setup_logger
+from utils.protocol import (
+    create_chat_packet,
+    create_join_packet,
+    create_leave_packet
+)
+from utils.network import send_message, receive_message
+
+# Dictionary to store connected clients
 clients = {}
+
 logger = setup_logger("server_logger", "server.log")
+
 
 def broadcast(message, sender_socket):
     """
     Send a message to every connected client except the sender.
     """
 
+    disconnected_clients = []
+
     for client in clients:
 
         if client != sender_socket:
 
             try:
-                client.send(message.encode(ENCODING))
+                send_message(client, message)
 
-            except:
+            except Exception:
 
-                client.close()
+                disconnected_clients.append(client)
 
-                del clients[client]
+    # Remove disconnected clients safely
+    for client in disconnected_clients:
+
+        client.close()
+
+        if client in clients:
+            del clients[client]
+
 
 def handle_client(client_socket, client_address):
+    """
+    Handle communication with a connected client.
+    """
+
+    username = None
 
     try:
 
-        username = client_socket.recv(BUFFER_SIZE).decode(ENCODING)
+        # Receive username
+        username = receive_message(client_socket)
+
+        if not username:
+            return
 
         clients[client_socket] = username
 
         print(f"[CONNECTED] {username} ({client_address})")
         logger.info(f"{username} connected")
 
-        broadcast(f"{username} joined the chat.", client_socket)
+        # Notify other clients
+        join_packet = create_join_packet(username)
+        broadcast(join_packet, client_socket)
 
         while True:
 
-            message = client_socket.recv(BUFFER_SIZE).decode(ENCODING)
+            message = receive_message(client_socket)
 
             if not message:
                 break
 
-            print(f"{username}: {message}")
-            logger.info(f"{username}: {message}")
+            print(f"{username}: [Encrypted Message]")
+            logger.info(f"{username}: [Encrypted Message]")
 
-            broadcast(f"{username}: {message}", client_socket)
+            chat_packet = create_chat_packet(username, message)
+
+            broadcast(chat_packet, client_socket)
 
     except Exception as e:
 
-        print(e)
+        print(f"[ERROR] {e}")
+        logger.error(str(e))
 
     finally:
 
         if client_socket in clients:
 
-            username = clients[client_socket]
+            username = clients.pop(client_socket)
 
-            del clients[client_socket]
+            leave_packet = create_leave_packet(username)
 
-            broadcast(f"{username} left the chat.", client_socket)
+            broadcast(leave_packet, client_socket)
 
         client_socket.close()
 
         print(f"[DISCONNECTED] {client_address}")
-        logger.info(f"{username} disconnected")
+
+        if username:
+            logger.info(f"{username} disconnected")
+
 
 def start_server():
+    """
+    Start the TCP server.
+    """
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -91,8 +128,9 @@ def start_server():
     print(" Quantum-Resistant Secure Communication Server")
     print(f" Listening on {HOST}:{PORT}")
     print(" Waiting for clients...")
-    logger.info(f"Server started on {HOST}:{PORT}")
     print("=" * 60)
+
+    logger.info(f"Server started on {HOST}:{PORT}")
 
     while True:
 
