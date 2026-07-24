@@ -4,13 +4,42 @@ Quantum-Resistant Secure Communication System
 Client Entry Point
 """
 
-import threading
-
-from config import HOST, PORT
 from client.session import ClientSession
-from client.receiver import receive_messages
 from client.sender import send_messages
-from utils.network import send_message
+
+from utils.console_ui import (
+    display_chat,
+    display_system,
+    display_warning,
+    display_online_users,
+)
+
+
+def terminal_message_handler(sender, message):
+    """
+    Handle incoming messages for the terminal UI.
+    """
+
+    if sender == "system":
+        display_system(message)
+    else:
+        display_chat(sender, message)
+
+
+def terminal_users_handler(users):
+    """
+    Update the terminal UI with online users.
+    """
+
+    display_online_users(users)
+
+
+def terminal_error_handler(message):
+    """
+    Display warnings/errors in the terminal UI.
+    """
+
+    display_warning(message)
 
 
 def start_client():
@@ -18,56 +47,68 @@ def start_client():
     Start the secure chat client.
     """
 
-    # Create client session
+    # ---------------------------------
+    # Create Client Session
+    # ---------------------------------
     session = ClientSession()
 
-    # Connect to server
-    session.client_socket.connect((HOST, PORT))
-
-    session.logger.info("Connected to server")
+    # ---------------------------------
+    # Register Terminal Callbacks
+    # ---------------------------------
+    session.on_message = terminal_message_handler
+    session.on_users_changed = terminal_users_handler
+    session.on_error = terminal_error_handler
 
     print("=" * 50)
     print(" Secure Communication Client")
     print("=" * 50)
 
-    # Username
-    session.username = input("Enter your username: ").strip()
-
-    if not session.username:
-        session.username = "Anonymous"
-
-    session.logger.info(f"Username: {session.username}")
-
-    # Send username
-    send_message(
-        session.client_socket,
-        session.username
-    )
-
-    # Start receiver thread
-    receiver_thread = threading.Thread(
-        target=receive_messages,
-        args=(session,)
-    )
-
-    receiver_thread.start()
-
-    # Start sender
-    send_messages(session)
-
-    # Shutdown
-    session.logger.info("Closing connection...")
-
     try:
-        session.client_socket.shutdown(2)
-    except OSError:
-        pass
 
-    session.client_socket.close()
+        # ---------------------------------
+        # Connect to Server
+        # ---------------------------------
+        session.connect()
 
-    receiver_thread.join(timeout=2)
+        # ---------------------------------
+        # Login
+        # ---------------------------------
+        username = input("Enter your username: ")
+        session.login(username)
 
-    print("\nDisconnected from server.")
+        # ---------------------------------
+        # Exchange RSA Public Key
+        # ---------------------------------
+        session.send_public_key()
+
+        # ---------------------------------
+        # Start Receiver
+        # ---------------------------------
+        session.start_receiver()
+
+        # ---------------------------------
+        # Start Sender
+        # ---------------------------------
+        send_messages(session)
+
+    except KeyboardInterrupt:
+
+        print("\nShutting down client...")
+
+    except Exception as error:
+
+        session.logger.exception(
+            f"Client Error: {error}"
+        )
+
+    finally:
+
+        # ---------------------------------
+        # Disconnect
+        # ---------------------------------
+        session.disconnect()
+
+        print("\nDisconnected from server.")
 
 
 if __name__ == "__main__":

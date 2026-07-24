@@ -12,15 +12,23 @@ class AESCipher:
         """
         Initialize the AES cipher.
 
-        Module 4:
-        Use a temporary shared 256-bit key.
-        This will later be replaced by RSA/Kyber key exchange.
+        If no key is supplied, use the temporary shared key.
+        This fallback will be removed after RSA session-key
+        exchange is fully implemented.
         """
+
         if key is None:
-            # 32-byte (256-bit) shared key
-            self.key = b"12345678901234567890123456789012"
-        else:
-            self.key = key
+            key = b"12345678901234567890123456789012"
+
+        if not isinstance(key, bytes):
+            raise TypeError("AES key must be bytes.")
+
+        if len(key) != 32:
+            raise ValueError(
+                "AES-256 key must be exactly 32 bytes."
+            )
+
+        self.key = key
 
     def encrypt(self, plaintext):
         """
@@ -29,15 +37,24 @@ class AESCipher:
         Returns:
             Base64 encoded string containing IV + Ciphertext.
         """
-        cipher = AES.new(self.key, AES.MODE_CBC)
+
+        cipher = AES.new(
+            self.key,
+            AES.MODE_CBC
+        )
 
         ciphertext = cipher.encrypt(
-            pad(plaintext.encode("utf-8"), AES.block_size)
+            pad(
+                plaintext.encode("utf-8"),
+                AES.block_size
+            )
         )
 
         encrypted_data = cipher.iv + ciphertext
 
-        return base64.b64encode(encrypted_data).decode("utf-8")
+        return base64.b64encode(
+            encrypted_data
+        ).decode("utf-8")
 
     def decrypt(self, encrypted_text):
         """
@@ -46,12 +63,19 @@ class AESCipher:
         Returns:
             Original plaintext string.
         """
-        encrypted_data = base64.b64decode(encrypted_text)
+
+        encrypted_data = base64.b64decode(
+            encrypted_text
+        )
 
         iv = encrypted_data[:16]
         ciphertext = encrypted_data[16:]
 
-        cipher = AES.new(self.key, AES.MODE_CBC, iv)
+        cipher = AES.new(
+            self.key,
+            AES.MODE_CBC,
+            iv
+        )
 
         plaintext = unpad(
             cipher.decrypt(ciphertext),

@@ -1,0 +1,47 @@
+﻿Quantum-Resistant-Secure-Communication-System/
+├── benchmark/
+├── client/
+│   ├── client.py
+│   ├── receiver.py
+│   ├── sender.py
+│   └── session.py
+├── crypto/
+│   ├── aes.py
+│   ├── key_manager.py
+│   ├── kyber.py
+│   └── rsa.py
+├── database/
+├── docs/
+├── gui/
+│   ├── chat_window.py
+│   ├── input_bar.py
+│   ├── login_window.py
+│   ├── main_window.py
+│   ├── message_widget.py
+│   ├── online_users_widget.py
+│   ├── status_bar.py
+│   ├── styles.py
+│   └── resources/
+│       └── icons/
+├── logs/
+├── screenshots/
+├── server/
+│   ├── broadcaster.py
+│   ├── client_handler.py
+│   ├── server_state.py
+│   └── server.py
+├── tests/
+│   ├── terminal_ui_test.py
+│   └── test_aes.py
+├── utils/
+│   ├── console_ui.py
+│   ├── helpers.py
+│   ├── network.py
+│   ├── protocol.py
+│   └── terminal_ui.py
+├── config.py
+├── logger_config.py
+├── main.py
+├── README.md
+├── requirements.txt
+└── structure.txt

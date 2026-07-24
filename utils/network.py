@@ -5,26 +5,34 @@ Provides reliable send/receive functions using
 length-prefixed TCP messages.
 """
 
+import json
 import struct
 
 
 def send_message(sock, message):
     """
-    Send a message with a 4-byte length prefix.
+    Send a JSON packet with a 4-byte length prefix.
     """
+
+    # Convert dictionary to JSON string
+    if isinstance(message, dict):
+        message = json.dumps(message)
+
     data = message.encode("utf-8")
-    length = struct.pack("!I", len(data))  # 4-byte unsigned integer (network byte order)
+
+    length = struct.pack("!I", len(data))
+
     sock.sendall(length + data)
 
 
 def receive_message(sock):
     """
-    Receive a complete length-prefixed message.
+    Receive a complete JSON packet.
 
     Returns:
-        Decoded string, or None if the connection is closed.
+        dict, string or None
     """
-    # Read the 4-byte length header
+
     header = recvall(sock, 4)
 
     if not header:
@@ -32,22 +40,30 @@ def receive_message(sock):
 
     length = struct.unpack("!I", header)[0]
 
-    # Read the actual message
     data = recvall(sock, length)
 
     if not data:
         return None
 
-    return data.decode("utf-8")
+    message = data.decode("utf-8")
+
+    # Try to convert JSON back into a dictionary
+    try:
+        return json.loads(message)
+    except json.JSONDecodeError:
+        # Username and other plain strings remain strings
+        return message
 
 
 def recvall(sock, n):
     """
     Receive exactly n bytes from the socket.
     """
+
     data = b""
 
     while len(data) < n:
+
         packet = sock.recv(n - len(data))
 
         if not packet:
