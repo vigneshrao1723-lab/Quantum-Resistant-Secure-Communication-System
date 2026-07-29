@@ -1,57 +1,101 @@
-# Quantum-Resistant Secure Communication System
+# 🔐 Quantum-Resistant Secure Communication System
 
-A secure multi-client communication system developed as a Final Year Project using Python. The project combines classical cryptography with Post-Quantum Cryptography (PQC) to demonstrate secure communication against both classical and future quantum computing attacks.
+> A secure multi-client chat application built with Python that demonstrates modern cryptographic communication using RSA, AES-256, and a modular architecture designed for Post-Quantum Cryptography integration.
 
----
-
-## Project Overview
-
-This project implements a client-server communication system that supports multiple users communicating securely over a network. The system is being developed in multiple modules, beginning with TCP socket communication and gradually integrating encryption, logging, benchmarking, and post-quantum cryptographic algorithms.
-
-The final implementation will support both traditional RSA-based key exchange and quantum-resistant Kyber key encapsulation, enabling performance comparison between classical and post-quantum approaches.
+![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)
+![PySide6](https://img.shields.io/badge/PySide6-GUI-green.svg)
+![AES-256](https://img.shields.io/badge/AES--256-Secure-orange.svg)
+![RSA](https://img.shields.io/badge/RSA-Key%20Exchange-red.svg)
+![Status](https://img.shields.io/badge/Status-Working-success.svg)
 
 ---
 
-## Features
+# 📖 Overview
 
-### Completed
+The **Quantum-Resistant Secure Communication System** is a desktop-based secure messaging application developed as a Final Year Computer Science Engineering Project.
 
-- Multi-client TCP socket communication
-- Username-based chat system
-- Professional server logging
-- Professional client logging
-- Modular project architecture
-- Git version control
-- GitHub integration
+The application provides encrypted communication between multiple clients over a TCP network using:
 
-### Upcoming
+- RSA Public Key Cryptography
+- AES-256 Symmetric Encryption
+- Secure Session Key Exchange
+- Multi-client Architecture
+- Real-time Online User Synchronization
 
-- AES-256 encrypted messaging
-- RSA secure key exchange
-- Kyber Post-Quantum Key Exchange
-- Secure session key management
-- Graphical User Interface (PyQt6)
-- Performance benchmarking
-- Security analysis
-- End-to-End Encryption
-- Final documentation and report
+The project is designed with a modular cryptographic architecture, making it easy to replace RSA with **Kyber (ML-KEM)** to achieve Post-Quantum Security.
 
 ---
 
-## Project Structure
+# ✨ Features
+
+## 🔑 Secure Authentication
+
+- Username-based login
+- Automatic client registration
+- Multi-client support
+
+---
+
+## 🔐 Secure Cryptography
+
+- RSA Public Key Exchange
+- AES-256 Encrypted Messaging
+- Automatic Secure Session Establishment
+- Modular Crypto Layer
+
+---
+
+## 💬 Real-Time Chat
+
+- Private one-to-one messaging
+- Automatic online user updates
+- Join/Leave notifications
+- Real-time message delivery
+
+---
+
+## 🖥️ Modern GUI
+
+Built using **PySide6 (Qt for Python)**
+
+Features include:
+
+- Login Window
+- Chat Window
+- Online Users Panel
+- Secure Message View
+- Status Bar
+- Dark Theme UI
+
+---
+
+## 📊 Logging
+
+Separate logs for
+
+- Client
+- Server
+
+Useful for debugging and monitoring.
+
+---
+
+# 🏗️ Project Structure
 
 ```
 Quantum-Resistant-Secure-Communication-System/
 │
 ├── client/
 │   ├── client.py
-│   ├── config.py
-│   └── __init__.py
+│   ├── receiver.py
+│   ├── sender.py
+│   └── session.py
 │
 ├── server/
 │   ├── server.py
-│   ├── config.py
-│   └── __init__.py
+│   ├── broadcaster.py
+│   ├── client_handler.py
+│   └── server_state.py
 │
 ├── crypto/
 │   ├── aes.py
@@ -59,86 +103,78 @@ Quantum-Resistant-Secure-Communication-System/
 │   ├── kyber.py
 │   └── key_manager.py
 │
-├── logs/
-│   ├── client.log
-│   └── server.log
-│
-├── benchmark/
-├── database/
-├── docs/
 ├── gui/
-├── screenshots/
-├── tests/
+│   ├── login_window.py
+│   ├── chat_window.py
+│   ├── main_window.py
+│   ├── message_widget.py
+│   ├── online_users_widget.py
+│   ├── input_bar.py
+│   ├── status_bar.py
+│   └── styles.py
 │
+├── database/
+│
+├── logs/
+│
+├── screenshots/
+│
+├── docs/
+│
+├── utils/
+│
+├── config.py
 ├── logger_config.py
-├── requirements.txt
-├── README.md
-└── .gitignore
+├── main.py
+└── README.md
 ```
 
 ---
 
-## Technologies Used
+# 🔄 Communication Flow
 
-### Programming Language
-
-- Python 3.13
-
-### Networking
-
-- Python Socket Programming
-- Multi-threading
-
-### Cryptography
-
-- AES-256
-- RSA
-- Kyber (Post-Quantum Cryptography)
-
-### Libraries
-
-- cryptography
-- pycryptodome
-- matplotlib
-- pandas
-- psutil
-- memory_profiler
-- PyQt6
-
-### Development Tools
-
-- Visual Studio Code
-- Git
-- GitHub
+```
+Client A
+     │
+     ▼
+RSA Public Key Exchange
+     │
+     ▼
+Encrypted AES Session Key
+     │
+     ▼
+AES-256 Secure Messaging
+     │
+     ▼
+Client B
+```
 
 ---
 
-## Current Development Progress
+# 🛠️ Technologies Used
 
-| Module | Status |
-|----------|--------|
-| Module 1 - TCP Client-Server Communication | Completed |
-| Module 2 - Multi-client Communication | Completed |
-| Module 3 - Username Support | Completed |
-| Module 3.5 - Professional Logging | Completed |
-| Module 4 - AES Secure Communication | In Progress |
-| Module 5 - RSA Key Exchange | Planned |
-| Module 6 - Kyber Post-Quantum Key Exchange | Planned |
-| Module 7 - GUI Development | Planned |
-| Module 8 - Benchmarking | Planned |
-| Module 9 - Final Documentation | Planned |
+| Technology | Purpose |
+|------------|---------|
+| Python 3.12+ | Programming Language |
+| PySide6 | Desktop GUI |
+| Socket Programming | Client-Server Communication |
+| RSA | Public Key Exchange |
+| AES-256 | Message Encryption |
+| JSON | Packet Serialization |
+| Threading | Concurrent Communication |
+| Logging | Monitoring & Debugging |
 
 ---
 
-## Installation
+# 🚀 Installation
 
 Clone the repository
 
 ```bash
-git clone https://github.com/vigneshrao1723-lab/Quantum-Resistant-Secure-Communication-System.git
+git clone https://github.com/your-username/Quantum-Resistant-Secure-Communication-System.git
 ```
 
-Move into the project directory
+Move into the project
 
 ```bash
 cd Quantum-Resistant-Secure-Communication-System
@@ -150,7 +186,7 @@ Create a virtual environment
 python -m venv venv
 ```
 
-Activate the virtual environment
+Activate it
 
 ### Windows
 
@@ -166,49 +202,105 @@ pip install -r requirements.txt
 
 ---
 
-## Running the Project
+# ▶️ Running the Project
 
-Start the server
-
-```bash
-cd server
-python server.py
-```
-
-Start one or more clients
+## Start the Server
 
 ```bash
-cd client
-python client.py
+python -m server.server
 ```
 
 ---
 
-## Future Scope
+## Start Client 1
 
-- End-to-End Encryption
-- Secure File Transfer
-- Voice Communication
-- Video Communication
+```bash
+python main.py
+```
+
+---
+
+## Start Client 2
+
+```bash
+python main.py
+```
+
+---
+
+# 📸 Screenshots
+
+Add screenshots inside
+
+```
+screenshots/
+```
+
+Suggested images:
+
+- Login Screen
+- Chat Window
+- Online Users
+- Multiple Clients
+- Secure Messaging
+
+---
+
+# 🔒 Security Features
+
+- RSA Public Key Cryptography
+- AES-256 Encryption
+- Secure Session Keys
+- Private Messaging
+- Multi-client Communication
+- Automatic Key Exchange
+
+---
+
+# 🔮 Future Enhancements
+
+- ✅ Kyber (ML-KEM) Post-Quantum Key Exchange
 - Digital Signatures
-- Authentication System
-- Secure Database Storage
-- Quantum-safe Secure Messaging
+- Encrypted File Transfer
+- User Authentication
+- Chat History Database
+- Group Chat
+- Voice Communication
+- End-to-End Encryption
+- Performance Benchmark Dashboard
 
 ---
 
-## Author
+# 📈 Current Project Status
 
-**Vignesh T**
+| Module | Status |
+|---------|--------|
+| Multi-client Server | ✅ Complete |
+| GUI | ✅ Complete |
+| Online User Synchronization | ✅ Complete |
+| RSA Key Exchange | ✅ Complete |
+| AES Secure Messaging | ✅ Complete |
+| Session Management | ✅ Complete |
+| Logging | ✅ Complete |
+| Kyber Integration | 🚧 In Progress |
 
-Bachelor of Engineering (Computer Science & Engineering)
+---
+
+# 👨‍💻 Author
+
+**Vignesh Thiyagarajan**
+
+Computer Science & Engineering
 
 Acharya Institute of Technology
 
-Bengaluru, India
 
 ---
 
-## License
+# 📜 License
 
 This project is developed for educational and research purposes as part of a Final Year Engineering Project.
+
+---
+
+⭐ If you found this project interesting, consider giving it a star!
