@@ -171,7 +171,7 @@ Client B
 Clone the repository
 
 ```bash
-git clone https://github.com/your-username/Quantum-Resistant-Secure-Communication-System.git
+git clone https://github.com/vigneshrao1723-lab/Quantum-Resistant-Secure-Communication-System.git
 ```
 
 Move into the project
