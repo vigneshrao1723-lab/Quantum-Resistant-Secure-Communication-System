@@ -38,7 +38,8 @@ def create_auth_result_packet(
 def create_chat_packet(
     sender,
     receiver,
-    message
+    message,
+    timestamp=None
 ):
     """
     Create a private chat message packet.
@@ -48,7 +49,24 @@ def create_chat_packet(
         "type": "chat",
         "sender": sender,
         "receiver": receiver,
-        "message": message
+        "message": message,
+        "timestamp": timestamp
+    }
+
+
+def create_delivery_failure_packet(
+    receiver,
+    reason="User is offline."
+):
+    """
+    Create a packet informing the sender that a private message
+    could not be delivered (e.g. the recipient is not connected).
+    """
+
+    return {
+        "type": "delivery_failure",
+        "receiver": receiver,
+        "reason": reason
     }
 
 

@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import DATABASE_URL  # noqa: E402
 from database.models.base import Base  # noqa: E402
-from database.models import session, user  # noqa: E402,F401  (registers tables on Base.metadata)
+from database.models import message, session, user  # noqa: E402,F401  (registers tables on Base.metadata)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

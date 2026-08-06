@@ -11,6 +11,7 @@ import threading
 import time
 import base64
 import os
+from datetime import datetime, timezone
 
 from PySide6.QtCore import QObject, Signal
 
@@ -372,7 +373,8 @@ class ClientSession(QObject):
         packet = create_chat_packet(
             sender=self.username,
             receiver=self.current_chat,
-            message=encrypted_message
+            message=encrypted_message,
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
 
         send_message(
@@ -402,6 +404,9 @@ class ClientSession(QObject):
 
         elif packet_type == "chat":
             self.handle_chat(packet)
+
+        elif packet_type == "delivery_failure":
+            self.handle_delivery_failure(packet)
 
         elif (
             packet_type == "key_exchange"
@@ -514,6 +519,25 @@ class ClientSession(QObject):
         self.message_received.emit(
             sender,
             decrypted_message
+        )
+
+    # ----------------------------------------------------------
+
+    def handle_delivery_failure(self, packet):
+
+        receiver = packet.get("receiver")
+
+        reason = packet.get(
+            "reason",
+            "Message could not be delivered."
+        )
+
+        self.logger.warning(
+            f"Delivery failed to {receiver}: {reason}"
+        )
+
+        self.error_occurred.emit(
+            f"Could not deliver message to {receiver}: {reason}"
         )
 
     # ----------------------------------------------------------

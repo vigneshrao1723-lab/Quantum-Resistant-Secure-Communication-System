@@ -4,11 +4,16 @@ Client Handler Module
 Handles communication with individual clients.
 """
 
+from datetime import datetime, timezone
+
 from auth.authentication_service import AuthenticationService
+from config import KEY_EXCHANGE_ALGORITHM
 from database.connection import SessionLocal
+from database.repositories.message_repository import MessageRepository
 from security.jwt_handler import TokenExpiredError, TokenValidationError
 from utils.protocol import (
     create_auth_result_packet,
+    create_delivery_failure_packet,
     create_join_packet,
     create_leave_packet,
     parse_packet,
@@ -22,6 +27,55 @@ from server.broadcaster import (
     distribute_public_keys,
     send_to_client,
 )
+
+
+def _parse_message_timestamp(raw_timestamp):
+    """
+    Parse the client-supplied ISO 8601 timestamp from a chat packet.
+
+    Falls back to the current server time if the timestamp is
+    missing or malformed, rather than failing the persistence.
+    """
+
+    if raw_timestamp:
+        try:
+            parsed = datetime.fromisoformat(raw_timestamp)
+
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+            return parsed
+        except ValueError:
+            pass
+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def persist_message(sender_id, receiver_id, algorithm, packet):
+    """
+    Persist a successfully delivered private message.
+
+    Only ever called after a "chat" packet has been routed to a
+    connected recipient -- failed deliveries are never stored. Stores
+    ciphertext only; the server never decrypts messages.
+    """
+
+    db = SessionLocal()
+
+    try:
+        message_repo = MessageRepository(db)
+
+        message_repo.save_message(
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            ciphertext=packet.get("message"),
+            algorithm=algorithm or KEY_EXCHANGE_ALGORITHM,
+            timestamp=_parse_message_timestamp(packet.get("timestamp")),
+        )
+
+        db.commit()
+    finally:
+        db.close()
 
 
 def authenticate_connection(state, client_socket, client_address):
@@ -190,7 +244,7 @@ def handle_client(state, client_socket, client_address):
 
                 receiver = packet.get("receiver")
 
-                for sock, client in state.clients.items():
+                for sock, client in list(state.clients.items()):
 
                     if client["username"] == receiver:
 
@@ -209,7 +263,31 @@ def handle_client(state, client_socket, client_address):
                             packet
                         )
 
+                        sender_client = state.get_client(client_socket)
+
+                        persist_message(
+                            sender_id=user.id,
+                            receiver_id=client["user_id"],
+                            algorithm=(sender_client or {}).get("algorithm"),
+                            packet=packet
+                        )
+
                         break
+
+                else:
+
+                    # Loop completed without finding a matching
+                    # connected recipient -- report delivery failure
+                    # to the sender instead of silently dropping it.
+                    state.logger.info(
+                        f"Delivery failed: {username} -> {receiver} "
+                        f"(recipient not connected)"
+                    )
+
+                    send_to_client(
+                        client_socket,
+                        create_delivery_failure_packet(receiver)
+                    )
 
             # -----------------------------
             # Session Key Exchange Packet

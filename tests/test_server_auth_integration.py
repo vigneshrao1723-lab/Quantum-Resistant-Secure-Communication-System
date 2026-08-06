@@ -15,6 +15,7 @@ Run with:
     pytest tests/test_server_auth_integration.py -v
 """
 
+import base64
 import json
 import socket
 import struct
@@ -356,9 +357,18 @@ def test_tampered_token_is_rejected(running_server, committed_user):
     invalid token."""
     token = _login_and_get_token(committed_user)
 
+    # Flip a bit in the decoded signature *bytes* rather than swapping
+    # a base64 character directly -- base64's unused padding bits mean
+    # a fixed character substitution can sometimes decode to the same
+    # underlying bytes, leaving the signature unchanged (flaky test).
     header, payload, signature = token.split(".")
-    tampered_char = "A" if signature[-1] != "A" else "B"
-    tampered_token = f"{header}.{payload}.{signature[:-1]}{tampered_char}"
+    padding = "=" * (-len(signature) % 4)
+    signature_bytes = bytearray(base64.urlsafe_b64decode(signature + padding))
+    signature_bytes[-1] ^= 0xFF
+    tampered_signature = (
+        base64.urlsafe_b64encode(bytes(signature_bytes)).decode("ascii").rstrip("=")
+    )
+    tampered_token = f"{header}.{payload}.{tampered_signature}"
 
     _state, port = running_server
     sock = socket.create_connection(("127.0.0.1", port), timeout=3)

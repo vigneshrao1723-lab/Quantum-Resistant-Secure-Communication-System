@@ -11,7 +11,8 @@ yet.
 """
 
 from database.models.base import Base
+from database.models.message import Message
 from database.models.session import Session
 from database.models.user import User
 
-__all__ = ["Base", "Session", "User"]
+__all__ = ["Base", "Message", "Session", "User"]
