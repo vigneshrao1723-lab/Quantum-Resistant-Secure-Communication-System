@@ -19,8 +19,9 @@ from config import HOST, PORT
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
 from logger_config import setup_logger
-from utils.network import send_message
+from utils.network import receive_message, send_message
 from utils.protocol import (
+    create_auth_packet,
     create_public_key_packet,
     create_session_key_packet,
     create_chat_packet,
@@ -134,7 +135,14 @@ class ClientSession(QObject):
 
     def login(self, username):
         """
-        Login/Register this client with the server.
+        Authenticate this client with the server using the JWT
+        access token obtained earlier from AuthenticationService
+        (set on self.access_token before this call), then wait for
+        the server's authentication result before proceeding.
+
+        Raises PermissionError if no access token is available or
+        the server rejects the token (expired, invalid, inactive,
+        or locked user).
         """
 
         username = username.strip()
@@ -144,17 +152,41 @@ class ClientSession(QObject):
 
         self.username = username
 
-        self.logger.info(
-            f"Username: {self.username}"
-        )
+        if not self.access_token:
+            raise PermissionError(
+                "No access token available. Please log in again."
+            )
 
         send_message(
             self.client_socket,
-            self.username
+            create_auth_packet(self.access_token)
         )
 
         self.logger.info(
-            "Username sent to server."
+            "Sent authentication request to server."
+        )
+
+        response = receive_message(self.client_socket)
+
+        if not isinstance(response, dict) or response.get("type") != "auth_result":
+            raise PermissionError(
+                "Server did not respond to the authentication request."
+            )
+
+        if not response.get("success"):
+            raise PermissionError(
+                response.get("message") or "Authentication failed."
+            )
+
+        # The server derives the authoritative username from the
+        # validated JWT/DB record rather than trusting the client.
+        server_username = response.get("username")
+
+        if server_username:
+            self.username = server_username
+
+        self.logger.info(
+            f"Authenticated as {self.username}."
         )
 
     def send_public_key(self):

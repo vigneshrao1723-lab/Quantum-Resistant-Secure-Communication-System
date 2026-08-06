@@ -4,7 +4,11 @@ Client Handler Module
 Handles communication with individual clients.
 """
 
+from auth.authentication_service import AuthenticationService
+from database.connection import SessionLocal
+from security.jwt_handler import TokenExpiredError, TokenValidationError
 from utils.protocol import (
+    create_auth_result_packet,
     create_join_packet,
     create_leave_packet,
     parse_packet,
@@ -20,6 +24,74 @@ from server.broadcaster import (
 )
 
 
+def authenticate_connection(state, client_socket, client_address):
+    """
+    Receive and validate the client's JWT access token.
+
+    Returns the authenticated (user, session) pair on success, or
+    None on failure. In both cases an "auth_result" packet is sent
+    back to the client before returning.
+    """
+
+    auth_packet = receive_message(client_socket)
+
+    if not auth_packet:
+        return None
+
+    auth_packet = parse_packet(auth_packet)
+
+    if not isinstance(auth_packet, dict) or auth_packet.get("type") != "auth":
+        send_to_client(
+            client_socket,
+            create_auth_result_packet(False, "Authentication required.")
+        )
+        return None
+
+    access_token = auth_packet.get("access_token")
+
+    db = SessionLocal()
+
+    try:
+        auth_service = AuthenticationService(db)
+
+        try:
+            user = auth_service.get_current_user(access_token)
+            user_session = auth_service.get_current_session(access_token)
+        except TokenExpiredError:
+            state.logger.info(
+                f"Rejected connection from {client_address}: token expired"
+            )
+            send_to_client(
+                client_socket,
+                create_auth_result_packet(
+                    False,
+                    "Session token has expired. Please log in again."
+                )
+            )
+            return None
+        except TokenValidationError:
+            state.logger.info(
+                f"Rejected connection from {client_address}: invalid token"
+            )
+            send_to_client(
+                client_socket,
+                create_auth_result_packet(
+                    False,
+                    "Invalid or unauthorized session."
+                )
+            )
+            return None
+    finally:
+        db.close()
+
+    send_to_client(
+        client_socket,
+        create_auth_result_packet(True, "Authenticated.", username=user.username)
+    )
+
+    return user, user_session
+
+
 def handle_client(state, client_socket, client_address):
     """
     Handle communication with a connected client.
@@ -30,17 +102,22 @@ def handle_client(state, client_socket, client_address):
     try:
 
         # -----------------------------
-        # Receive username
+        # Authenticate via JWT
         # -----------------------------
-        username = receive_message(client_socket)
+        authenticated = authenticate_connection(state, client_socket, client_address)
 
-        if not username:
+        if authenticated is None:
             return
 
-        # Register client
+        user, user_session = authenticated
+        username = user.username
+
+        # Register client, associated with the authenticated user/session
         state.add_client(
             client_socket,
-            username
+            username,
+            user_id=str(user.id),
+            session_id=user_session.session_id
         )
 
         print(f"[CONNECTED] {username} ({client_address})")

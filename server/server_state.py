@@ -4,7 +4,17 @@ Server State
 Stores shared resources used by the server.
 """
 
+from datetime import datetime, timezone
+
 from logger_config import setup_logger
+
+
+def _utc_now():
+    """Current UTC time as a naive datetime, via the non-deprecated
+    timezone-aware API. See auth/authentication_service.py's identical
+    helper for the full rationale.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class ServerState:
@@ -20,8 +30,11 @@ class ServerState:
         # {
         #     client_socket: {
         #         "username": "...",
+        #         "user_id": "...",
+        #         "session_id": "...",
         #         "algorithm": "RSA",
-        #         "public_key": "..."
+        #         "public_key": "...",
+        #         "connected_at": datetime(...)
         #     }
         # }
         self.clients = {}
@@ -32,15 +45,18 @@ class ServerState:
             "server.log"
         )
 
-    def add_client(self, client_socket, username):
+    def add_client(self, client_socket, username, user_id=None, session_id=None):
         """
-        Add a newly connected client.
+        Add a newly connected, authenticated client.
         """
 
         self.clients[client_socket] = {
             "username": username,
+            "user_id": user_id,
+            "session_id": session_id,
             "algorithm": None,
-            "public_key": None
+            "public_key": None,
+            "connected_at": _utc_now()
         }
 
     def remove_client(self, client_socket):

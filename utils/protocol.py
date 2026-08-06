@@ -5,6 +5,36 @@ Defines all packet formats used by the application.
 """
 
 
+def create_auth_packet(access_token):
+    """
+    Create an authentication request packet carrying the
+    client's JWT access token.
+    """
+
+    return {
+        "type": "auth",
+        "access_token": access_token
+    }
+
+
+def create_auth_result_packet(
+    success,
+    message,
+    username=None
+):
+    """
+    Create a packet reporting the outcome of server-side
+    JWT authentication.
+    """
+
+    return {
+        "type": "auth_result",
+        "success": success,
+        "message": message,
+        "username": username
+    }
+
+
 def create_chat_packet(
     sender,
     receiver,

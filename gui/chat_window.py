@@ -5,7 +5,7 @@ Main chat interface for the Quantum-Resistant
 Secure Communication System.
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget,
     QLabel,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
     QMessageBox,
+    QPushButton,
 )
 
 from gui.online_users_widget import OnlineUsersWidget
@@ -26,6 +27,8 @@ class ChatWindow(QWidget):
     """
     Main chat interface.
     """
+
+    logout_requested = Signal()
 
     def __init__(self, session):
         super().__init__()
@@ -100,6 +103,22 @@ class ChatWindow(QWidget):
             "font-size: 15px; font-weight: 700;"
         )
 
+        self.logout_button = QPushButton("Logout")
+
+        self.logout_button.setCursor(Qt.PointingHandCursor)
+
+        self.logout_button.clicked.connect(
+            self.logout_requested.emit
+        )
+
+        header_top_row = QHBoxLayout()
+
+        header_top_row.addWidget(app_title)
+
+        header_top_row.addStretch()
+
+        header_top_row.addWidget(self.logout_button)
+
         self.chat_partner_label = QLabel(
             "Select a user to start chatting"
         )
@@ -108,7 +127,7 @@ class ChatWindow(QWidget):
             f"color: {COLOR_TEXT_MUTED}; font-size: 10pt;"
         )
 
-        header_layout.addWidget(app_title)
+        header_layout.addLayout(header_top_row)
 
         header_layout.addWidget(self.chat_partner_label)
 

@@ -74,6 +74,10 @@ class MainWindow(QMainWindow):
             self.session
         )
 
+        self.chat_window.logout_requested.connect(
+            self.handle_logout
+        )
+
         self.setCentralWidget(
             self.chat_window
         )
@@ -176,3 +180,32 @@ class MainWindow(QMainWindow):
             self.session.start_receiver()
         except Exception as error:
             self.login_window.show_connection_error(str(error))
+
+    def handle_logout(self):
+
+        session_id = self.session.session_id
+
+        if session_id:
+
+            try:
+                with self.db_factory() as db:
+                    auth_service = AuthenticationService(db)
+                    auth_service.logout(session_id)
+            except Exception as error:
+                self.session.logger.error(
+                    f"Failed to revoke session on logout: {error}"
+                )
+
+        self.session.disconnect()
+
+        self.session.user_id = None
+        self.session.username = ""
+        self.session.session_id = None
+        self.session.access_token = None
+        self.session.refresh_token = None
+        self.session.current_chat = None
+        self.session.online_users = []
+
+        self.chat_window = None
+
+        self.show_login()

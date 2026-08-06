@@ -4,8 +4,13 @@ Quantum-Resistant Secure Communication System
 Client Entry Point
 """
 
+import getpass
+
+from auth.authentication_service import AuthenticationService
+from auth.schemas import LoginRequest
 from client.session import ClientSession
 from client.sender import send_messages
+from database.connection import SessionLocal
 
 from utils.console_ui import (
     display_chat,
@@ -13,6 +18,44 @@ from utils.console_ui import (
     display_warning,
     display_online_users,
 )
+
+
+def authenticate(session):
+    """
+    Prompt for credentials and authenticate against the database,
+    storing the resulting JWT/session info on the session object.
+
+    Mirrors the DB-backed login gui/main_window.py performs before
+    ever touching the socket -- the terminal client needs the same
+    JWT in hand before ClientSession.login() can authenticate the
+    connection with the server.
+    """
+
+    identifier = input("Username or email: ").strip()
+    password = getpass.getpass("Password: ")
+
+    db = SessionLocal()
+
+    try:
+        auth_service = AuthenticationService(db)
+        result = auth_service.authenticate_user(
+            LoginRequest(identifier=identifier, password=password)
+        )
+    finally:
+        db.close()
+
+    if not result.success:
+        raise PermissionError(
+            result.errors and "; ".join(result.errors.values()) or result.message
+        )
+
+    session.user_id = result.user_id
+    session.username = result.username
+    session.session_id = result.session_id
+    session.access_token = result.token_pair.access_token
+    session.refresh_token = result.token_pair.refresh_token
+
+    return result.username
 
 
 def terminal_message_handler(sender, message):
@@ -73,7 +116,7 @@ def start_client():
         # ---------------------------------
         # Login
         # ---------------------------------
-        username = input("Enter your username: ")
+        username = authenticate(session)
         session.login(username)
 
         # ---------------------------------
