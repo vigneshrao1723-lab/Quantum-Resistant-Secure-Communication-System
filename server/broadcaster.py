@@ -69,7 +69,7 @@ def distribute_public_keys(state, new_client_socket):
 
     # Send existing clients' public keys to the new client,
     # and send the new client's public key to existing clients.
-    for client_socket, client in state.clients.items():
+    for client_socket, client in list(state.clients.items()):
 
         if client_socket == new_client_socket:
             continue
@@ -116,11 +116,11 @@ def broadcast_user_list(state):
     print("\n========== USER LIST BROADCAST ==========")
     state.logger.info("Broadcasting online user lists...")
 
-    for client_socket, client in state.clients.items():
+    for client_socket, client in list(state.clients.items()):
 
         users = []
 
-        for other_socket, other_client in state.clients.items():
+        for other_socket, other_client in list(state.clients.items()):
 
             if other_socket == client_socket:
                 continue
