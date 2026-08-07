@@ -11,6 +11,7 @@ import threading
 import time
 import base64
 import os
+import uuid
 from datetime import datetime, timezone
 
 from PySide6.QtCore import QObject, Signal
@@ -19,6 +20,9 @@ from client.receiver import receive_messages
 from config import HOST, PORT
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
+from database.connection import SessionLocal
+from database.repositories.message_repository import MessageRepository
+from database.repositories.user_repository import UserRepository
 from logger_config import setup_logger
 from utils.network import receive_message, send_message
 from utils.protocol import (
@@ -27,6 +31,11 @@ from utils.protocol import (
     create_session_key_packet,
     create_chat_packet,
 )
+
+# Placeholder shown for a historical message that cannot be decrypted
+# with the currently cached AES session key (e.g. it was encrypted in
+# a previous run, under a key that no longer exists in memory).
+_UNDECRYPTABLE_PLACEHOLDER = "Message unavailable (encrypted in a previous session)"
 
 
 class ClientSession(QObject):
@@ -381,6 +390,85 @@ class ClientSession(QObject):
             self.client_socket,
             packet
         )
+
+    def _decrypt_history_message(self, partner_username, ciphertext):
+        """
+        Best-effort AES decryption of a stored historical message.
+
+        Reuses the currently cached session key for this partner, if
+        any -- never establishes a new one (history loading must not
+        trigger a fresh key exchange). Never raises: returns the
+        placeholder text if no key is cached, or if AES-GCM
+        authentication fails (the message was encrypted under a
+        different, since-discarded key from a previous session).
+        """
+
+        session_key = self.key_manager.get_session_key(partner_username)
+
+        if session_key is None:
+            return _UNDECRYPTABLE_PLACEHOLDER
+
+        try:
+            return AESCipher(session_key).decrypt(ciphertext)
+        except Exception:
+            return _UNDECRYPTABLE_PLACEHOLDER
+
+    def load_conversation_history(self, partner_username):
+        """
+        Load and best-effort decrypt the stored conversation history
+        with a partner from PostgreSQL.
+
+        Reuses the existing MessageRepository.get_conversation() query
+        and the current user's already-known UUID (self.user_id, set
+        at login) -- the only new database lookup is resolving the
+        partner's username to their UUID via the existing
+        UserRepository. No new SQL, no new repository methods, no
+        protocol or packet changes.
+
+        This method performs no GUI operations; it returns a plain
+        list of dicts, ordered chronologically exactly as stored:
+            {"sender": str, "text": str, "timestamp": datetime, "is_own": bool}
+        """
+
+        db = SessionLocal()
+
+        try:
+            user_repo = UserRepository(db)
+            message_repo = MessageRepository(db)
+
+            partner = user_repo.get_by_username(partner_username)
+
+            if partner is None:
+                return []
+
+            own_id = uuid.UUID(self.user_id)
+
+            conversation = message_repo.get_conversation(own_id, partner.id)
+
+            history = []
+
+            for message in conversation:
+
+                is_own = message.sender_id == own_id
+
+                sender_name = self.username if is_own else partner_username
+
+                text = self._decrypt_history_message(
+                    partner_username,
+                    message.ciphertext
+                )
+
+                history.append({
+                    "sender": sender_name,
+                    "text": text,
+                    "timestamp": message.timestamp,
+                    "is_own": is_own,
+                })
+
+            return history
+        finally:
+            db.close()
+
     # ==========================================================
     # Packet Handlers
     # ==========================================================

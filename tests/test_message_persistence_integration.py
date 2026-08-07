@@ -1,16 +1,19 @@
 """
-Integration tests for Milestone 2: database message persistence.
+Integration tests for Milestone 2 (database message persistence) and
+Milestone 3 (conversation history retrieval).
 
 Verifies, against the real server.client_handler.handle_client accept
 loop (same pattern as test_private_messaging_integration.py), that a
 successfully routed private message is persisted to the messages
 table with the correct sender, receiver, ciphertext, algorithm, and
-timestamp -- and that a failed delivery (offline recipient) never
-creates a database record.
+timestamp -- that a failed delivery (offline recipient) never creates
+a database record -- and that ClientSession.load_conversation_history()
+correctly retrieves, orders, attributes, and best-effort decrypts that
+persisted history.
 
-This suite only checks persistence; message routing itself is already
-covered by test_private_messaging_integration.py, and encryption
-correctness by test_chat_encryption_integration.py.
+This suite only checks persistence and history retrieval; live message
+routing itself is covered by test_private_messaging_integration.py,
+and encryption correctness by test_chat_encryption_integration.py.
 
 Run with:
     pytest tests/test_message_persistence_integration.py -v
@@ -29,6 +32,8 @@ from sqlalchemy import select
 
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
+from client.session import ClientSession
+from crypto.aes import AESCipher
 from database.connection import SessionLocal
 from database.models.message import Message
 from database.repositories.message_repository import MessageRepository
@@ -209,6 +214,26 @@ def _wait_for_persisted_message(sender_user_id, receiver_user_id, attempts=40):
     return None
 
 
+def _wait_for_conversation_length(user_a_id, user_b_id, expected_length, attempts=40):
+    for _ in range(attempts):
+        conversation = _get_conversation(user_a_id, user_b_id)
+        if len(conversation) >= expected_length:
+            return conversation
+        time.sleep(0.05)
+    return _get_conversation(user_a_id, user_b_id)
+
+
+def _make_session_for(user_id, username):
+    """A bare ClientSession standing in for a logged-in user, for
+    calling load_conversation_history() directly without going
+    through the GUI or a real socket connection (which that method
+    never touches)."""
+    session = ClientSession()
+    session.user_id = user_id
+    session.username = username
+    return session
+
+
 @pytest.fixture()
 def sender_and_recipient(running_server):
     _state, port = running_server
@@ -374,3 +399,168 @@ def test_failed_delivery_does_not_create_database_record(running_server):
     finally:
         sender_sock.close()
         _delete_user(sender_payload["username"])
+
+
+# ----------------------------------------------------------------------
+# Milestone 3: conversation history retrieval
+# ----------------------------------------------------------------------
+
+
+def test_get_conversation_returns_chronological_order(sender_and_recipient):
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    for i in range(3):
+        _send(
+            sender_sock,
+            create_chat_packet(
+                sender=sender_name,
+                receiver=recipient_name,
+                message=f"ciphertext-{i}",
+                timestamp=datetime(
+                    2026, 1, 1, 10, i, 0, tzinfo=timezone.utc
+                ).isoformat(),
+            ),
+        )
+        _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    conversation = _wait_for_conversation_length(sender_id, recipient_id, 3)
+    assert len(conversation) == 3
+    assert [m.ciphertext for m in conversation] == [
+        "ciphertext-0",
+        "ciphertext-1",
+        "ciphertext-2",
+    ]
+    assert (
+        conversation[0].timestamp
+        < conversation[1].timestamp
+        < conversation[2].timestamp
+    )
+
+
+def test_load_conversation_history_marks_incoming_and_outgoing(sender_and_recipient):
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message="from-sender-to-recipient",
+            timestamp=datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    _send(
+        recipient_sock,
+        create_chat_packet(
+            sender=recipient_name,
+            receiver=sender_name,
+            message="from-recipient-to-sender",
+            timestamp=datetime(2026, 1, 1, 9, 1, 0, tzinfo=timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(sender_sock, lambda p: p.get("type") == "chat")
+
+    _wait_for_conversation_length(sender_id, recipient_id, 2)
+
+    sender_view = _make_session_for(sender_id, sender_name)
+    history_for_sender = sender_view.load_conversation_history(recipient_name)
+
+    assert len(history_for_sender) == 2
+    assert history_for_sender[0]["is_own"] is True
+    assert history_for_sender[0]["sender"] == sender_name
+    assert history_for_sender[1]["is_own"] is False
+    assert history_for_sender[1]["sender"] == recipient_name
+
+    recipient_view = _make_session_for(recipient_id, recipient_name)
+    history_for_recipient = recipient_view.load_conversation_history(sender_name)
+
+    assert history_for_recipient[0]["is_own"] is False
+    assert history_for_recipient[0]["sender"] == sender_name
+    assert history_for_recipient[1]["is_own"] is True
+    assert history_for_recipient[1]["sender"] == recipient_name
+
+
+def test_load_conversation_history_preserves_stored_timestamp(sender_and_recipient):
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    sent_timestamp = datetime(2026, 3, 15, 12, 30, 45, tzinfo=timezone.utc)
+
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message="timestamped-ciphertext",
+            timestamp=sent_timestamp.isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+    _wait_for_conversation_length(sender_id, recipient_id, 1)
+
+    recipient_view = _make_session_for(recipient_id, recipient_name)
+    history = recipient_view.load_conversation_history(sender_name)
+
+    assert len(history) == 1
+    assert history[0]["timestamp"] == sent_timestamp.replace(tzinfo=None)
+
+
+def test_load_conversation_history_returns_placeholder_without_session_key(
+    sender_and_recipient,
+):
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message="opaque-ciphertext-no-real-key",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+    _wait_for_conversation_length(sender_id, recipient_id, 1)
+
+    # Fresh session standing in for a new app run: no session key has
+    # ever been cached for this partner.
+    recipient_view = _make_session_for(recipient_id, recipient_name)
+    history = recipient_view.load_conversation_history(sender_name)
+
+    assert len(history) == 1
+    assert history[0]["text"] == "Message unavailable (encrypted in a previous session)"
+
+
+def test_load_conversation_history_decrypts_with_cached_session_key(
+    sender_and_recipient,
+):
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    session_key = b"K" * 32
+    plaintext = "a real decryptable message"
+
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message=AESCipher(session_key).encrypt(plaintext),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+    _wait_for_conversation_length(sender_id, recipient_id, 1)
+
+    recipient_view = _make_session_for(recipient_id, recipient_name)
+    recipient_view.key_manager.add_session_key(sender_name, session_key)
+
+    history = recipient_view.load_conversation_history(sender_name)
+
+    assert len(history) == 1
+    assert history[0]["text"] == plaintext

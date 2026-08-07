@@ -205,25 +205,29 @@ class MessageWidget(QListWidget):
         self,
         sender,
         message,
+        timestamp=None,
     ):
         """
         Display a received message.
         """
 
         self._add_bubble(
-            MessageBubble(message, kind="received", sender=sender)
+            MessageBubble(
+                message, kind="received", sender=sender, timestamp=timestamp
+            )
         )
 
     def add_sent_message(
         self,
         message,
+        timestamp=None,
     ):
         """
         Display a sent message.
         """
 
         self._add_bubble(
-            MessageBubble(message, kind="sent")
+            MessageBubble(message, kind="sent", timestamp=timestamp)
         )
 
     def clear_messages(self):

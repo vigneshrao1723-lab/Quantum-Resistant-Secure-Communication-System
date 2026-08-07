@@ -245,6 +245,42 @@ class ChatWindow(QWidget):
             f"Chatting with {username}"
         )
 
+        self.load_history(username)
+
+    def load_history(self, username):
+        """
+        Populate the message panel with this conversation's stored
+        history. Runs once per conversation open, right after the
+        panel is cleared -- live messages continue to arrive and
+        append via the unchanged receive_message()/send_message()
+        paths after this returns.
+        """
+
+        history = self.session.load_conversation_history(username)
+
+        for entry in history:
+
+            timestamp = entry["timestamp"]
+
+            timestamp_text = (
+                timestamp.strftime("%H:%M") if timestamp else None
+            )
+
+            if entry["is_own"]:
+
+                self.messages.add_sent_message(
+                    entry["text"],
+                    timestamp=timestamp_text
+                )
+
+            else:
+
+                self.messages.add_received_message(
+                    entry["sender"],
+                    entry["text"],
+                    timestamp=timestamp_text
+                )
+
     def send_message(self, message):
 
         if self.session.get_current_chat() is None:
@@ -277,12 +313,21 @@ class ChatWindow(QWidget):
                 message
             )
 
-        else:
+            return
 
-            self.messages.add_received_message(
-                sender,
-                message
-            )
+        if sender != self.session.get_current_chat():
+
+            # This message belongs to a different conversation. It is
+            # already correctly persisted (Milestone 2) and will be
+            # shown when that conversation is opened (Milestone 3's
+            # history load) -- the currently open conversation must
+            # stay completely unchanged.
+            return
+
+        self.messages.add_received_message(
+            sender,
+            message
+        )
 
     def show_error(self, message):
 
