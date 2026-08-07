@@ -279,22 +279,28 @@ class ClientSession(QObject):
 
         self.connection_changed.emit(False)
 
-        try:
-            self.client_socket.shutdown(
-                socket.SHUT_RDWR
-            )
+        # Guard against a redundant disconnect() call (e.g. a rapid
+        # double-click on Logout): client_socket is None once already
+        # disconnected, and shutdown()/close() have nothing to do.
+        if self.client_socket is not None:
 
-        except OSError:
-            pass
+            try:
+                self.client_socket.shutdown(
+                    socket.SHUT_RDWR
+                )
 
-        self.client_socket.close()
+            except OSError:
+                pass
 
-        # Drop the reference to the now-closed socket object rather
-        # than leaving it dangling. Doesn't change behavior -- connect()
-        # already unconditionally builds a fresh socket every time --
-        # but makes the "not connected" state unambiguous instead of
-        # a closed-yet-still-truthy socket object sitting here.
-        self.client_socket = None
+            self.client_socket.close()
+
+            # Drop the reference to the now-closed socket object rather
+            # than leaving it dangling. Doesn't change behavior beyond
+            # this -- connect() already unconditionally builds a fresh
+            # socket every time -- but makes the "not connected" state
+            # unambiguous instead of a closed-yet-still-truthy socket
+            # object sitting here.
+            self.client_socket = None
 
         if self.receiver_thread is not None:
 
