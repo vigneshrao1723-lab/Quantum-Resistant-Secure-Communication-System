@@ -205,6 +205,7 @@ class MainWindow(QMainWindow):
         self.session.refresh_token = None
         self.session.current_chat = None
         self.session.online_users = []
+        self.session.unread_counts = {}
 
         self.chat_window = None
 

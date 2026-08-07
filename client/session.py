@@ -88,6 +88,15 @@ class ClientSession(QObject):
         self.online_users = []
 
         # ---------------------------------
+        # Unread Message Counts
+        #
+        # Client-side only, in-memory for the lifetime of the app.
+        # {username: count}
+        # ---------------------------------
+
+        self.unread_counts = {}
+
+        # ---------------------------------
         # Legacy Terminal UI
         # (Will be removed later)
         # ---------------------------------
@@ -131,7 +140,19 @@ class ClientSession(QObject):
     def connect(self):
         """
         Connect to the chat server.
+
+        Always builds a fresh socket first: disconnect() closes
+        self.client_socket, and ClientSession is reused across a
+        logout/login cycle within the same running app (it is not
+        recreated), so without this a reconnect would call .connect()
+        on an already-closed socket object -- raising
+        OSError: [WinError 10038] on Windows.
         """
+
+        self.client_socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
 
         self.client_socket.connect((HOST, PORT))
 
@@ -267,6 +288,13 @@ class ClientSession(QObject):
             pass
 
         self.client_socket.close()
+
+        # Drop the reference to the now-closed socket object rather
+        # than leaving it dangling. Doesn't change behavior -- connect()
+        # already unconditionally builds a fresh socket every time --
+        # but makes the "not connected" state unambiguous instead of
+        # a closed-yet-still-truthy socket object sitting here.
+        self.client_socket = None
 
         if self.receiver_thread is not None:
 
@@ -730,3 +758,22 @@ class ClientSession(QObject):
         Returns the active chat partner.
         """
         return self.current_chat
+
+    def increment_unread(self, username):
+        """
+        Increment and return the unread count for a user.
+        """
+        self.unread_counts[username] = self.unread_counts.get(username, 0) + 1
+        return self.unread_counts[username]
+
+    def clear_unread(self, username):
+        """
+        Reset the unread count for a user to zero.
+        """
+        self.unread_counts[username] = 0
+
+    def get_unread_count(self, username):
+        """
+        Returns the current unread count for a user.
+        """
+        return self.unread_counts.get(username, 0)

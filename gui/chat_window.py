@@ -204,7 +204,7 @@ class ChatWindow(QWidget):
     def register_callbacks(self):
 
         self.session.users_updated.connect(
-            self.online_users.update_users
+            self.handle_users_updated
         )
 
         self.session.message_received.connect(
@@ -219,9 +219,26 @@ class ChatWindow(QWidget):
         # Sync UI with current session state
         # -----------------------------------------
 
-        self.online_users.update_users(
+        self.handle_users_updated(
             self.session.get_online_users()
         )
+
+    def handle_users_updated(self, users):
+        """
+        Refresh the online users list, then reapply each user's
+        current unread badge -- update_users() rebuilds the row
+        widgets from scratch, which would otherwise silently drop
+        any badge already being shown.
+        """
+
+        self.online_users.update_users(users)
+
+        for username in users:
+
+            self.online_users.set_unread_count(
+                username,
+                self.session.get_unread_count(username)
+            )
 
     # ==========================================================
     # Events
@@ -230,6 +247,10 @@ class ChatWindow(QWidget):
     def user_selected(self, username):
 
         self.session.set_current_chat(username)
+
+        self.session.clear_unread(username)
+
+        self.online_users.set_unread_count(username, 0)
 
         self.chat_partner_label.setText(
             f"Chatting with {username}"
@@ -321,7 +342,11 @@ class ChatWindow(QWidget):
             # already correctly persisted (Milestone 2) and will be
             # shown when that conversation is opened (Milestone 3's
             # history load) -- the currently open conversation must
-            # stay completely unchanged.
+            # stay completely unchanged. Track it as unread instead.
+            unread_count = self.session.increment_unread(sender)
+
+            self.online_users.set_unread_count(sender, unread_count)
+
             return
 
         self.messages.add_received_message(

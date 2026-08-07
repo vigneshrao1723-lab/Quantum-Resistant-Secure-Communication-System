@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
 )
 
-from gui.styles import COLOR_ACCENT, COLOR_ONLINE, COLOR_TEXT_MUTED
+from gui.styles import COLOR_ACCENT, COLOR_OFFLINE, COLOR_ONLINE, COLOR_TEXT_MUTED
 
 
 class UserRow(QWidget):
@@ -44,12 +44,38 @@ class UserRow(QWidget):
         name = QLabel(username)
         name.setStyleSheet("font-size: 10.5pt; font-weight: 500;")
 
+        self.unread_badge = QLabel("")
+        self.unread_badge.setFixedHeight(20)
+        self.unread_badge.setAlignment(Qt.AlignCenter)
+        self.unread_badge.setStyleSheet(
+            f"background-color: {COLOR_OFFLINE}; color: #0B0D16; "
+            "border-radius: 10px; font-size: 8.5pt; font-weight: 700; "
+            "padding: 0px 7px;"
+        )
+        self.unread_badge.setVisible(False)
+
         dot = QLabel("●")
         dot.setStyleSheet(f"color: {COLOR_ONLINE}; font-size: 9pt;")
 
         layout.addWidget(avatar)
         layout.addWidget(name, stretch=1)
+        layout.addWidget(self.unread_badge)
         layout.addWidget(dot)
+
+    # ==========================================================
+    # Public Methods
+    # ==========================================================
+
+    def set_unread_count(self, count):
+        """
+        Show or hide the unread badge for this row.
+        """
+
+        if count > 0:
+            self.unread_badge.setText(str(count))
+            self.unread_badge.setVisible(True)
+        else:
+            self.unread_badge.setVisible(False)
 
 
 class OnlineUsersWidget(QListWidget):
@@ -138,6 +164,26 @@ class OnlineUsersWidget(QListWidget):
         """
 
         self.clear()
+
+    def set_unread_count(self, username, count):
+        """
+        Update the unread badge for a single user row, in place,
+        without rebuilding the list or disturbing the current
+        selection.
+        """
+
+        for i in range(self.count()):
+
+            item = self.item(i)
+
+            if item.data(Qt.UserRole) == username:
+
+                row = self.itemWidget(item)
+
+                if row is not None:
+                    row.set_unread_count(count)
+
+                break
 
     # ==========================================================
     # Events
