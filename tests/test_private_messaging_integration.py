@@ -32,6 +32,7 @@ from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from server.client_handler import handle_client
 from server.server_state import ServerState
+from tests.tls_test_support import serve_tls_client, wrap_client_socket
 from utils.protocol import (
     create_auth_packet,
     create_chat_packet,
@@ -97,6 +98,13 @@ def _assert_no_chat_packet_received(sock, attempts=15, per_attempt_timeout=0.2):
 
 @pytest.fixture()
 def running_server():
+    """
+    TLS Transport Security: every accepted socket is wrapped via
+    tests/tls_test_support.py's serve_tls_client() -- the same context
+    builder (security.tls.build_server_context()) and wrap_socket()
+    call server/server.py's real accept loop uses -- before
+    handle_client() ever sees it.
+    """
     state = ServerState()
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -117,7 +125,9 @@ def running_server():
             except OSError:
                 break
             threading.Thread(
-                target=handle_client, args=(state, client_socket, addr), daemon=True
+                target=serve_tls_client,
+                args=(handle_client, state, client_socket, addr, state.logger),
+                daemon=True,
             ).start()
 
     accept_thread = threading.Thread(target=accept_loop, daemon=True)
@@ -180,7 +190,7 @@ def _connect_and_authenticate(port, user_payload):
     handle_client() requires before it will route chat packets. These
     tests focus on routing, not real Kyber/RSA key material, so the
     public key sent is an inert placeholder."""
-    sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+    sock = wrap_client_socket(socket.create_connection(("127.0.0.1", port), timeout=3))
     token = _login_and_get_token(user_payload)
 
     _send(sock, create_auth_packet(token))

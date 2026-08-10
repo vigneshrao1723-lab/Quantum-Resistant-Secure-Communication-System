@@ -38,6 +38,7 @@ from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from server.client_handler import handle_client
 from server.server_state import ServerState
+from tests.tls_test_support import serve_tls_client, wrap_client_socket
 from utils.protocol import (
     create_auth_packet,
     create_chat_packet,
@@ -113,7 +114,9 @@ def running_server():
             except OSError:
                 break
             threading.Thread(
-                target=handle_client, args=(state, client_socket, addr), daemon=True
+                target=serve_tls_client,
+                args=(handle_client, state, client_socket, addr, state.logger),
+                daemon=True,
             ).start()
 
     accept_thread = threading.Thread(target=accept_loop, daemon=True)
@@ -179,7 +182,9 @@ class _ConnectedClient:
 
     def __init__(self, port, user_payload):
         self.key_manager = KeyManager()
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+        self.sock = wrap_client_socket(
+            socket.create_connection(("127.0.0.1", port), timeout=3)
+        )
 
         token = _login_and_get_token(user_payload)
         _send(self.sock, create_auth_packet(token))
@@ -252,7 +257,7 @@ def _establish_session_key(sender, receiver):
         )
         encrypted_key = base64.b64encode(raw_encrypted_key).decode("utf-8")
 
-    sender.key_manager.add_session_key(receiver.username, session_key)
+    sender.key_manager.store_key(receiver.username, session_key)
 
     _send(
         sender.sock,
@@ -280,7 +285,7 @@ def _establish_session_key(sender, receiver):
             base64.b64decode(packet["encrypted_key"])
         )
 
-    receiver.key_manager.add_session_key(sender.username, received_key)
+    receiver.key_manager.store_key(sender.username, received_key)
 
     return session_key
 
@@ -337,7 +342,7 @@ def test_receiver_decrypts_to_original_plaintext(two_clients):
     _establish_session_key(client_a, client_b)
 
     plaintext = "Decrypt me correctly, please."
-    session_key_a_side = client_a.key_manager.get_session_key(client_b.username)
+    session_key_a_side = client_a.key_manager.get_key(client_b.username)
     ciphertext = AESCipher(session_key_a_side).encrypt(plaintext)
 
     _send(
@@ -350,7 +355,7 @@ def test_receiver_decrypts_to_original_plaintext(two_clients):
     received = _recv_until(client_b.sock, lambda p: p.get("type") == "chat")
     assert received is not None
 
-    session_key_b_side = client_b.key_manager.get_session_key(client_a.username)
+    session_key_b_side = client_b.key_manager.get_key(client_a.username)
     decrypted = AESCipher(session_key_b_side).decrypt(received["message"])
 
     assert decrypted == plaintext
@@ -361,7 +366,7 @@ def test_wrong_session_key_fails_to_decrypt(two_clients):
     _establish_session_key(client_a, client_b)
 
     plaintext = "Only the right key should open this."
-    real_key = client_a.key_manager.get_session_key(client_b.username)
+    real_key = client_a.key_manager.get_key(client_b.username)
     ciphertext = AESCipher(real_key).encrypt(plaintext)
 
     wrong_key = b"0" * 32

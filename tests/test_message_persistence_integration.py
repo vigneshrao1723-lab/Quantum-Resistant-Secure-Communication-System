@@ -35,12 +35,15 @@ from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
 from crypto.aes import AESCipher
 from database.connection import SessionLocal
+from database.models.conversation_member import ConversationMember
 from database.models.message import Message
+from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from server.client_handler import handle_client
 from server.server_state import ServerState
+from tests.tls_test_support import serve_tls_client, wrap_client_socket
 from utils.protocol import (
     create_auth_packet,
     create_chat_packet,
@@ -111,7 +114,9 @@ def running_server():
             except OSError:
                 break
             threading.Thread(
-                target=handle_client, args=(state, client_socket, addr), daemon=True
+                target=serve_tls_client,
+                args=(handle_client, state, client_socket, addr, state.logger),
+                daemon=True,
             ).start()
 
     accept_thread = threading.Thread(target=accept_loop, daemon=True)
@@ -175,7 +180,7 @@ def _connect_and_authenticate(port, user_payload, algorithm="KYBER"):
     handle_client() requires before it will route (and persist) chat
     packets. The public key sent is an inert placeholder -- these
     tests focus on persistence, not real Kyber/RSA key material."""
-    sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+    sock = wrap_client_socket(socket.create_connection(("127.0.0.1", port), timeout=3))
     token = _login_and_get_token(user_payload)
 
     _send(sock, create_auth_packet(token))
@@ -201,11 +206,16 @@ def _get_conversation(sender_user_id, receiver_user_id):
         db.close()
 
 
-def _wait_for_persisted_message(sender_user_id, receiver_user_id, attempts=40):
+def _wait_for_persisted_message(sender_user_id, receiver_user_id, attempts=100):
     """Persistence happens on the server thread right after
     send_to_client() -- poll briefly rather than assuming it's
     already committed and visible the instant the socket read
-    returns."""
+    returns. Widened from 40 attempts (2s) after TLS Transport
+    Security: under heavy concurrent load (many tests' TLS handshakes
+    contending for CPU at once), persistence occasionally took longer
+    than the pre-TLS budget -- a generous ceiling costs nothing on the
+    common, fast path, since the loop still breaks the instant
+    persistence lands."""
     for _ in range(attempts):
         conversation = _get_conversation(sender_user_id, receiver_user_id)
         if conversation:
@@ -214,7 +224,7 @@ def _wait_for_persisted_message(sender_user_id, receiver_user_id, attempts=40):
     return None
 
 
-def _wait_for_conversation_length(user_a_id, user_b_id, expected_length, attempts=40):
+def _wait_for_conversation_length(user_a_id, user_b_id, expected_length, attempts=100):
     for _ in range(attempts):
         conversation = _get_conversation(user_a_id, user_b_id)
         if len(conversation) >= expected_length:
@@ -359,6 +369,139 @@ def test_algorithm_stored(sender_and_recipient):
     saved = _wait_for_persisted_message(sender_id, recipient_id)
     assert saved is not None
     assert saved.algorithm == "KYBER"
+
+
+def test_payload_type_defaults_to_text(sender_and_recipient):
+    """Phase 3 (Universal Secure Payload Architecture): a packet built
+    by create_chat_packet()'s backward-compatible wrapper carries
+    payload_type=PayloadType.TEXT automatically -- persist_message()
+    must store it, without requiring the sender to pass anything new."""
+    from domain.payload_type import PayloadType
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message="ciphertext-blob-payload-type",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.payload_type == PayloadType.TEXT
+    assert saved.content_metadata is None
+
+
+def test_content_metadata_stored_when_present(sender_and_recipient):
+    """A packet that does carry content_metadata (built directly via
+    create_payload_packet(), the generic packet-layer entry point) is
+    persisted into the JSONB column as a plain dict -- proven here
+    even though no payload type populates it in real use yet."""
+    from domain.payload_envelope import PayloadEnvelope
+    from domain.payload_type import PayloadType
+    from utils.protocol import create_payload_packet
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    envelope = PayloadEnvelope(
+        payload_type=PayloadType.TEXT,
+        ciphertext="ciphertext-blob-with-metadata",
+        content_metadata={"note": "future payload types populate this"},
+    )
+
+    _send(
+        sender_sock,
+        create_payload_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            envelope=envelope,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.payload_type == PayloadType.TEXT
+    assert saved.content_metadata == {
+        "note": "future payload types populate this"
+    }
+
+
+def test_conversation_id_populated_with_both_members(sender_and_recipient):
+    """Phase 1 (Conversation Foundation): persist_message() must also
+    resolve/create a direct conversation and record it on the message,
+    alongside the untouched receiver_id, without changing anything
+    about delivery or the receiver_id-based read path above."""
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message="ciphertext-blob-conversation-id",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.conversation_id is not None
+
+    db = SessionLocal()
+    try:
+        members = (
+            db.query(ConversationMember)
+            .filter(ConversationMember.conversation_id == saved.conversation_id)
+            .all()
+        )
+        member_user_ids = {str(member.user_id) for member in members}
+        assert member_user_ids == {sender_id, recipient_id}
+    finally:
+        db.close()
+
+
+def test_conversation_reused_across_multiple_messages(sender_and_recipient):
+    """A second message between the same pair must resolve to the
+    same conversation as the first, not create a duplicate one."""
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    for i in range(2):
+        _send(
+            sender_sock,
+            create_chat_packet(
+                sender=sender_name,
+                receiver=recipient_name,
+                message=f"ciphertext-reuse-{i}",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    conversation = _wait_for_conversation_length(sender_id, recipient_id, 2)
+    assert len(conversation) == 2
+    assert conversation[0].conversation_id == conversation[1].conversation_id
+
+    db = SessionLocal()
+    try:
+        conversation_repo = ConversationRepository(db)
+        resolved = conversation_repo.get_or_create_direct_conversation(
+            sender_id, recipient_id
+        )
+        assert str(resolved.id) == str(conversation[0].conversation_id)
+    finally:
+        db.close()
 
 
 def test_failed_delivery_does_not_create_database_record(running_server):
@@ -558,9 +701,132 @@ def test_load_conversation_history_decrypts_with_cached_session_key(
     _wait_for_conversation_length(sender_id, recipient_id, 1)
 
     recipient_view = _make_session_for(recipient_id, recipient_name)
-    recipient_view.key_manager.add_session_key(sender_name, session_key)
+
+    # Phase 5 (Secure Group Key Distribution): KeyManager is addressed
+    # by conversation_id only -- resolve it via the same
+    # ConversationStore method the application itself uses, rather
+    # than seeding the key under the partner's username.
+    conversation_id = recipient_view.conversation_store.ensure_direct_conversation_id(
+        recipient_id, sender_name
+    )
+    recipient_view.key_manager.store_key(conversation_id, session_key)
 
     history = recipient_view.load_conversation_history(sender_name)
 
     assert len(history) == 1
     assert history[0]["text"] == plaintext
+
+
+# ----------------------------------------------------------------------
+# Phase 6 (Secure File & Image Transfer Infrastructure): blob storage
+# routing in persist_message()
+# ----------------------------------------------------------------------
+
+
+def test_file_payload_routed_to_blob_storage(sender_and_recipient):
+    from domain.payload_envelope import PayloadEnvelope
+    from domain.payload_type import PayloadType
+    from storage import encrypted_blob_store
+    from utils.protocol import create_payload_packet
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    envelope = PayloadEnvelope(
+        payload_type=PayloadType.FILE,
+        ciphertext="fake-file-ciphertext-blob",
+        content_metadata={"filename": "report.pdf", "mime_type": "application/pdf"},
+    )
+
+    _send(
+        sender_sock,
+        create_payload_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            envelope=envelope,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.payload_type == PayloadType.FILE
+    assert saved.ciphertext is None
+    assert saved.blob_ref is not None
+    assert saved.content_metadata == {
+        "filename": "report.pdf", "mime_type": "application/pdf"
+    }
+
+    try:
+        assert encrypted_blob_store.load_blob(saved.blob_ref) == (
+            b"fake-file-ciphertext-blob"
+        )
+    finally:
+        encrypted_blob_store.delete_blob(saved.blob_ref)
+
+
+def test_image_payload_also_routed_to_blob_storage(sender_and_recipient):
+    """Proves FILE isn't special-cased -- IMAGE reuses the exact same
+    routing decision and the exact same storage backend call."""
+    from domain.payload_envelope import PayloadEnvelope
+    from domain.payload_type import PayloadType
+    from storage import encrypted_blob_store
+    from utils.protocol import create_payload_packet
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    envelope = PayloadEnvelope(
+        payload_type=PayloadType.IMAGE,
+        ciphertext="fake-image-ciphertext-blob",
+        content_metadata={"filename": "photo.png"},
+    )
+
+    _send(
+        sender_sock,
+        create_payload_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            envelope=envelope,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.payload_type == PayloadType.IMAGE
+    assert saved.ciphertext is None
+    assert saved.blob_ref is not None
+
+    try:
+        assert encrypted_blob_store.load_blob(saved.blob_ref) == (
+            b"fake-image-ciphertext-blob"
+        )
+    finally:
+        encrypted_blob_store.delete_blob(saved.blob_ref)
+
+
+def test_text_payload_still_stored_inline_not_as_blob(sender_and_recipient):
+    """Regression guard: routing FILE/IMAGE to blob storage must not
+    change TEXT's storage at all -- ciphertext stays inline, blob_ref
+    stays unset, exactly as before Phase 6."""
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message="plain-text-ciphertext",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.ciphertext == "plain-text-ciphertext"
+    assert saved.blob_ref is None

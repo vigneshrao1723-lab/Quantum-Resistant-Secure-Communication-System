@@ -10,13 +10,15 @@ from PySide6.QtWidgets import (
     QWidget,
     QLabel,
     QFrame,
+    QDialog,
     QHBoxLayout,
     QVBoxLayout,
     QMessageBox,
     QPushButton,
 )
 
-from gui.online_users_widget import OnlineUsersWidget
+from gui.conversation_list_widget import ConversationListWidget
+from gui.create_group_dialog import CreateGroupDialog
 from gui.message_widget import MessageWidget
 from gui.input_bar import InputBar
 from gui.status_bar import StatusBarWidget
@@ -67,15 +69,31 @@ class ChatWindow(QWidget):
 
         left_layout.setContentsMargins(14, 14, 14, 14)
 
-        users_title = QLabel("ONLINE USERS")
+        users_title = QLabel("CONVERSATIONS")
 
         users_title.setObjectName("SectionTitle")
 
-        self.online_users = OnlineUsersWidget()
+        self.new_group_button = QPushButton("+ Group")
 
-        left_layout.addWidget(users_title)
+        self.new_group_button.setCursor(Qt.PointingHandCursor)
 
-        left_layout.addWidget(self.online_users)
+        self.new_group_button.clicked.connect(
+            self.handle_create_group
+        )
+
+        conversations_header = QHBoxLayout()
+
+        conversations_header.addWidget(users_title)
+
+        conversations_header.addStretch()
+
+        conversations_header.addWidget(self.new_group_button)
+
+        self.conversation_list = ConversationListWidget()
+
+        left_layout.addLayout(conversations_header)
+
+        left_layout.addWidget(self.conversation_list)
 
         # -----------------------------
         # Right Panel
@@ -189,8 +207,8 @@ class ChatWindow(QWidget):
 
     def connect_signals(self):
 
-        self.online_users.user_selected.connect(
-            self.user_selected
+        self.conversation_list.conversation_selected.connect(
+            self.open_conversation
         )
 
         self.input_bar.message_sent.connect(
@@ -203,8 +221,14 @@ class ChatWindow(QWidget):
 
     def register_callbacks(self):
 
-        self.session.users_updated.connect(
-            self.handle_users_updated
+        # ConversationStore (client/conversation_store.py) is the
+        # single source of truth for sidebar state -- it already
+        # reacts to session.users_updated internally (see
+        # ClientSession.handle_user_list()), so this window only ever
+        # needs to listen for conversations_changed, never
+        # users_updated directly.
+        self.session.conversation_store.conversations_changed.connect(
+            self.render_conversations
         )
 
         self.session.message_received.connect(
@@ -219,42 +243,78 @@ class ChatWindow(QWidget):
         # Sync UI with current session state
         # -----------------------------------------
 
-        self.handle_users_updated(
-            self.session.get_online_users()
-        )
+        self.session.load_conversations()
 
-    def handle_users_updated(self, users):
+    def render_conversations(self):
         """
-        Refresh the online users list, then reapply each user's
-        current unread badge -- update_users() rebuilds the row
-        widgets from scratch, which would otherwise silently drop
-        any badge already being shown.
+        Re-render the sidebar from ConversationStore -- the single
+        source of truth for conversation state. This is the only
+        place the sidebar widget is populated; nothing else in this
+        class (or anywhere else) mutates it directly.
         """
 
-        self.online_users.update_users(users)
+        summaries = self.session.conversation_store.get_all()
 
-        for username in users:
+        self.conversation_list.render(summaries)
 
-            self.online_users.set_unread_count(
-                username,
-                self.session.get_unread_count(username)
+        for summary in summaries:
+
+            self.conversation_list.set_unread_count(
+                summary.key,
+                self.session.get_unread_count(summary.key)
             )
 
     # ==========================================================
     # Events
     # ==========================================================
 
-    def user_selected(self, username):
+    def handle_create_group(self):
+        """
+        Open the group-creation dialog and, if confirmed with a name
+        and at least one member, ask the session to create it. The
+        new group appears in the sidebar asynchronously, once the
+        server confirms it (see ClientSession.handle_group_create_result())
+        -- there is no optimistic local update here.
+        """
 
-        self.session.set_current_chat(username)
+        dialog = CreateGroupDialog(self.session.get_online_users(), self)
 
-        self.session.clear_unread(username)
+        if dialog.exec() == QDialog.Accepted:
 
-        self.online_users.set_unread_count(username, 0)
+            name, member_usernames = dialog.get_result()
 
-        self.chat_partner_label.setText(
-            f"Chatting with {username}"
+            if name and member_usernames:
+                self.session.create_group_conversation(name, member_usernames)
+
+    def open_conversation(self, summary):
+        """
+        Open a conversation -- direct or group. ``summary`` is the
+        whole ConversationSummary the sidebar row was rendered from
+        (see ConversationListWidget.conversation_selected); passed to
+        the session as-is (Phase 5 -- Secure Group Key Distribution)
+        so it can resolve the real conversation_id via
+        ConversationStore without ClientSession ever needing a bare
+        key guessed at here. ``summary.key`` remains the addressing
+        identity for everything else in this method (unread counts,
+        history loading) -- unchanged since Phase 4.
+        """
+
+        key = summary.key
+
+        self.session.set_current_chat(summary)
+
+        self.session.clear_unread(key)
+
+        self.render_conversations()
+
+        display_name = summary.group_name if summary.is_group else summary.username
+
+        label = (
+            f"Group: {display_name}" if summary.is_group
+            else f"Chatting with {display_name}"
         )
+
+        self.chat_partner_label.setText(label)
 
         self.input_bar.set_enabled(True)
 
@@ -262,13 +322,11 @@ class ChatWindow(QWidget):
 
         self.messages.clear_messages()
 
-        self.messages.add_system_message(
-            f"Chatting with {username}"
-        )
+        self.messages.add_system_message(label)
 
-        self.load_history(username)
+        self.load_history(key, summary.is_group)
 
-    def load_history(self, username):
+    def load_history(self, key, is_group=False):
         """
         Populate the message panel with this conversation's stored
         history. Runs once per conversation open, right after the
@@ -277,7 +335,7 @@ class ChatWindow(QWidget):
         paths after this returns.
         """
 
-        history = self.session.load_conversation_history(username)
+        history = self.session.load_conversation_history(key, is_group=is_group)
 
         for entry in history:
 
@@ -326,7 +384,15 @@ class ChatWindow(QWidget):
 
             self.show_error(str(error))
 
-    def receive_message(self, sender, message):
+    def receive_message(self, conversation_key, sender, message):
+        """
+        ``conversation_key`` identifies which conversation this
+        belongs to (a username for direct, a conversation_id for
+        group -- see ClientSession.handle_chat()); ``sender`` is
+        always the individual who wrote it, used only for display.
+        For a direct message the two are the same value, so this
+        check behaves exactly as it did before Phase 4.
+        """
 
         if sender == "system":
 
@@ -336,16 +402,18 @@ class ChatWindow(QWidget):
 
             return
 
-        if sender != self.session.get_current_chat():
+        if conversation_key != self.session.get_current_chat():
 
             # This message belongs to a different conversation. It is
-            # already correctly persisted (Milestone 2) and will be
-            # shown when that conversation is opened (Milestone 3's
-            # history load) -- the currently open conversation must
-            # stay completely unchanged. Track it as unread instead.
-            unread_count = self.session.increment_unread(sender)
+            # already correctly persisted and will be shown when that
+            # conversation is opened -- the currently open conversation
+            # must stay completely unchanged. Track it as unread
+            # instead, then re-render through the single sidebar
+            # render path (ConversationStore already recorded this
+            # message's preview via ClientSession.handle_chat()).
+            self.session.increment_unread(conversation_key)
 
-            self.online_users.set_unread_count(sender, unread_count)
+            self.render_conversations()
 
             return
 

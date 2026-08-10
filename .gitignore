@@ -14,3 +14,8 @@ Thumbs.db
 # Runtime log files
 logs/
 *.log
+
+# TLS certificates and private keys (development + any local
+# deployment) -- generated locally by scripts/generate_dev_certs.py,
+# never committed. See docs/architecture/tls_transport.md.
+certs/

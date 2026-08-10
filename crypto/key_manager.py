@@ -1,4 +1,7 @@
+import base64
+
 from config import KEY_EXCHANGE_ALGORITHM
+from crypto.aes import AESCipher
 from crypto.kyber import KyberKEM
 from crypto.rsa import RSAEncryption
 
@@ -38,13 +41,21 @@ class KeyManager:
         # (Kyber -> raw bytes, RSA -> cryptography key object)
         self.public_keys = {}
 
-        # Store AES session keys for each user
+        # Store AES keys by conversation_id (Phase 5 -- Secure Group
+        # Key Distribution). This is the ONLY identity the encryption
+        # layer ever receives -- a direct conversation's key and a
+        # group conversation's key are stored and looked up exactly
+        # the same way; KeyManager has no notion of "direct" or
+        # "group" at all. conversation_id resolution (including for
+        # a not-yet-created direct conversation) is entirely
+        # ConversationStore's responsibility -- see
+        # client/conversation_store.py::ensure_direct_conversation_id().
         # Example:
         # {
-        #     "Ramya": b"...32 bytes...",
-        #     "Hari": b"...32 bytes..."
+        #     "3fa8...": b"...32 bytes...",  # a direct conversation
+        #     "9c21...": b"...32 bytes...",  # a group conversation
         # }
-        self.session_keys = {}
+        self.keys = {}
 
     # =====================================================
     # Algorithm Helpers
@@ -91,36 +102,44 @@ class KeyManager:
         return self.public_keys.get(username)
 
     # =====================================================
-    # AES Session Key Management
+    # Conversation Key Management (Phase 5)
+    #
+    # The only source of truth for encryption keys across the whole
+    # platform. Every conversation -- direct or group, and every
+    # future payload type built on top (files, images, voice, calls)
+    # -- is addressed here by conversation_id alone. Deliberately no
+    # get_direct_key()/get_group_key()-style methods: the cryptographic
+    # layer must never know or care which kind of conversation a key
+    # belongs to.
     # =====================================================
 
-    def add_session_key(self, username, key):
+    def store_key(self, conversation_id, key):
         """
-        Store the AES session key shared with a user.
-        """
-
-        self.session_keys[username] = key
-
-    def get_session_key(self, username):
-        """
-        Retrieve the AES session key for a user.
+        Store the AES key for a conversation.
         """
 
-        return self.session_keys.get(username)
+        self.keys[conversation_id] = key
 
-    def has_session_key(self, username):
+    def get_key(self, conversation_id):
         """
-        Check whether a session key already exists.
-        """
-
-        return username in self.session_keys
-
-    def remove_session_key(self, username):
-        """
-        Remove a user's session key.
+        Retrieve the AES key for a conversation.
         """
 
-        self.session_keys.pop(username, None)
+        return self.keys.get(conversation_id)
+
+    def has_key(self, conversation_id):
+        """
+        Check whether a key already exists for a conversation.
+        """
+
+        return conversation_id in self.keys
+
+    def remove_key(self, conversation_id):
+        """
+        Remove a conversation's key.
+        """
+
+        self.keys.pop(conversation_id, None)
 
     # =====================================================
     # Kyber Encapsulation / Decapsulation
@@ -183,3 +202,74 @@ class KeyManager:
         return self.rsa.decrypt(
             encrypted_key
         )
+
+    # =====================================================
+    # Group Key Wrapping (Phase 4 -- Secure Group Messaging
+    # Foundation)
+    #
+    # Distributes one arbitrary, already-chosen 32-byte AES key (the
+    # group key) to a member. Composes the same primitives above --
+    # no new cryptography is introduced.
+    # =====================================================
+
+    def wrap_key_for_member(self, username, key_bytes):
+        """
+        Wrap a pre-chosen key (the group key) for one member.
+
+        RSA mode: RSA-OAEP is true public-key encryption, so it can
+        encrypt the caller-chosen key_bytes directly -- the same
+        operation encrypt_session_key() already performs.
+
+        KYBER mode: ML-KEM is a KEM, not a PKE -- encapsulate() always
+        generates its own fresh secret, it cannot target a
+        caller-chosen one. So a fresh per-member secret is
+        encapsulated (the same operation encapsulate_session_key()
+        already performs) and used to AES-GCM-encrypt key_bytes --
+        standard KEM-then-DEM hybrid composition, not a new protocol.
+
+        Returns (encapsulation, wrapped_key): encapsulation is the
+        Kyber ciphertext in KYBER mode, or None in RSA mode (nothing
+        to decapsulate); wrapped_key is always a base64 string.
+        """
+
+        public_key = self.get_public_key(username)
+
+        if public_key is None:
+            raise ValueError(
+                f"No public key found for {username}"
+            )
+
+        if self.algorithm == "KYBER":
+
+            encapsulation, wrapping_secret = self.kyber.encapsulate(
+                public_key
+            )
+
+            wrapped_key = AESCipher(wrapping_secret).encrypt(
+                base64.b64encode(key_bytes).decode("ascii")
+            )
+
+            return encapsulation, wrapped_key
+
+        encrypted = self.rsa.encrypt(key_bytes, public_key)
+
+        return None, base64.b64encode(encrypted).decode("utf-8")
+
+    def unwrap_received_key(self, encapsulation, wrapped_key):
+        """
+        Reverse of wrap_key_for_member(), using this client's own
+        private key material -- the recipient's decapsulation/RSA
+        private key, never anything from the sender.
+        """
+
+        if self.algorithm == "KYBER":
+
+            wrapping_secret = self.kyber.decapsulate(encapsulation)
+
+            key_b64 = AESCipher(wrapping_secret).decrypt(wrapped_key)
+
+            return base64.b64decode(key_b64)
+
+        encrypted = base64.b64decode(wrapped_key)
+
+        return self.rsa.decrypt(encrypted)

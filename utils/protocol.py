@@ -4,6 +4,9 @@ Protocol Module
 Defines all packet formats used by the application.
 """
 
+from domain.payload_envelope import PayloadEnvelope
+from domain.payload_type import PayloadType
+
 
 def create_auth_packet(access_token):
     """
@@ -35,6 +38,43 @@ def create_auth_result_packet(
     }
 
 
+def create_payload_packet(
+    sender,
+    envelope,
+    timestamp=None,
+    receiver=None,
+    conversation_id=None
+):
+    """
+    Wrap an already-encrypted PayloadEnvelope for the wire.
+
+    Transport-only: this function knows nothing about serialization
+    or encryption -- envelope.ciphertext is opaque to it. This is the
+    generic packet-layer entry point every payload type (text, and in
+    future files, images, voice, video) uses; create_chat_packet()
+    below exists only so every pre-existing text caller keeps working
+    unmodified.
+
+    Exactly one of `receiver` (a username -- direct conversation) or
+    `conversation_id` (a group conversation) should be given. This is
+    the addressing extension Phase 4 (Secure Group Messaging
+    Foundation) adds -- a group message reuses this exact packet
+    shape and "chat" type rather than a duplicate one; the server
+    routes on whichever field is present.
+    """
+
+    return {
+        "type": "chat",
+        "sender": sender,
+        "receiver": receiver,
+        "conversation_id": conversation_id,
+        "message": envelope.ciphertext,
+        "payload_type": envelope.payload_type,
+        "content_metadata": envelope.content_metadata or None,
+        "timestamp": timestamp
+    }
+
+
 def create_chat_packet(
     sender,
     receiver,
@@ -43,14 +83,86 @@ def create_chat_packet(
 ):
     """
     Create a private chat message packet.
+
+    A backward-compatible wrapper around create_payload_packet():
+    every existing caller keeps working with its original signature
+    and output shape (plus the additive fields the generic builder
+    adds). `message` is wrapped into a "text" PayloadEnvelope and
+    handed to the generic builder. New payload types, and group
+    messaging, call create_payload_packet() directly instead of
+    extending this function.
+    """
+
+    envelope = PayloadEnvelope(
+        payload_type=PayloadType.TEXT,
+        ciphertext=message,
+        content_metadata={},
+    )
+
+    return create_payload_packet(sender, envelope, timestamp, receiver=receiver)
+
+
+def create_group_create_packet(
+    sender,
+    name,
+    member_usernames
+):
+    """
+    Ask the server to create a new group conversation. No existing
+    packet performs this operation, so this is genuinely new rather
+    than a duplicate of anything in the payload pipeline.
     """
 
     return {
-        "type": "chat",
+        "type": "group_create",
         "sender": sender,
-        "receiver": receiver,
-        "message": message,
-        "timestamp": timestamp
+        "name": name,
+        "members": member_usernames
+    }
+
+
+def create_group_create_result_packet(
+    conversation_id,
+    name,
+    creator,
+    members
+):
+    """
+    Confirm a group's creation to every currently connected member
+    (including the creator), so each client's sidebar and (for the
+    creator) group-key distribution can proceed.
+    """
+
+    return {
+        "type": "group_create_result",
+        "conversation_id": conversation_id,
+        "name": name,
+        "creator": creator,
+        "members": members
+    }
+
+
+def create_group_key_distribution_packet(
+    sender,
+    conversation_id,
+    recipient,
+    encapsulation,
+    wrapped_key
+):
+    """
+    Deliver one member's wrapped copy of a group key
+    (crypto/key_manager.py's wrap_key_for_member()). The server only
+    ever relays this packet's two opaque fields -- it never sees the
+    group key itself.
+    """
+
+    return {
+        "type": "group_key_distribution",
+        "sender": sender,
+        "conversation_id": conversation_id,
+        "recipient": recipient,
+        "encapsulation": encapsulation,
+        "wrapped_key": wrapped_key
     }
 
 
