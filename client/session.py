@@ -38,6 +38,8 @@ from utils.protocol import (
     create_auth_packet,
     create_group_create_packet,
     create_group_key_distribution_packet,
+    create_group_key_rotation_complete_packet,
+    create_group_leave_packet,
     create_payload_packet,
     create_public_key_packet,
     create_session_key_packet,
@@ -531,6 +533,15 @@ class ClientSession(QObject):
 
         sent_at = datetime.now(timezone.utc)
 
+        # Phase 7 -- Group Membership Management: every outgoing
+        # message is stamped with the epoch that encrypted it (always
+        # 1 for a direct conversation, or a group before its first
+        # rotation). current_epoch() reflects whatever key
+        # session_key above actually is, since both are read from
+        # KeyManager for the same conversation_id without anything in
+        # between that could change it.
+        epoch = self.key_manager.current_epoch(self.current_conversation_id) or 1
+
         if self.current_chat_is_group:
 
             packet = create_payload_packet(
@@ -538,6 +549,7 @@ class ClientSession(QObject):
                 envelope=envelope,
                 timestamp=sent_at.isoformat(),
                 conversation_id=self.current_chat,
+                epoch=epoch,
             )
 
         else:
@@ -547,6 +559,7 @@ class ClientSession(QObject):
                 envelope=envelope,
                 timestamp=sent_at.isoformat(),
                 receiver=self.current_chat,
+                epoch=epoch,
             )
 
         send_message(
@@ -569,7 +582,7 @@ class ClientSession(QObject):
             ),
         )
 
-    def _decrypt_history_message(self, conversation_id, ciphertext):
+    def _decrypt_history_message(self, conversation_id, ciphertext, epoch=1):
         """
         Best-effort AES decryption of a stored historical message.
 
@@ -578,15 +591,27 @@ class ClientSession(QObject):
         alike -- KeyManager.keys is addressed by nothing else; this
         method needs no branch for either.
 
+        ``epoch`` (Phase 7 -- Group Membership Management): exactly
+        the epoch that encrypted this specific message (Message.epoch,
+        with NULL already normalized to 1 by the caller) -- never
+        "whatever this client's current key is". A group that has
+        rotated has messages at multiple epochs in the same
+        conversation; using the wrong one here would either fail to
+        decrypt a message this client CAN read, or -- far worse --
+        silently return garbage if two different epochs' keys somehow
+        both happened to authenticate (AES-GCM's tag makes this
+        effectively impossible per-message, but the point is this
+        method never relies on that; it asks for the one correct key).
+
         Reuses the currently cached key, if any -- never establishes a
         new one (history loading must not trigger a fresh key
-        exchange). Never raises: returns the placeholder text if no
-        key is cached, or if AES-GCM authentication fails (the message
-        was encrypted under a different, since-discarded key from a
-        previous session).
+        exchange). Never raises: returns the placeholder text if this
+        client never received that epoch's key, or if AES-GCM
+        authentication fails (the message was encrypted under a
+        different, since-discarded key from a previous session).
         """
 
-        session_key = self.key_manager.get_key(conversation_id)
+        session_key = self.key_manager.get_key(conversation_id, epoch=epoch)
 
         if session_key is None:
             return _UNDECRYPTABLE_PLACEHOLDER
@@ -689,7 +714,8 @@ class ClientSession(QObject):
 
                 text = self._decrypt_history_message(
                     decrypt_key,
-                    message.ciphertext
+                    message.ciphertext,
+                    epoch=message.epoch or 1,
                 )
 
                 history.append({
@@ -740,7 +766,8 @@ class ClientSession(QObject):
 
                         text = self._decrypt_history_message(
                             conversation_id,
-                            preview.latest_message.ciphertext
+                            preview.latest_message.ciphertext,
+                            epoch=preview.latest_message.epoch or 1,
                         )
 
                         latest_message = MessagePreview(
@@ -777,7 +804,8 @@ class ClientSession(QObject):
                     # not the partner's username.
                     text = self._decrypt_history_message(
                         str(preview.conversation.id),
-                        preview.latest_message.ciphertext
+                        preview.latest_message.ciphertext,
+                        epoch=preview.latest_message.epoch or 1,
                     )
 
                     latest_message = MessagePreview(
@@ -867,6 +895,12 @@ class ClientSession(QObject):
 
         elif packet_type == "group_key_distribution":
             self.handle_group_key_distribution(packet)
+
+        elif packet_type == "group_member_left":
+            self.handle_group_member_left(packet)
+
+        elif packet_type == "group_key_rotation_required":
+            self.handle_group_key_rotation_required(packet)
 
         else:
 
@@ -965,12 +999,20 @@ class ClientSession(QObject):
 
         encrypted_message = packet["message"]
 
+        # Phase 7 -- Group Membership Management: decrypt using
+        # exactly the epoch this packet says encrypted it, never
+        # "whatever this client's current key is" -- a receiver that
+        # is mid-rotation, or that never received a later epoch (e.g.
+        # a departed member), must not conflate the two.
+        epoch = packet.get("epoch") or 1
+
         session_key = None
 
         for _ in range(10):
 
             session_key = self.key_manager.get_key(
-                key_conversation_id
+                key_conversation_id,
+                epoch=epoch,
             )
 
             if session_key is not None:
@@ -981,7 +1023,7 @@ class ClientSession(QObject):
         if session_key is None:
 
             self.logger.warning(
-                f"No AES session key for {identity_key}"
+                f"No AES session key for {identity_key} (epoch {epoch})"
             )
 
             self.error_occurred.emit(
@@ -1157,28 +1199,26 @@ class ClientSession(QObject):
         if creator == self.username:
             self._create_and_distribute_group_key(conversation_id, participants)
 
-    def _create_and_distribute_group_key(self, conversation_id, participants):
+    def _distribute_group_key(self, conversation_id, group_key, epoch, recipients):
         """
-        Generate a fresh group key and deliver it to every other
-        member whose public key is already known -- see
+        Wrap ``group_key`` (already stored locally under ``epoch``) for
+        each of ``recipients`` and send it -- see
         crypto/key_manager.py::wrap_key_for_member() for the
-        KEM-then-DEM composition. A member with no cached public key
-        (never online this session) does not receive it; retroactive
-        delivery to a late-joining or previously-offline member is out
-        of scope for this foundation phase.
+        KEM-then-DEM composition. Shared by both initial group
+        creation (epoch 1) and Phase 7's post-leave rotation (epoch
+        N > 1) so the wrap-and-send loop exists exactly once. A
+        recipient with no cached public key (never online this
+        session) does not receive it; retroactive delivery to a
+        late-joining or previously-offline member is out of scope.
         """
 
-        group_key = os.urandom(32)
-
-        self.key_manager.store_key(conversation_id, group_key)
-
-        for member in participants:
+        for member in recipients:
 
             if self.key_manager.get_public_key(member) is None:
 
                 self.logger.warning(
                     f"No public key for {member}; cannot distribute "
-                    f"group key for {conversation_id}."
+                    f"group key for {conversation_id} epoch {epoch}."
                 )
 
                 continue
@@ -1193,12 +1233,25 @@ class ClientSession(QObject):
                 recipient=member,
                 encapsulation=encapsulation,
                 wrapped_key=wrapped_key,
+                epoch=epoch,
             )
 
             send_message(
                 self.client_socket,
                 packet
             )
+
+    def _create_and_distribute_group_key(self, conversation_id, participants):
+        """
+        Generate the group's first key (epoch 1) and deliver it to
+        every other member whose public key is already known.
+        """
+
+        group_key = os.urandom(32)
+
+        self.key_manager.store_key(conversation_id, group_key, epoch=1)
+
+        self._distribute_group_key(conversation_id, group_key, 1, participants)
 
         self.logger.info(
             f"Distributed group key for {conversation_id} to {participants}"
@@ -1210,21 +1263,139 @@ class ClientSession(QObject):
         crypto/key_manager.py::unwrap_received_key(). Uses only this
         client's own private key material; nothing from the sender is
         needed beyond the packet's opaque fields.
+
+        ``epoch`` (Phase 7 -- Group Membership Management): stored
+        under the epoch the packet declares, defaulting to 1 for
+        compatibility with a sender that predates this field.
+        KeyManager.store_key() never overwrites an existing epoch with
+        a different key, so a redundant/duplicate delivery of the same
+        epoch is always safe.
         """
 
         if packet.get("recipient") != self.username:
             return
 
         conversation_id = packet["conversation_id"]
+        epoch = packet.get("epoch") or 1
 
         group_key = self.key_manager.unwrap_received_key(
             packet["encapsulation"], packet["wrapped_key"]
         )
 
-        self.key_manager.store_key(conversation_id, group_key)
+        self.key_manager.store_key(conversation_id, group_key, epoch=epoch)
 
         self.logger.info(
-            f"Group key established for conversation {conversation_id}"
+            f"Group key established for conversation {conversation_id} "
+            f"(epoch {epoch})"
+        )
+
+    def handle_group_member_left(self, packet):
+        """
+        A group conversation this user belongs to lost a member (Phase
+        7 -- Group Membership Management) -- one packet, two
+        interpretations depending on whose username left:
+
+        If it was this client's own username, the leave this client
+        itself requested (leave_group_conversation()) has been
+        confirmed by the server -- this is the only acknowledgment
+        that ever arrives for it, matching every other conversation-
+        store change in this codebase being server-confirmed rather
+        than optimistic. The conversation is removed from this
+        client's own view.
+
+        Otherwise, a different member left -- this client is still in
+        the group, so its participant list is refreshed to the
+        server-provided remaining-members list. No key-rotation action
+        is taken here: rotation is entirely server-initiated (see
+        handle_group_key_rotation_required()), never self-elected.
+        """
+
+        conversation_id = packet["conversation_id"]
+        departed_username = packet["username"]
+        members = packet.get("members", [])
+
+        if departed_username == self.username:
+
+            self.conversation_store.remove_conversation(conversation_id)
+
+            self.logger.info(
+                f"Left group {conversation_id}"
+            )
+
+            return
+
+        self.conversation_store.update_group_participants(conversation_id, members)
+
+        self.logger.info(
+            f"{departed_username} left group {conversation_id} "
+            f"(remaining: {members})"
+        )
+
+    def handle_group_key_rotation_required(self, packet):
+        """
+        The server has selected this client to establish a group
+        conversation's next key epoch (Phase 7 -- Group Membership
+        Management) -- either right after a member left, or as
+        reconnect-triggered catch-up for a rotation an earlier
+        initiator never finished distributing.
+
+        Reuses an already-stored key for this exact epoch rather than
+        generating a new one -- see KeyManager.store_key()'s no-
+        overwrite guarantee -- so a retry (this client being asked
+        again for an epoch it already generated) redistributes the
+        SAME key instead of creating a second, conflicting one. This
+        is what makes recovery from a partial-distribution failure
+        safe: whichever client ends up finishing the job always
+        produces the identical epoch key every other recipient
+        already has or will receive.
+        """
+
+        conversation_id = packet["conversation_id"]
+        epoch = packet["epoch"]
+        recipients = [
+            member for member in packet.get("members", [])
+            if member != self.username
+        ]
+
+        if self.key_manager.has_key(conversation_id, epoch=epoch):
+            group_key = self.key_manager.get_key(conversation_id, epoch=epoch)
+        else:
+            group_key = os.urandom(32)
+            self.key_manager.store_key(conversation_id, group_key, epoch=epoch)
+
+        self._distribute_group_key(conversation_id, group_key, epoch, recipients)
+
+        send_message(
+            self.client_socket,
+            create_group_key_rotation_complete_packet(
+                conversation_id=conversation_id,
+                epoch=epoch,
+            ),
+        )
+
+        self.logger.info(
+            f"Rotated group key for {conversation_id} to epoch {epoch} "
+            f"({recipients})"
+        )
+
+    def leave_group_conversation(self, conversation_id):
+        """
+        Ask the server to remove this client from a group conversation
+        (Phase 7 -- Group Membership Management). The result (removing
+        the conversation from this client's own view, and notifying
+        remaining members) arrives asynchronously via
+        handle_group_member_left() -- there is no optimistic local
+        update, matching every other conversation-store change.
+        """
+
+        packet = create_group_leave_packet(
+            sender=self.username,
+            conversation_id=conversation_id,
+        )
+
+        send_message(
+            self.client_socket,
+            packet
         )
 
     def create_group_conversation(self, name, member_usernames):

@@ -121,6 +121,16 @@ class ChatWindow(QWidget):
             "font-size: 15px; font-weight: 700;"
         )
 
+        self.leave_group_button = QPushButton("Leave Group")
+
+        self.leave_group_button.setCursor(Qt.PointingHandCursor)
+
+        self.leave_group_button.clicked.connect(
+            self.handle_leave_group
+        )
+
+        self.leave_group_button.setVisible(False)
+
         self.logout_button = QPushButton("Logout")
 
         self.logout_button.setCursor(Qt.PointingHandCursor)
@@ -134,6 +144,8 @@ class ChatWindow(QWidget):
         header_top_row.addWidget(app_title)
 
         header_top_row.addStretch()
+
+        header_top_row.addWidget(self.leave_group_button)
 
         header_top_row.addWidget(self.logout_button)
 
@@ -235,6 +247,17 @@ class ChatWindow(QWidget):
             self.receive_message
         )
 
+        # connection_changed carries only True/False (client/session.py
+        # emits it on successful connect(), on explicit disconnect(),
+        # and -- the gap this closes -- on an unexpected mid-session
+        # drop detected by the receiver thread, client/receiver.py).
+        # StatusBarWidget.set_connected() already takes exactly that
+        # bool, so this is a direct connection: no new connection-state
+        # concept, no polling, no second source of truth.
+        self.session.connection_changed.connect(
+            self.status.set_connected
+        )
+
         self.session.error_occurred.connect(
             self.show_error
         )
@@ -286,6 +309,28 @@ class ChatWindow(QWidget):
             if name and member_usernames:
                 self.session.create_group_conversation(name, member_usernames)
 
+    def handle_leave_group(self):
+        """
+        Leave the currently open group conversation (Phase 7 -- Group
+        Membership Management). A no-op if the open conversation isn't
+        a group -- the button is only visible when it is, but this
+        guards direct calls/races too. No optimistic local update:
+        the sidebar/message panel update once the server confirms via
+        ClientSession.handle_group_member_left() ->
+        conversations_changed, the same path every other conversation-
+        store change already goes through.
+        """
+
+        if not self.session.current_chat_is_group:
+            return
+
+        conversation_id = self.session.get_current_chat()
+
+        if conversation_id is None:
+            return
+
+        self.session.leave_group_conversation(conversation_id)
+
     def open_conversation(self, summary):
         """
         Open a conversation -- direct or group. ``summary`` is the
@@ -306,6 +351,8 @@ class ChatWindow(QWidget):
         self.session.clear_unread(key)
 
         self.render_conversations()
+
+        self.leave_group_button.setVisible(summary.is_group)
 
         display_name = summary.group_name if summary.is_group else summary.username
 

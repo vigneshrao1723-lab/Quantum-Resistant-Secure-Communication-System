@@ -16,7 +16,7 @@ in Phase 1 only ever passes TYPE_DIRECT.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import CheckConstraint, Column, DateTime, String
+from sqlalchemy import CheckConstraint, Column, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 
 from database.models.base import Base
@@ -56,6 +56,32 @@ class Conversation(Base):
     # Additive (Phase 4 -- Secure Group Messaging Foundation): nullable,
     # meaningful only for TYPE_GROUP. Direct conversations never set it.
     name = Column(String(128), nullable=True)
+
+    # Additive (Phase 7 -- Group Membership Management), meaningful
+    # only for TYPE_GROUP -- direct conversations stay at epoch 1
+    # forever, since nothing ever rotates them. Together these two
+    # counters are the server's authoritative, race-free bookkeeping
+    # for group-key rotation (see server/client_handler.py's leave/
+    # rotation handlers); the server tracks *which epoch number* is
+    # current/confirmed as plain coordination metadata -- it never
+    # sees the epoch's actual key material.
+    #
+    # current_key_epoch: the highest epoch *reserved* so far --
+    # incremented by exactly one every time a member leaves.
+    #
+    # confirmed_key_epoch: the highest epoch a rotation initiator has
+    # confirmed finishing distribution for (group_key_rotation_complete).
+    # "A rotation is owed" is the derived condition
+    # confirmed_key_epoch < current_key_epoch -- not a separate flag --
+    # so an arbitrary backlog of un-rotated epochs (multiple leaves
+    # before an earlier rotation finishes) is representable and can be
+    # caught up one epoch at a time, in order, never skipped.
+    #
+    # Both default to 1: every conversation that predates this phase
+    # has, in fact, never rotated -- 1 is the true current and
+    # confirmed epoch for all of them, not a placeholder.
+    current_key_epoch = Column(Integer, nullable=False, default=1)
+    confirmed_key_epoch = Column(Integer, nullable=False, default=1)
 
     created_at = Column(DateTime, nullable=False, default=_utc_now)
 

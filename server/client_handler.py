@@ -28,6 +28,8 @@ from utils.protocol import (
     create_auth_result_packet,
     create_delivery_failure_packet,
     create_group_create_result_packet,
+    create_group_key_rotation_required_packet,
+    create_group_member_left_packet,
     create_join_packet,
     create_leave_packet,
     parse_packet,
@@ -132,6 +134,7 @@ def persist_message(sender_id, receiver_id, algorithm, packet, conversation_id=N
             content_metadata=envelope.content_metadata or None,
             algorithm=algorithm or KEY_EXCHANGE_ALGORITHM,
             timestamp=_parse_message_timestamp(packet.get("timestamp")),
+            epoch=packet.get("epoch") or 1,
         )
 
         db.commit()
@@ -328,6 +331,282 @@ def handle_group_create(state, client_socket, user, packet):
     )
 
 
+def _usernames_for(db, member_ids):
+    """Resolve a list of user ids to their usernames, skipping any
+    that no longer exist. Small groups, one lookup per member --
+    mirrors handle_group_create()'s own username-resolution loop."""
+
+    user_repo = UserRepository(db)
+
+    usernames = []
+
+    for member_id in member_ids:
+
+        member = user_repo.get_by_id(member_id)
+
+        if member is not None:
+            usernames.append(member.username)
+
+    return usernames
+
+
+def _select_connected_active_member(state, member_ids, exclude_user_id=None):
+    """
+    Return the (socket, username) of one currently-connected member
+    among ``member_ids``, or None if none are connected (Phase 7 --
+    Group Membership Management). Any valid connected member is
+    acceptable -- there is no election, no username/id ordering
+    requirement; the server is the sole issuer of rotation
+    instructions, so which specific connected member is picked has no
+    correctness implications, only that at most one is picked per
+    dispatch.
+    """
+
+    member_id_strings = {str(member_id) for member_id in member_ids}
+
+    for sock, client in list(state.clients.items()):
+
+        if exclude_user_id is not None and client.get("user_id") == str(exclude_user_id):
+            continue
+
+        if client.get("user_id") in member_id_strings:
+            return sock, client["username"]
+
+    return None
+
+
+def _dispatch_pending_rotation_if_needed(state, conversation_id_str):
+    """
+    If a conversation's confirmed_key_epoch is behind its
+    current_key_epoch, select one currently-connected active member
+    and send them a group_key_rotation_required instruction for the
+    next unconfirmed epoch (Phase 7 -- Group Membership Management).
+
+    A no-op if already caught up, or if no active member is currently
+    connected -- the gap is picked up again the next time an active
+    member connects (see handle_client()'s reconnect-recovery hook) or
+    the next time a rotation completes for this conversation (see
+    handle_group_key_rotation_complete(), which calls this again after
+    advancing confirmed_key_epoch, so a multi-epoch backlog is caught
+    up one epoch at a time, in order, never skipped).
+    """
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        conversation_id = uuid.UUID(conversation_id_str)
+
+        current_epoch, confirmed_epoch = conversation_repo.get_epoch_state(
+            conversation_id
+        )
+
+        if current_epoch is None or confirmed_epoch >= current_epoch:
+            return
+
+        next_epoch = confirmed_epoch + 1
+
+        member_ids = conversation_repo.get_member_user_ids(conversation_id)
+        member_usernames = _usernames_for(db, member_ids)
+    finally:
+        db.close()
+
+    selected = _select_connected_active_member(state, member_ids)
+
+    if selected is None:
+        state.logger.info(
+            f"No connected active member available to rotate "
+            f"{conversation_id_str} to epoch {next_epoch}; deferred until "
+            f"an active member connects."
+        )
+        return
+
+    sock, selected_username = selected
+
+    recipients = [u for u in member_usernames if u != selected_username]
+
+    send_to_client(
+        sock,
+        create_group_key_rotation_required_packet(
+            conversation_id=conversation_id_str,
+            epoch=next_epoch,
+            members=recipients,
+        ),
+    )
+
+    state.logger.info(
+        f"Dispatched group key rotation for {conversation_id_str} epoch "
+        f"{next_epoch} to {selected_username}"
+    )
+
+
+def handle_group_leave(state, client_socket, user, packet):
+    """
+    Remove the authenticated user from a group conversation (Phase 7
+    -- Group Membership Management).
+
+    Security: who leaves is derived entirely from the authenticated
+    socket (``user``), never from packet["sender"]/packet["user_id"]/
+    packet["username"] -- mirrors the sender-authentication and
+    group-membership-authorization hardening already in
+    handle_group_chat_delivery(). Membership is verified the same way
+    (get_member_user_ids()) before anything is changed.
+
+    Transactional: left_at is set and the next epoch is reserved in
+    the SAME session, committed once -- see
+    ConversationRepository.reserve_next_epoch()'s docstring for why a
+    split here (unlike persist_group_message()'s accepted two-
+    transaction gap) is not acceptable: losing the epoch reservation
+    while the departure commits would leave the group silently stuck
+    on a key the departed member still holds, with nothing to ever
+    trigger a rotation.
+    """
+
+    conversation_id = packet.get("conversation_id")
+
+    if not conversation_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        conversation_uuid = uuid.UUID(conversation_id)
+
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+        if user.id not in member_ids:
+
+            state.logger.warning(
+                f"Rejected group_leave: {user.username} is not a member of "
+                f"{conversation_id}"
+            )
+
+            return
+
+        conversation_repo.leave_conversation(conversation_uuid, user.id)
+        conversation_repo.reserve_next_epoch(conversation_uuid)
+
+        conversation_repo.commit()
+
+        remaining_ids = [m for m in member_ids if m != user.id]
+        remaining_usernames = _usernames_for(db, remaining_ids)
+    finally:
+        db.close()
+
+    member_left_packet = create_group_member_left_packet(
+        conversation_id=conversation_id,
+        username=user.username,
+        members=remaining_usernames,
+    )
+
+    all_former_id_strings = {str(m) for m in member_ids}
+
+    for sock, client in list(state.clients.items()):
+
+        if client.get("user_id") in all_former_id_strings:
+            send_to_client(sock, member_left_packet)
+
+    state.logger.info(
+        f"{user.username} left group {conversation_id} "
+        f"(remaining: {remaining_usernames})"
+    )
+
+    if not remaining_ids:
+        return
+
+    _dispatch_pending_rotation_if_needed(state, conversation_id)
+
+
+def handle_group_key_rotation_complete(state, client_socket, user, packet):
+    """
+    A rotation initiator has finished attempting distribution of an
+    epoch's group key (Phase 7 -- Group Membership Management).
+    Carries no key material -- only conversation_id and an epoch
+    number.
+
+    Authorization: only an active member of the conversation may
+    advance its confirmed_key_epoch -- otherwise a non-member could
+    falsely claim a rotation completed, tricking the server into never
+    re-dispatching it to the members who never actually received the
+    key. Advancing is itself guarded with max() (see
+    ConversationRepository.confirm_epoch()), so even a legitimate but
+    stale/duplicate confirmation cannot regress state.
+
+    Chains immediately into the next epoch if this conversation still
+    has a backlog (multiple leaves before an earlier rotation
+    finished) -- see _dispatch_pending_rotation_if_needed().
+    """
+
+    conversation_id = packet.get("conversation_id")
+    epoch = packet.get("epoch")
+
+    if not conversation_id or epoch is None:
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        conversation_uuid = uuid.UUID(conversation_id)
+
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+        if user.id not in member_ids:
+
+            state.logger.warning(
+                f"Rejected group_key_rotation_complete: {user.username} is "
+                f"not a member of {conversation_id}"
+            )
+
+            return
+
+        conversation_repo.confirm_epoch(conversation_uuid, epoch)
+        conversation_repo.commit()
+    finally:
+        db.close()
+
+    state.logger.info(
+        f"{user.username} confirmed group key rotation for {conversation_id} "
+        f"epoch {epoch}"
+    )
+
+    _dispatch_pending_rotation_if_needed(state, conversation_id)
+
+
+def _recover_pending_rotations_for_user(state, user):
+    """
+    Reconnect recovery (Phase 7 -- Group Membership Management): for
+    every active group conversation this user belongs to where a
+    rotation was reserved but never confirmed complete, dispatch the
+    next outstanding epoch -- picking up a rotation an earlier
+    initiator never finished (e.g. it disconnected mid-distribution).
+
+    Purely event-driven off the existing connection-setup path in
+    handle_client() -- no scheduler, polling loop, or background
+    worker. Called once, after distribute_public_keys() has already
+    queued this user's peers' public keys to them on this same
+    connection -- TCP/TLS's in-order, per-connection delivery
+    guarantees those are processed by this client's receiver thread
+    before any rotation instruction sent afterward on the same socket,
+    so a freshly (re)connected initiator already has what it needs to
+    wrap a key for every other remaining member.
+    """
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        pending_conversation_ids = (
+            conversation_repo.get_group_conversations_with_pending_rotation(user.id)
+        )
+    finally:
+        db.close()
+
+    for conversation_id in pending_conversation_ids:
+        _dispatch_pending_rotation_if_needed(state, str(conversation_id))
+
+
 def authenticate_connection(state, client_socket, client_address):
     """
     Receive and validate the client's JWT access token.
@@ -458,6 +737,16 @@ def handle_client(state, client_socket, client_address):
                 state,
                 client_socket
             )
+
+            # -----------------------------
+            # Group key rotation recovery (Phase 7)
+            #
+            # Must come after distribute_public_keys() above -- see
+            # _recover_pending_rotations_for_user()'s docstring for
+            # why that ordering, on this same connection, is load-
+            # bearing rather than incidental.
+            # -----------------------------
+            _recover_pending_rotations_for_user(state, user)
 
         # -----------------------------
         # Notify other clients
@@ -627,6 +916,20 @@ def handle_client(state, client_socket, client_address):
                         )
 
                         break
+
+            # -----------------------------
+            # Group Leave Packet (Phase 7)
+            # -----------------------------
+            elif packet.get("type") == "group_leave":
+
+                handle_group_leave(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Group Key Rotation Complete Packet (Phase 7)
+            # -----------------------------
+            elif packet.get("type") == "group_key_rotation_complete":
+
+                handle_group_key_rotation_complete(state, client_socket, user, packet)
 
     except Exception as e:
 

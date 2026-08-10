@@ -180,6 +180,7 @@ def test_create_payload_packet_shape():
         "payload_type": PayloadType.TEXT,
         "content_metadata": None,
         "timestamp": "2026-01-01T00:00:00+00:00",
+        "epoch": None,
     }
 
 
@@ -281,4 +282,5 @@ def test_create_group_key_distribution_packet_shape():
         "recipient": "bob",
         "encapsulation": "kyber-ct",
         "wrapped_key": "wrapped-b64",
+        "epoch": 1,
     }

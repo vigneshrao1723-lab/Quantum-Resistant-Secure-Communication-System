@@ -14,9 +14,17 @@ Phase 2 (Conversation List Foundation) adds
 get_conversation_previews_for_user() -- the read side of the sidebar,
 returning each of a user's conversations paired with its latest
 message and other participant(s) in two efficient, set-based queries.
+
+Phase 7 (Group Membership Management) adds leave_conversation() and
+the group-key-epoch bookkeeping methods (reserve_next_epoch(),
+get_epoch_state(), confirm_epoch(), get_group_conversations_with_pending_rotation())
+-- all operating on the existing ConversationMember.left_at column and
+the new Conversation.current_key_epoch/confirmed_key_epoch columns,
+never a second membership-state mechanism.
 """
 
 from collections import namedtuple
+from datetime import datetime, timezone
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import aliased
@@ -26,6 +34,15 @@ from database.models.conversation_member import ConversationMember
 from database.models.message import Message
 from database.models.user import User
 from database.repositories.base_repository import BaseRepository
+
+
+def _utc_now() -> datetime:
+    """Current UTC time as a naive datetime, via the non-deprecated
+    timezone-aware API. See auth/authentication_service.py's identical
+    helper for the full rationale -- duplicated here rather than
+    shared, matching this codebase's existing per-file convention.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # One row per conversation this user belongs to: the Conversation
 # itself, its latest Message (None if it has none yet), and the
@@ -129,6 +146,120 @@ class ConversationRepository(BaseRepository):
         statement = select(ConversationMember.user_id).where(
             ConversationMember.conversation_id == conversation_id,
             ConversationMember.left_at.is_(None),
+        )
+
+        return list(self.db.scalars(statement).all())
+
+    def leave_conversation(self, conversation_id, user_id):
+        """
+        Mark an active member as having left -- sets left_at exactly
+        once (Phase 7 -- Group Membership Management). Idempotent: a
+        second call for a user who has already left (or never was an
+        active member) matches no row and is a safe no-op, mirroring
+        UserRepository's mutate-then-flush pattern (e.g.
+        update_last_login()).
+
+        Every existing query that filters left_at.is_(None)
+        (get_member_user_ids(), get_conversation_previews_for_user(),
+        _get_other_participants()) automatically excludes this member
+        afterward -- no other method needs to change.
+        """
+
+        statement = select(ConversationMember).where(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.user_id == user_id,
+            ConversationMember.left_at.is_(None),
+        )
+
+        member = self.db.scalar(statement)
+
+        if member is None:
+            return None
+
+        member.left_at = _utc_now()
+
+        self.refresh(member)
+
+        return member
+
+    def reserve_next_epoch(self, conversation_id):
+        """
+        Reserve the next group-key epoch -- increments
+        current_key_epoch by exactly one (Phase 7 -- Group Membership
+        Management). Must be called in the same transaction as
+        leave_conversation() for the same leave event (see
+        server/client_handler.py::handle_group_leave()) so the
+        membership change and the epoch reservation either both
+        commit or neither does -- a departed member excluded from
+        messaging without a reserved next epoch would leave the group
+        silently stuck on its old key forever.
+        """
+
+        conversation = self.db.get(Conversation, conversation_id)
+
+        if conversation is None:
+            return None
+
+        conversation.current_key_epoch += 1
+
+        self.refresh(conversation)
+
+        return conversation.current_key_epoch
+
+    def get_epoch_state(self, conversation_id):
+        """
+        Return (current_key_epoch, confirmed_key_epoch) for a
+        conversation, or (None, None) if it doesn't exist.
+        """
+
+        conversation = self.db.get(Conversation, conversation_id)
+
+        if conversation is None:
+            return None, None
+
+        return conversation.current_key_epoch, conversation.confirmed_key_epoch
+
+    def confirm_epoch(self, conversation_id, epoch):
+        """
+        Advance confirmed_key_epoch to at least ``epoch`` -- never
+        decreases it (Phase 7 -- Group Membership Management), so a
+        stale or duplicate group_key_rotation_complete cannot regress
+        state. Mirrors the max()-based guard KeyManager.store_key()
+        uses for current_epoch, for the same reason.
+        """
+
+        conversation = self.db.get(Conversation, conversation_id)
+
+        if conversation is None:
+            return None
+
+        conversation.confirmed_key_epoch = max(
+            conversation.confirmed_key_epoch, epoch
+        )
+
+        self.refresh(conversation)
+
+        return conversation.confirmed_key_epoch
+
+    def get_group_conversations_with_pending_rotation(self, user_id):
+        """
+        Return the ids of every group conversation this user is an
+        active member of where confirmed_key_epoch is behind
+        current_key_epoch -- a rotation reserved by a leave event that
+        hasn't finished distributing yet (Phase 7 -- Group Membership
+        Management). Used only by the reconnect-recovery hook in
+        server/client_handler.py::handle_client().
+        """
+
+        member_conversation_ids = select(ConversationMember.conversation_id).where(
+            ConversationMember.user_id == user_id,
+            ConversationMember.left_at.is_(None),
+        )
+
+        statement = select(Conversation.id).where(
+            Conversation.id.in_(member_conversation_ids),
+            Conversation.type == Conversation.TYPE_GROUP,
+            Conversation.current_key_epoch > Conversation.confirmed_key_epoch,
         )
 
         return list(self.db.scalars(statement).all())

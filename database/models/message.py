@@ -11,7 +11,7 @@ recipient; failed deliveries are never persisted.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, ForeignKey, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from database.models.base import Base
@@ -108,6 +108,20 @@ class Message(Base):
     # a plain Python dict directly, no manual JSON (de)serialization.
     payload_type = Column(String(32), nullable=True)
     content_metadata = Column(JSONB, nullable=True)
+
+    # Expand step of an expand-and-contract migration (Architecture
+    # Blueprint v2, Phase 7 -- Group Membership Management): nullable.
+    # Which group-key epoch (crypto/key_manager.py) encrypted this
+    # row's ciphertext -- NULL on every historical row, interpreted as
+    # 1 everywhere it's read (no rotation mechanism existed before
+    # this phase, so every prior message really was epoch 1; NULL->1
+    # is a true statement about the past, not a convenient default).
+    # Direct messages are always epoch 1 and never change. A group
+    # conversation that has rotated has messages at multiple epochs in
+    # the same conversation_id -- this column is what lets history
+    # loading pick the correct historical key per message instead of
+    # decrypting everything with whatever key is current "now".
+    epoch = Column(Integer, nullable=True)
 
     timestamp = Column(DateTime, nullable=False)
     created_at = Column(DateTime, nullable=False, default=_utc_now)

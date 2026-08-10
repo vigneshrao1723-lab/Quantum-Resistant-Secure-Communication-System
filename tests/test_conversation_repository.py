@@ -385,3 +385,251 @@ def test_record_recipients_marks_connected_members_delivered(db_session, unique_
     assert status_by_recipient[user_b.id] == MessageDeliveryStatus.DELIVERED
     assert status_by_recipient[user_c.id] == MessageDeliveryStatus.QUEUED
     assert user_a.id not in status_by_recipient
+
+
+# ----------------------------------------------------------------------
+# Phase 7: Group Membership Management
+# ----------------------------------------------------------------------
+
+
+def _make_trio_group(db_session, unique_suffix):
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+
+    user_a = _make_user(user_repo, unique_suffix, "a")
+    user_b = _make_user(user_repo, unique_suffix, "b")
+    user_c = _make_user(user_repo, unique_suffix, "c")
+
+    conversation = conversation_repo.create_group_conversation(
+        member_ids=[user_a.id, user_b.id, user_c.id], name="Trio"
+    )
+    conversation_repo.commit()
+
+    return conversation_repo, conversation, user_a, user_b, user_c
+
+
+def test_leave_conversation_sets_left_at(db_session, unique_suffix):
+    conversation_repo, conversation, _a, _b, user_c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.leave_conversation(conversation.id, user_c.id)
+    conversation_repo.commit()
+
+    member = (
+        db_session.query(ConversationMember)
+        .filter(
+            ConversationMember.conversation_id == conversation.id,
+            ConversationMember.user_id == user_c.id,
+        )
+        .one()
+    )
+
+    assert member.left_at is not None
+
+
+def test_leave_conversation_excludes_member_from_active_list(db_session, unique_suffix):
+    conversation_repo, conversation, user_a, user_b, user_c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.leave_conversation(conversation.id, user_c.id)
+    conversation_repo.commit()
+
+    member_ids = conversation_repo.get_member_user_ids(conversation.id)
+
+    assert set(member_ids) == {user_a.id, user_b.id}
+    assert user_c.id not in member_ids
+
+
+def test_leave_conversation_excludes_member_from_previews(db_session, unique_suffix):
+    """Bonus, self-healing property: the departed member's own next
+    preview query already excludes the group, independent of any live
+    notification packet -- verified directly, not assumed."""
+    conversation_repo, conversation, _a, _b, user_c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.leave_conversation(conversation.id, user_c.id)
+    conversation_repo.commit()
+
+    previews = conversation_repo.get_conversation_previews_for_user(user_c.id)
+
+    assert previews == []
+
+
+def test_leave_conversation_is_idempotent(db_session, unique_suffix):
+    """A second leave attempt for an already-departed member matches
+    no active-membership row and is a safe no-op -- it must not raise,
+    and must not disturb the already-set left_at."""
+    conversation_repo, conversation, _a, _b, user_c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    first = conversation_repo.leave_conversation(conversation.id, user_c.id)
+    conversation_repo.commit()
+
+    second = conversation_repo.leave_conversation(conversation.id, user_c.id)
+    conversation_repo.commit()
+
+    assert first is not None
+    assert second is None
+
+    member = (
+        db_session.query(ConversationMember)
+        .filter(
+            ConversationMember.conversation_id == conversation.id,
+            ConversationMember.user_id == user_c.id,
+        )
+        .one()
+    )
+    assert member.left_at == first.left_at
+
+
+def test_leave_conversation_for_non_member_is_a_no_op(db_session, unique_suffix):
+    conversation_repo, conversation, _a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    user_repo = UserRepository(db_session)
+    outsider = _make_user(user_repo, unique_suffix, "outsider")
+
+    result = conversation_repo.leave_conversation(conversation.id, outsider.id)
+    conversation_repo.commit()
+
+    assert result is None
+
+
+def test_new_group_conversation_starts_at_epoch_1(db_session, unique_suffix):
+    conversation_repo, conversation, _a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    current, confirmed = conversation_repo.get_epoch_state(conversation.id)
+
+    assert current == 1
+    assert confirmed == 1
+
+
+def test_reserve_next_epoch_increments_current_key_epoch(db_session, unique_suffix):
+    conversation_repo, conversation, _a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    new_epoch = conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.commit()
+
+    assert new_epoch == 2
+
+    current, confirmed = conversation_repo.get_epoch_state(conversation.id)
+    assert current == 2
+    assert confirmed == 1
+
+
+def test_reserve_next_epoch_twice_reaches_epoch_3(db_session, unique_suffix):
+    """Two leaves before either rotation completes: current_key_epoch
+    must advance sequentially, 1 -> 2 -> 3, never skipping."""
+    conversation_repo, conversation, _a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.commit()
+
+    current, confirmed = conversation_repo.get_epoch_state(conversation.id)
+    assert current == 3
+    assert confirmed == 1
+
+
+def test_confirm_epoch_advances_confirmed_key_epoch(db_session, unique_suffix):
+    conversation_repo, conversation, _a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.commit()
+
+    result = conversation_repo.confirm_epoch(conversation.id, 2)
+    conversation_repo.commit()
+
+    assert result == 2
+
+    current, confirmed = conversation_repo.get_epoch_state(conversation.id)
+    assert current == 2
+    assert confirmed == 2
+
+
+def test_confirm_epoch_never_regresses(db_session, unique_suffix):
+    """A stale or duplicate completion signal (an epoch lower than
+    what's already confirmed) must not move confirmed_key_epoch
+    backwards."""
+    conversation_repo, conversation, _a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.commit()
+
+    conversation_repo.confirm_epoch(conversation.id, 3)
+    conversation_repo.commit()
+
+    result = conversation_repo.confirm_epoch(conversation.id, 2)
+    conversation_repo.commit()
+
+    assert result == 3
+
+    _current, confirmed = conversation_repo.get_epoch_state(conversation.id)
+    assert confirmed == 3
+
+
+def test_get_group_conversations_with_pending_rotation_finds_outstanding(
+    db_session, unique_suffix
+):
+    conversation_repo, conversation, user_a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.commit()
+
+    pending = conversation_repo.get_group_conversations_with_pending_rotation(
+        user_a.id
+    )
+
+    assert conversation.id in pending
+
+
+def test_get_group_conversations_with_pending_rotation_excludes_caught_up(
+    db_session, unique_suffix
+):
+    conversation_repo, conversation, user_a, _b, _c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    pending = conversation_repo.get_group_conversations_with_pending_rotation(
+        user_a.id
+    )
+
+    assert conversation.id not in pending
+
+
+def test_get_group_conversations_with_pending_rotation_excludes_departed_member(
+    db_session, unique_suffix
+):
+    """A member who has left must not be told to rotate a group they
+    are no longer part of."""
+    conversation_repo, conversation, _a, _b, user_c = _make_trio_group(
+        db_session, unique_suffix
+    )
+
+    conversation_repo.leave_conversation(conversation.id, user_c.id)
+    conversation_repo.reserve_next_epoch(conversation.id)
+    conversation_repo.commit()
+
+    pending = conversation_repo.get_group_conversations_with_pending_rotation(
+        user_c.id
+    )
+
+    assert conversation.id not in pending

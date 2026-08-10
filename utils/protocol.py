@@ -43,7 +43,8 @@ def create_payload_packet(
     envelope,
     timestamp=None,
     receiver=None,
-    conversation_id=None
+    conversation_id=None,
+    epoch=None
 ):
     """
     Wrap an already-encrypted PayloadEnvelope for the wire.
@@ -61,6 +62,14 @@ def create_payload_packet(
     Foundation) adds -- a group message reuses this exact packet
     shape and "chat" type rather than a duplicate one; the server
     routes on whichever field is present.
+
+    `epoch` (Phase 7 -- Group Membership Management): which group-key
+    epoch (crypto/key_manager.py) encrypted this message -- always 1
+    for a direct conversation, and for a group before its first
+    rotation. Optional and additive: every existing caller that omits
+    it gets `epoch: None` on the wire, which persist_message() and
+    handle_chat() both already treat as 1, identical to today's
+    behavior.
     """
 
     return {
@@ -71,7 +80,8 @@ def create_payload_packet(
         "message": envelope.ciphertext,
         "payload_type": envelope.payload_type,
         "content_metadata": envelope.content_metadata or None,
-        "timestamp": timestamp
+        "timestamp": timestamp,
+        "epoch": epoch
     }
 
 
@@ -147,13 +157,20 @@ def create_group_key_distribution_packet(
     conversation_id,
     recipient,
     encapsulation,
-    wrapped_key
+    wrapped_key,
+    epoch=1
 ):
     """
     Deliver one member's wrapped copy of a group key
     (crypto/key_manager.py's wrap_key_for_member()). The server only
-    ever relays this packet's two opaque fields -- it never sees the
+    ever relays this packet's opaque fields -- it never sees the
     group key itself.
+
+    `epoch` (Phase 7 -- Group Membership Management): which epoch this
+    wrapped key belongs to. Defaults to 1 -- the one existing call
+    site (initial group creation) passes it explicitly, since epoch 1
+    is exactly what that flow has always produced; a rotation
+    (post-leave) passes the new epoch number instead.
     """
 
     return {
@@ -162,7 +179,82 @@ def create_group_key_distribution_packet(
         "conversation_id": conversation_id,
         "recipient": recipient,
         "encapsulation": encapsulation,
-        "wrapped_key": wrapped_key
+        "wrapped_key": wrapped_key,
+        "epoch": epoch
+    }
+
+
+def create_group_leave_packet(sender, conversation_id):
+    """
+    Ask the server to remove the sender from a group conversation
+    (Phase 7 -- Group Membership Management). The server derives who
+    is actually leaving from the authenticated socket, never from
+    this packet's `sender` field -- it's included only for logging/
+    symmetry with the other group packets, the same way `sender` is
+    present-but-not-trusted on a "chat" packet.
+    """
+
+    return {
+        "type": "group_leave",
+        "sender": sender,
+        "conversation_id": conversation_id
+    }
+
+
+def create_group_member_left_packet(conversation_id, username, members):
+    """
+    Notify every former member of a group -- both the ones remaining
+    and the one who just left -- that `username` left (Phase 7 --
+    Group Membership Management). One packet, two interpretations: a
+    remaining recipient updates its participant list; the departed
+    recipient (whose own username matches `username`) removes the
+    conversation from its own view -- this doubles as that member's
+    only confirmation their leave succeeded, no separate ack packet
+    needed. `members` is the remaining active members' usernames.
+    """
+
+    return {
+        "type": "group_member_left",
+        "conversation_id": conversation_id,
+        "username": username,
+        "members": members
+    }
+
+
+def create_group_key_rotation_required_packet(conversation_id, epoch, members):
+    """
+    Server -> one selected, currently-connected active member: you are
+    responsible for generating (or, on a retry, reusing) `epoch`'s
+    group key and distributing it to `members` (Phase 7 -- Group
+    Membership Management). Carries no key material -- only
+    coordination metadata (conversation_id, an epoch number, and a
+    list of usernames), all of which the server already legitimately
+    knows. Reused unchanged for both the immediate post-leave dispatch
+    and a later reconnect-triggered catch-up dispatch.
+    """
+
+    return {
+        "type": "group_key_rotation_required",
+        "conversation_id": conversation_id,
+        "epoch": epoch,
+        "members": members
+    }
+
+
+def create_group_key_rotation_complete_packet(conversation_id, epoch):
+    """
+    Client -> server: distribution of `epoch`'s group key has been
+    attempted for every remaining member (Phase 7 -- Group Membership
+    Management). Carries no key material. The server uses this only to
+    advance conversations.confirmed_key_epoch and, if a backlog
+    remains, dispatch the next epoch -- it never inspects or requires
+    anything about the key itself.
+    """
+
+    return {
+        "type": "group_key_rotation_complete",
+        "conversation_id": conversation_id,
+        "epoch": epoch
     }
 
 

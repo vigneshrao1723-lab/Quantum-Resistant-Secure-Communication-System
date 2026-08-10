@@ -50,12 +50,25 @@ class KeyManager:
         # a not-yet-created direct conversation) is entirely
         # ConversationStore's responsibility -- see
         # client/conversation_store.py::ensure_direct_conversation_id().
-        # Example:
+        #
+        # Phase 7 -- Group Membership Management: each conversation_id
+        # maps to a dict of {epoch: key_bytes}, not a single key.
+        # Rotating a group's key (after a member leaves) never deletes
+        # or overwrites an older epoch -- historical messages encrypted
+        # under epoch 1 must stay decryptable after epoch 2 exists.
+        # Direct conversations, and a group before its first rotation,
+        # simply never have more than epoch 1. Example:
         # {
-        #     "3fa8...": b"...32 bytes...",  # a direct conversation
-        #     "9c21...": b"...32 bytes...",  # a group conversation
+        #     "3fa8...": {1: b"...32 bytes..."},               # direct
+        #     "9c21...": {1: b"...", 2: b"...", 3: b"..."},     # group, rotated twice
         # }
         self.keys = {}
+
+        # conversation_id -> highest epoch ever stored for it. Tracked
+        # separately (not derived by taking max(self.keys[id]) on every
+        # lookup) so get_key(id) -- "give me the current key" -- stays
+        # O(1), and so it can only ever move forward (see store_key()).
+        self._current_epoch = {}
 
     # =====================================================
     # Algorithm Helpers
@@ -113,33 +126,84 @@ class KeyManager:
     # belongs to.
     # =====================================================
 
-    def store_key(self, conversation_id, key):
+    def store_key(self, conversation_id, key, epoch=1):
         """
-        Store the AES key for a conversation.
+        Store the AES key for a conversation at a given epoch.
+
+        epoch defaults to 1 -- the only epoch a direct conversation, or
+        a group before its first rotation, ever has -- so every
+        pre-Phase-7 call site (store_key(id, key)) keeps working
+        unchanged.
+
+        Never overwrites an existing epoch with a different key: if
+        this exact epoch is already stored, this is a no-op. This is
+        what makes a retried rotation instruction safe (Phase 7 --
+        Group Membership Management) -- an initiator that already
+        generated epoch N's key and is asked to redistribute it (e.g.
+        after a partial-distribution failure) reuses the same value
+        rather than silently replacing it with a second, different
+        "epoch N" that would make the two no longer agree.
         """
 
-        self.keys[conversation_id] = key
+        epochs = self.keys.setdefault(conversation_id, {})
 
-    def get_key(self, conversation_id):
+        if epoch not in epochs:
+            epochs[epoch] = key
+
+        self._current_epoch[conversation_id] = max(
+            self._current_epoch.get(conversation_id, 0), epoch
+        )
+
+    def get_key(self, conversation_id, epoch=None):
         """
         Retrieve the AES key for a conversation.
+
+        epoch=None (default) returns the CURRENT (highest-numbered)
+        epoch's key -- what encrypting a new outgoing message, or
+        decrypting a live-arriving one, wants. An explicit epoch
+        retrieves exactly that epoch's key (for decrypting a stored
+        historical message), or None if this client never received it
+        -- never silently substitutes a different epoch's key.
         """
 
-        return self.keys.get(conversation_id)
+        epochs = self.keys.get(conversation_id)
 
-    def has_key(self, conversation_id):
+        if not epochs:
+            return None
+
+        if epoch is None:
+            epoch = self._current_epoch.get(conversation_id)
+
+        return epochs.get(epoch)
+
+    def has_key(self, conversation_id, epoch=None):
         """
         Check whether a key already exists for a conversation.
+
+        epoch=None (default) checks the current epoch, matching
+        get_key()'s default -- every pre-Phase-7 call site keeps
+        working unchanged.
         """
 
-        return conversation_id in self.keys
+        return self.get_key(conversation_id, epoch) is not None
+
+    def current_epoch(self, conversation_id):
+        """
+        The highest epoch this client has ever stored a key for, in
+        this conversation, or None if it has never had a key at all
+        (Phase 7 -- Group Membership Management). Used to stamp an
+        outgoing group message with the epoch that encrypted it.
+        """
+
+        return self._current_epoch.get(conversation_id)
 
     def remove_key(self, conversation_id):
         """
-        Remove a conversation's key.
+        Remove every epoch of a conversation's key material.
         """
 
         self.keys.pop(conversation_id, None)
+        self._current_epoch.pop(conversation_id, None)
 
     # =====================================================
     # Kyber Encapsulation / Decapsulation

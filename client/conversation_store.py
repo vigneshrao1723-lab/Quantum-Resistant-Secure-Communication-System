@@ -126,6 +126,47 @@ class ConversationStore(QObject):
 
         self.conversations_changed.emit()
 
+    def update_group_participants(self, conversation_id, participant_usernames):
+        """
+        Refresh a group's participant list in place (Phase 7 -- Group
+        Membership Management: called after a member other than this
+        client leaves) -- mirrors add_or_update_group()'s shape but
+        only touches participants, preserving latest_message/
+        is_online/group_name. A no-op if this client doesn't have the
+        conversation (shouldn't happen: a member-left notification only
+        ever reaches members who were in the group).
+        """
+
+        existing = self._summaries.get(conversation_id)
+
+        if existing is None:
+            return
+
+        self._summaries[conversation_id] = ConversationSummary(
+            conversation_id=conversation_id,
+            username=None,
+            is_online=existing.is_online,
+            latest_message=existing.latest_message,
+            is_group=True,
+            group_name=existing.group_name,
+            participants=list(participant_usernames),
+        )
+
+        self.conversations_changed.emit()
+
+    def remove_conversation(self, key):
+        """
+        Remove a conversation entirely from the store (Phase 7 --
+        Group Membership Management: used when this client itself
+        leaves a group). A no-op if the key isn't present.
+        """
+
+        if key in self._summaries:
+
+            del self._summaries[key]
+
+            self.conversations_changed.emit()
+
     def ensure_direct_conversation_id(self, own_user_id, username):
         """
         Resolve the real conversation_id for a direct conversation
