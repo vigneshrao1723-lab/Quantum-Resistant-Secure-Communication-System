@@ -31,6 +31,24 @@ from gui.styles import (
 )
 
 
+def _read_status_suffix(read_status):
+    """
+    Read-receipt glyph appended to a sent bubble's timestamp label (C2
+    -- Read Receipts): nothing for None (no receipt data at all -- a
+    legacy message persisted before C2, or a conversation partner who
+    predates MessageRecipient rows for direct messages), a single
+    check for sent/delivered-but-not-yet-fully-read, a double check
+    once fully read. Never called for a received/system bubble, which
+    never shows a receipt indicator at all -- see each bubble class's
+    set_read_status().
+    """
+
+    if read_status is None:
+        return ""
+
+    return "  ✓✓" if read_status else "  ✓"
+
+
 class MessageBubble(QWidget):
     """
     A single chat bubble.
@@ -38,7 +56,7 @@ class MessageBubble(QWidget):
     kind is one of "sent", "received", "system".
     """
 
-    def __init__(self, text, kind, sender=None, timestamp=None):
+    def __init__(self, text, kind, sender=None, timestamp=None, read_status=None):
         super().__init__()
 
         self.kind = kind
@@ -101,18 +119,22 @@ class MessageBubble(QWidget):
 
             bubble_layout.addWidget(text_label)
 
-            time_label = QLabel(
-                timestamp or datetime.now().strftime("%H:%M")
+            self._timestamp_text = timestamp or datetime.now().strftime("%H:%M")
+
+            self.time_label = QLabel(
+                self._timestamp_text + (
+                    _read_status_suffix(read_status) if kind == "sent" else ""
+                )
             )
-            time_label.setStyleSheet(
+            self.time_label.setStyleSheet(
                 "color: rgba(255, 255, 255, 0.55); "
                 "font-size: 8pt; background: transparent;"
             )
-            time_label.setAlignment(
+            self.time_label.setAlignment(
                 Qt.AlignRight if kind == "sent" else Qt.AlignLeft
             )
 
-            bubble_layout.addWidget(time_label)
+            bubble_layout.addWidget(self.time_label)
 
             if kind == "sent":
 
@@ -133,6 +155,19 @@ class MessageBubble(QWidget):
 
                 outer.addWidget(bubble)
                 outer.addStretch()
+
+    def set_read_status(self, read_status):
+        """
+        Update this sent bubble's check-mark glyph in place (C2 --
+        Read Receipts), without touching the timestamp it's appended
+        to. A no-op for a received/system bubble -- neither ever shows
+        one, by design (see _read_status_suffix()'s docstring).
+        """
+
+        if self.kind != "sent":
+            return
+
+        self.time_label.setText(self._timestamp_text + _read_status_suffix(read_status))
 
 
 def _format_file_size(size_bytes):
@@ -165,7 +200,7 @@ class ImageMessageBubble(QWidget):
 
     MAX_THUMBNAIL_WIDTH = 320
 
-    def __init__(self, image_bytes, kind, sender=None, timestamp=None):
+    def __init__(self, image_bytes, kind, sender=None, timestamp=None, read_status=None):
         super().__init__()
 
         self.kind = kind
@@ -211,17 +246,21 @@ class ImageMessageBubble(QWidget):
 
         bubble_layout.addWidget(image_label)
 
-        time_label = QLabel(
-            timestamp or datetime.now().strftime("%H:%M")
+        self._timestamp_text = timestamp or datetime.now().strftime("%H:%M")
+
+        self.time_label = QLabel(
+            self._timestamp_text + (
+                _read_status_suffix(read_status) if kind == "sent" else ""
+            )
         )
-        time_label.setStyleSheet(
+        self.time_label.setStyleSheet(
             "color: rgba(255, 255, 255, 0.55); "
             "font-size: 8pt; background: transparent;"
         )
-        time_label.setAlignment(
+        self.time_label.setAlignment(
             Qt.AlignRight if kind == "sent" else Qt.AlignLeft
         )
-        bubble_layout.addWidget(time_label)
+        bubble_layout.addWidget(self.time_label)
 
         bubble.setStyleSheet(
             f"background-color: "
@@ -236,6 +275,18 @@ class ImageMessageBubble(QWidget):
             outer.addWidget(bubble)
             outer.addStretch()
 
+    def set_read_status(self, read_status):
+        """
+        Update this sent bubble's check-mark glyph in place (C2 --
+        Read Receipts). A no-op for a received bubble -- see
+        MessageBubble.set_read_status()'s identical docstring.
+        """
+
+        if self.kind != "sent":
+            return
+
+        self.time_label.setText(self._timestamp_text + _read_status_suffix(read_status))
+
 
 class FileMessageBubble(QWidget):
     """
@@ -248,7 +299,15 @@ class FileMessageBubble(QWidget):
     ImageMessageBubble is -- see its docstring.
     """
 
-    def __init__(self, file_bytes, content_metadata, kind, sender=None, timestamp=None):
+    def __init__(
+        self,
+        file_bytes,
+        content_metadata,
+        kind,
+        sender=None,
+        timestamp=None,
+        read_status=None,
+    ):
         super().__init__()
 
         self.kind = kind
@@ -298,17 +357,21 @@ class FileMessageBubble(QWidget):
         save_button.clicked.connect(self._handle_save_as)
         bubble_layout.addWidget(save_button)
 
-        time_label = QLabel(
-            timestamp or datetime.now().strftime("%H:%M")
+        self._timestamp_text = timestamp or datetime.now().strftime("%H:%M")
+
+        self.time_label = QLabel(
+            self._timestamp_text + (
+                _read_status_suffix(read_status) if kind == "sent" else ""
+            )
         )
-        time_label.setStyleSheet(
+        self.time_label.setStyleSheet(
             "color: rgba(255, 255, 255, 0.55); "
             "font-size: 8pt; background: transparent;"
         )
-        time_label.setAlignment(
+        self.time_label.setAlignment(
             Qt.AlignRight if kind == "sent" else Qt.AlignLeft
         )
-        bubble_layout.addWidget(time_label)
+        bubble_layout.addWidget(self.time_label)
 
         bubble.setStyleSheet(
             f"background-color: "
@@ -338,6 +401,18 @@ class FileMessageBubble(QWidget):
         if path:
             Path(path).write_bytes(self._file_bytes)
 
+    def set_read_status(self, read_status):
+        """
+        Update this sent bubble's check-mark glyph in place (C2 --
+        Read Receipts). A no-op for a received bubble -- see
+        MessageBubble.set_read_status()'s identical docstring.
+        """
+
+        if self.kind != "sent":
+            return
+
+        self.time_label.setText(self._timestamp_text + _read_status_suffix(read_status))
+
 
 class MessageWidget(QListWidget):
     """
@@ -346,6 +421,22 @@ class MessageWidget(QListWidget):
 
     def __init__(self):
         super().__init__()
+
+        # C2 -- Read Receipts: this client's own sent bubbles in the
+        # currently-open conversation, keyed by the database
+        # message_id, so a later read_receipt_notification can flip
+        # the right ones to "read" in place -- see
+        # mark_all_sent_read(). Cleared on every clear_messages() call
+        # (i.e. every conversation open/switch), since bubbles are
+        # always re-rendered fresh from history at that point anyway.
+        # A bubble added without a message_id (a message sent live
+        # this session, before it has a database id -- see
+        # gui/chat_window.py::send_message()) is simply never
+        # registered here; it isn't reachable by a live notification
+        # until the conversation is re-opened and history reloads with
+        # its real id and current status, a known, documented scope
+        # limit rather than an oversight.
+        self._sent_bubbles_by_message_id = {}
 
         self.build_ui()
 
@@ -380,7 +471,7 @@ class MessageWidget(QListWidget):
     # Internal Helpers
     # ==========================================================
 
-    def _add_bubble(self, bubble):
+    def _add_bubble(self, bubble, message_id=None):
 
         item = QListWidgetItem()
 
@@ -395,6 +486,13 @@ class MessageWidget(QListWidget):
         self.setItemWidget(item, bubble)
 
         self.scrollToBottom()
+
+        # C2 -- Read Receipts: only a sent bubble with a known
+        # message_id is ever registered -- a received bubble never
+        # shows a receipt indicator (set_read_status() is a no-op for
+        # it regardless), so tracking it here would only waste memory.
+        if message_id is not None and bubble.kind == "sent":
+            self._sent_bubbles_by_message_id[message_id] = bubble
 
     # ==========================================================
     # Public Methods
@@ -429,13 +527,22 @@ class MessageWidget(QListWidget):
         self,
         message,
         timestamp=None,
+        message_id=None,
+        read_status=None,
     ):
         """
-        Display a sent message.
+        Display a sent message. ``message_id``/``read_status`` (C2 --
+        Read Receipts) are optional -- omitted for a message sent live
+        this session (no database id yet); supplied by
+        gui/chat_window.py::load_history() for a history-loaded row,
+        which always has both.
         """
 
         self._add_bubble(
-            MessageBubble(message, kind="sent", timestamp=timestamp)
+            MessageBubble(
+                message, kind="sent", timestamp=timestamp, read_status=read_status
+            ),
+            message_id=message_id,
         )
 
     def add_received_image(self, sender, image_bytes, timestamp=None):
@@ -449,13 +556,18 @@ class MessageWidget(QListWidget):
             )
         )
 
-    def add_sent_image(self, image_bytes, timestamp=None):
+    def add_sent_image(self, image_bytes, timestamp=None, message_id=None, read_status=None):
         """
-        Display a sent image (Phase 8 -- File & Image Transfer).
+        Display a sent image (Phase 8 -- File & Image Transfer). See
+        add_sent_message() for ``message_id``/``read_status`` (C2 --
+        Read Receipts).
         """
 
         self._add_bubble(
-            ImageMessageBubble(image_bytes, kind="sent", timestamp=timestamp)
+            ImageMessageBubble(
+                image_bytes, kind="sent", timestamp=timestamp, read_status=read_status
+            ),
+            message_id=message_id,
         )
 
     def add_received_file(self, sender, file_bytes, content_metadata, timestamp=None):
@@ -473,16 +585,47 @@ class MessageWidget(QListWidget):
             )
         )
 
-    def add_sent_file(self, file_bytes, content_metadata, timestamp=None):
+    def add_sent_file(
+        self, file_bytes, content_metadata, timestamp=None, message_id=None, read_status=None
+    ):
         """
-        Display a sent file (Phase 8 -- File & Image Transfer).
+        Display a sent file (Phase 8 -- File & Image Transfer). See
+        add_sent_message() for ``message_id``/``read_status`` (C2 --
+        Read Receipts).
         """
 
         self._add_bubble(
             FileMessageBubble(
-                file_bytes, content_metadata, kind="sent", timestamp=timestamp
-            )
+                file_bytes,
+                content_metadata,
+                kind="sent",
+                timestamp=timestamp,
+                read_status=read_status,
+            ),
+            message_id=message_id,
         )
+
+    def mark_all_sent_read(self):
+        """
+        Flip every currently-tracked sent bubble in this conversation
+        to the "read" check-mark state (C2 -- Read Receipts).
+
+        Correct, not an approximation, given this app's conversation-
+        level "read up to now" semantics (server/client_handler.py::
+        handle_read_receipt() marks every one of the reader's unread
+        MessageRecipient rows in the conversation at once, not a
+        single message) -- when a read_receipt_notification arrives
+        for a direct conversation, the one other party has, by
+        definition, just read every message they could see; for a
+        group, the caller (gui/chat_window.py) only calls this once
+        every currently-active recipient has been accounted for.
+        Never touches a bubble added without a message_id (a message
+        sent live this session -- see _add_bubble()'s docstring) since
+        those were never registered in the first place.
+        """
+
+        for bubble in self._sent_bubbles_by_message_id.values():
+            bubble.set_read_status(True)
 
     def clear_messages(self):
         """
@@ -490,3 +633,5 @@ class MessageWidget(QListWidget):
         """
 
         self.clear()
+
+        self._sent_bubbles_by_message_id = {}

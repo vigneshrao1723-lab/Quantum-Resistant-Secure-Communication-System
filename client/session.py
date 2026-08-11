@@ -29,6 +29,7 @@ from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary, MessagePreview
+from domain.message_delivery_status import MessageDeliveryStatus
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import (
     BLOB_STORAGE_PAYLOAD_TYPES,
@@ -50,6 +51,7 @@ from utils.protocol import (
     create_group_leave_packet,
     create_payload_packet,
     create_public_key_packet,
+    create_read_receipt_packet,
     create_session_key_packet,
 )
 
@@ -83,6 +85,16 @@ class ClientSession(QObject):
     # fixed-type, so bytes cannot flow through it; this is additive,
     # not a replacement.
     payload_message_received = Signal(str, str, str, bytes, dict)
+
+    # C2 -- Read Receipts: identity_key (the GUI addressing key -- see
+    # ClientSession.handle_chat()'s docstring), reader's username.
+    # Purely a live-update signal for a conversation that's already
+    # open -- the authoritative read status is always re-derived from
+    # the database at load_conversation_history() time (see its
+    # "read_status" field), so a client that never receives this
+    # signal (e.g. the conversation isn't open) is not out of sync --
+    # it just sees the correct status next time it opens/reloads.
+    read_receipt_updated = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -811,6 +823,53 @@ class ClientSession(QObject):
         except Exception:
             return None
 
+    def _read_status_for_own_message(self, message_repo, message, is_group, member_ids):
+        """
+        Compute the read-receipt display state for one of THIS user's
+        own sent messages (C2 -- Read Receipts): True (double check --
+        fully read), False (single check -- sent/delivered, not yet
+        fully read), or None (no MessageRecipient rows at all -- a
+        legacy message persisted before C2 shipped, or before this
+        direct conversation started creating rows; show no receipt
+        state at all rather than fabricate one).
+
+        For a group, "fully read" means every CURRENTLY active member
+        (``member_ids``, already left-member-filtered by
+        get_member_user_ids()) who has a recipient row for this
+        specific message has read it -- a departed member's row is
+        simply excluded from consideration, so they can never block
+        the all-read state (see the row-filtering below). A member
+        added after this message was sent was never one of its
+        recipients in the first place (Issue 2's epoch rotation means
+        they couldn't decrypt it anyway), so they're correctly absent
+        from message_recipients for it and need no special-casing
+        here.
+
+        Only ever called for is_own rows -- never for a message this
+        user received, which this codebase's own security model
+        already keeps this user from seeing anyone else's read state
+        for anyway (MessageRepository.mark_conversation_read() is
+        scoped to the authenticated recipient; there is no query
+        surface here that could reveal a stranger's read state).
+        """
+
+        recipient_rows = message_repo.get_recipients_for_message(message.id)
+
+        if not recipient_rows:
+            return None
+
+        if is_group:
+            relevant_rows = [
+                row for row in recipient_rows if row.recipient_id in member_ids
+            ]
+        else:
+            relevant_rows = recipient_rows
+
+        if not relevant_rows:
+            return False
+
+        return all(row.status == MessageDeliveryStatus.READ for row in relevant_rows)
+
     def load_conversation_history(self, key, is_group=False):
         """
         Load and best-effort decrypt the stored conversation history
@@ -826,7 +885,13 @@ class ClientSession(QObject):
 
         Returns a plain list of dicts, ordered chronologically exactly
         as stored:
-            {"sender": str, "text": str, "timestamp": datetime, "is_own": bool}
+            {"sender": str, "text": str, "timestamp": datetime,
+             "is_own": bool, "message_id": str,
+             "read_status": bool | None}
+        ``read_status`` (C2 -- Read Receipts) is only ever meaningful
+        for ``is_own`` rows -- see _read_status_for_own_message(); it
+        is always None for a received message (no receipt indicator
+        is ever shown for those, by design).
         """
 
         db = SessionLocal()
@@ -920,11 +985,21 @@ class ClientSession(QObject):
                     )
                     content = None
 
+                read_status = (
+                    self._read_status_for_own_message(
+                        message_repo, message, is_group, member_ids if is_group else None
+                    )
+                    if is_own
+                    else None
+                )
+
                 history.append({
                     "sender": sender_name,
                     "text": text,
                     "timestamp": message.timestamp,
                     "is_own": is_own,
+                    "message_id": str(message.id),
+                    "read_status": read_status,
                     "payload_type": payload_type,
                     "content": content,
                     "content_metadata": message.content_metadata or {},
@@ -1180,6 +1255,9 @@ class ClientSession(QObject):
 
         elif packet_type == "group_members_added":
             self.handle_group_members_added(packet)
+
+        elif packet_type == "read_receipt_notification":
+            self.handle_read_receipt_notification(packet)
 
         else:
 
@@ -1731,6 +1809,58 @@ class ClientSession(QObject):
 
         self.logger.info(
             f"Group {conversation_id} members updated: {members}"
+        )
+
+    def handle_read_receipt_notification(self, packet):
+        """
+        Another active member of a conversation has read up to now
+        (C2 -- Read Receipts). Purely a live-update hint for a
+        conversation the GUI currently has open -- re-emitted as a Qt
+        signal rather than acted on here directly, since ClientSession
+        has no reference to which message bubbles are currently on
+        screen (gui/chat_window.py's connected slot does). Never
+        touches decryption, message delivery, or persistence -- this
+        packet carries no message content, and the authoritative read
+        status is always re-derived from the database the next time
+        load_conversation_history() runs regardless of whether this
+        notification ever arrives.
+        """
+
+        conversation_id = packet.get("conversation_id")
+        reader = packet.get("reader")
+
+        if not conversation_id or not reader:
+            return
+
+        self.read_receipt_updated.emit(conversation_id, reader)
+
+    def mark_conversation_read(self, conversation_id):
+        """
+        Tell the server every currently-unread message in this
+        conversation has now been read (C2 -- Read Receipts). Only
+        ever called when the user actually opens the conversation
+        (see gui/chat_window.py::open_conversation()) -- never merely
+        on reconnect/login, so an offline (C1) message stays QUEUED
+        until the recipient genuinely opens the conversation, not just
+        because they came back online. Carries no reader/user identity
+        of its own -- the server derives that exclusively from this
+        socket's authenticated session (see server/client_handler.py::
+        handle_read_receipt()); there is nothing here for a malicious
+        client to forge.
+
+        A no-op if there's no real conversation_id yet (e.g. a direct
+        partner who has never been messaged, so no conversation exists
+        to mark).
+        """
+
+        if not conversation_id:
+            return
+
+        packet = create_read_receipt_packet(conversation_id=conversation_id)
+
+        send_message(
+            self.client_socket,
+            packet
         )
 
     def add_group_members(self, conversation_id, member_usernames):

@@ -41,6 +41,15 @@ class ChatWindow(QWidget):
 
         self.session = session
 
+        # C2 -- Read Receipts: usernames who have confirmed reading
+        # the currently-open conversation "up to now" since it was
+        # opened -- see handle_read_receipt_updated(). Reset every
+        # time open_conversation() runs, since bubbles are always
+        # re-rendered fresh from history at that point (already
+        # reflecting current status), making any prior accumulation
+        # stale.
+        self._read_receipt_readers = set()
+
         self.build_ui()
 
         self.connect_signals()
@@ -301,6 +310,15 @@ class ChatWindow(QWidget):
             self.show_error
         )
 
+        # C2 -- Read Receipts: a live "someone read up to now" hint
+        # for whichever conversation is currently open -- see
+        # handle_read_receipt_updated(). The authoritative status is
+        # always re-derived from the database at load_history() time
+        # regardless, so this is purely a same-session UI refresh.
+        self.session.read_receipt_updated.connect(
+            self.handle_read_receipt_updated
+        )
+
         # -----------------------------------------
         # Sync UI with current session state
         # -----------------------------------------
@@ -467,6 +485,12 @@ class ChatWindow(QWidget):
 
         self.session.set_current_chat(summary)
 
+        # C2 -- Read Receipts: any reader accumulated for whatever
+        # conversation was open before is now stale -- bubbles are
+        # about to be fully re-rendered from fresh history below,
+        # already reflecting current status.
+        self._read_receipt_readers = set()
+
         self.session.clear_unread(key)
 
         self.render_conversations()
@@ -494,6 +518,26 @@ class ChatWindow(QWidget):
 
         self.load_history(key, summary.is_group)
 
+        # C2 -- Read Receipts: tell the server everything in this
+        # conversation is now read -- only once the user has actually
+        # opened it and its history has been loaded/rendered above,
+        # never merely because the client reconnected or logged in.
+        try:
+
+            self.session.mark_conversation_read(self.session.current_conversation_id)
+
+        except Exception as error:  # noqa: BLE001
+
+            # Intentionally broad, matching send_message()'s/
+            # handle_attachment_selected()'s outbound-failure pattern:
+            # mark_conversation_read() can fail for reasons spanning
+            # unrelated exception hierarchies (a socket-level OSError,
+            # or anything session-state related), and the conversation
+            # has already fully opened and rendered above -- a failure
+            # here only means the read receipt itself didn't go out;
+            # it must never block or undo the open.
+            self.show_error(str(error))
+
     def load_history(self, key, is_group=False):
         """
         Populate the message panel with this conversation's stored
@@ -515,13 +559,24 @@ class ChatWindow(QWidget):
 
             payload_type = entry.get("payload_type", PayloadType.TEXT)
 
+            # C2 -- Read Receipts: message_id/read_status are only
+            # ever meaningful for entry["is_own"] rows (see
+            # ClientSession.load_conversation_history()'s docstring);
+            # read_status is already None for a received row, so
+            # passing it through unconditionally is safe -- the bubble
+            # classes only ever render it for kind="sent" regardless.
+            message_id = entry.get("message_id")
+            read_status = entry.get("read_status")
+
             if payload_type == PayloadType.TEXT:
 
                 if entry["is_own"]:
 
                     self.messages.add_sent_message(
                         entry["text"],
-                        timestamp=timestamp_text
+                        timestamp=timestamp_text,
+                        message_id=message_id,
+                        read_status=read_status,
                     )
 
                 else:
@@ -545,7 +600,12 @@ class ChatWindow(QWidget):
                 placeholder = "[Attachment unavailable]"
 
                 if entry["is_own"]:
-                    self.messages.add_sent_message(placeholder, timestamp=timestamp_text)
+                    self.messages.add_sent_message(
+                        placeholder,
+                        timestamp=timestamp_text,
+                        message_id=message_id,
+                        read_status=read_status,
+                    )
                 else:
                     self.messages.add_received_message(
                         entry["sender"], placeholder, timestamp=timestamp_text
@@ -556,7 +616,12 @@ class ChatWindow(QWidget):
             if payload_type == PayloadType.IMAGE:
 
                 if entry["is_own"]:
-                    self.messages.add_sent_image(content, timestamp=timestamp_text)
+                    self.messages.add_sent_image(
+                        content,
+                        timestamp=timestamp_text,
+                        message_id=message_id,
+                        read_status=read_status,
+                    )
                 else:
                     self.messages.add_received_image(
                         entry["sender"], content, timestamp=timestamp_text
@@ -566,7 +631,11 @@ class ChatWindow(QWidget):
 
                 if entry["is_own"]:
                     self.messages.add_sent_file(
-                        content, content_metadata, timestamp=timestamp_text
+                        content,
+                        content_metadata,
+                        timestamp=timestamp_text,
+                        message_id=message_id,
+                        read_status=read_status,
                     )
                 else:
                     self.messages.add_received_file(
@@ -697,6 +766,42 @@ class ChatWindow(QWidget):
             self.messages.add_received_image(sender, content)
         else:
             self.messages.add_received_file(sender, content, content_metadata)
+
+    def handle_read_receipt_updated(self, conversation_id, reader):
+        """
+        A live "someone read up to now" hint arrived (C2 -- Read
+        Receipts). Ignored if it's not for the conversation currently
+        on screen -- compared against current_conversation_id (the
+        real conversation_id ClientSession.set_current_chat() already
+        resolves), not get_current_chat() (which is a partner
+        *username* for a direct conversation, not its conversation_id).
+
+        Direct: the one other party has, by definition, just read
+        every message they could see -- flip every sent bubble
+        immediately. Group: accumulate readers and only flip once
+        every currently-active participant (ConversationStore's own
+        already-left-member-excluded list -- see
+        ConversationStore.update_group_participants()) has been
+        accounted for, per your "double-check only when all active
+        recipients have read" decision. A departed member is simply
+        never in that list, so they can never block it.
+        """
+
+        if conversation_id != self.session.current_conversation_id:
+            return
+
+        self._read_receipt_readers.add(reader)
+
+        if not self.session.current_chat_is_group:
+            self.messages.mark_all_sent_read()
+            return
+
+        summary = self.session.conversation_store.get(conversation_id)
+
+        active_participants = set(summary.participants or []) if summary else set()
+
+        if active_participants and self._read_receipt_readers.issuperset(active_participants):
+            self.messages.mark_all_sent_read()
 
     def show_error(self, message):
 

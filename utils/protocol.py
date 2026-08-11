@@ -298,6 +298,41 @@ def create_group_members_added_packet(conversation_id, name, members):
     }
 
 
+def create_read_receipt_packet(conversation_id):
+    """
+    Ask the server to mark every currently-unread message in
+    ``conversation_id`` as read, on behalf of the authenticated
+    connection (C2 -- Read Receipts). Deliberately carries no reader/
+    recipient/user field at all -- the server derives who is reading
+    exclusively from the authenticated socket (see
+    server/client_handler.py::handle_read_receipt()), never from
+    anything client-supplied, so there is nothing here a malicious
+    client could forge to mark a different user's messages read.
+    """
+
+    return {
+        "type": "read_receipt",
+        "conversation_id": conversation_id
+    }
+
+
+def create_read_receipt_notification_packet(conversation_id, reader):
+    """
+    Server -> the other active member(s) of a conversation: `reader`
+    has read up to now in `conversation_id` (C2 -- Read Receipts).
+    Carries no message content, no message-id list, and no per-
+    recipient status -- conversation-level "read up to now" is the
+    whole signal; each recipient re-derives whatever it needs for its
+    own sent-message display from what it already holds locally.
+    """
+
+    return {
+        "type": "read_receipt_notification",
+        "conversation_id": conversation_id,
+        "reader": reader
+    }
+
+
 def create_delivery_failure_packet(
     receiver,
     reason="User is offline."

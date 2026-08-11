@@ -93,3 +93,47 @@ class MessageRepository(BaseRepository):
             MessageRecipient.message_id == message_id
         )
         return self.db.scalars(statement).all()
+
+    def mark_conversation_read(self, conversation_id, recipient_id):
+        """
+        Transition every not-yet-READ MessageRecipient row belonging
+        to ``recipient_id``, in ``conversation_id``, to READ (C2 --
+        Read Receipts). Reuses MessageRecipient/MessageDeliveryStatus
+        exactly as they already exist -- no schema change, no new
+        table; MessageRecipient has no conversation_id column of its
+        own, so this joins through Message to reach it.
+
+        Security: restricted to rows matching BOTH conversation_id AND
+        recipient_id -- the caller (server/client_handler.py::
+        handle_read_receipt()) must pass only the authenticated
+        connection's own user id here, never a client-supplied one, so
+        this can never touch another user's row regardless of what a
+        malicious client sends. Already-READ rows are left untouched
+        (filtered out, not just idempotently re-set) so updated_at
+        isn't bumped for no reason.
+
+        Returns the list of message_ids actually transitioned (empty
+        if there was nothing new to mark) -- the caller uses this to
+        decide whether a read_receipt_notification is even worth
+        sending.
+        """
+
+        statement = (
+            select(MessageRecipient)
+            .join(Message, MessageRecipient.message_id == Message.id)
+            .where(
+                Message.conversation_id == conversation_id,
+                MessageRecipient.recipient_id == recipient_id,
+                MessageRecipient.status != MessageDeliveryStatus.READ,
+            )
+        )
+
+        rows = self.db.scalars(statement).all()
+
+        message_ids = []
+
+        for row in rows:
+            row.status = MessageDeliveryStatus.READ
+            message_ids.append(row.message_id)
+
+        return message_ids

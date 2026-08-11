@@ -34,6 +34,7 @@ from utils.protocol import (
     create_group_members_added_packet,
     create_join_packet,
     create_leave_packet,
+    create_read_receipt_notification_packet,
     parse_packet,
 )
 
@@ -192,6 +193,41 @@ def persist_group_message(
         ]
 
         message_repo.record_recipients(message.id, recipient_ids, delivered_ids)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def _record_direct_recipient(message, receiver_id, delivered):
+    """
+    Create a direct message's MessageRecipient row (C2 -- Read
+    Receipts): DELIVERED if the recipient was connected and live-
+    relayed to just now, QUEUED otherwise (the C1 offline-persistence
+    path) -- exactly mirroring persist_group_message()'s own
+    DELIVERED/QUEUED split, reusing record_recipients() unchanged
+    rather than a new method. A direct message always has exactly one
+    recipient, so this is always a one-element list -- the same
+    generic method group messages already use, not a parallel
+    mechanism for direct messages.
+
+    Before C2, a direct message never got a MessageRecipient row at
+    all (see database/models/message_recipient.py's own prior
+    docstring); this is the one behavioral change to that existing
+    invariant, needed so read receipts have a row to transition to
+    READ later.
+    """
+
+    db = SessionLocal()
+
+    try:
+        message_repo = MessageRepository(db)
+
+        message_repo.record_recipients(
+            message.id,
+            [receiver_id],
+            [receiver_id] if delivered else [],
+        )
 
         db.commit()
     finally:
@@ -680,6 +716,84 @@ def handle_group_add_members(state, client_socket, user, packet):
     _dispatch_pending_rotation_if_needed(state, conversation_id)
 
 
+def handle_read_receipt(state, client_socket, user, packet):
+    """
+    Mark every currently-unread message in a conversation as read, on
+    behalf of the authenticated connection (C2 -- Read Receipts).
+
+    Security: the reader is derived exclusively from the authenticated
+    socket (``user.id``) -- create_read_receipt_packet() carries no
+    reader/recipient/user field at all, so there is nothing a
+    malicious client could supply to mark a different user's messages
+    read; MessageRepository.mark_conversation_read() is itself scoped
+    to exactly this recipient_id, so even a forged packet field
+    (there isn't one) couldn't reach another user's row. For a group
+    conversation, the authenticated user must currently be an active
+    member (get_member_user_ids() -- the identical check
+    handle_group_leave()/handle_group_chat_delivery() already use); a
+    non-member's request is silently rejected, matching the
+    established pattern for every other group-authorization check in
+    this file. This same check also correctly covers direct
+    conversations -- ConversationMember rows exist for both direct and
+    group conversations (get_or_create_direct_conversation() creates
+    one per participant), so no is_group branch is needed here at all.
+    """
+
+    conversation_id = packet.get("conversation_id")
+
+    if not conversation_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        conversation_uuid = uuid.UUID(conversation_id)
+
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+        if user.id not in member_ids:
+
+            state.logger.warning(
+                f"Rejected read_receipt: {user.username} is not a member of "
+                f"conversation {conversation_id}"
+            )
+
+            return
+
+        message_repo = MessageRepository(db)
+
+        newly_read_message_ids = message_repo.mark_conversation_read(
+            conversation_uuid, user.id
+        )
+
+        if not newly_read_message_ids:
+            return
+
+        db.commit()
+
+        recipient_id_strings = {
+            str(member_id) for member_id in member_ids if member_id != user.id
+        }
+    finally:
+        db.close()
+
+    notification = create_read_receipt_notification_packet(
+        conversation_id=conversation_id,
+        reader=user.username,
+    )
+
+    for sock, client in list(state.clients.items()):
+
+        if client.get("user_id") in recipient_id_strings:
+            send_to_client(sock, notification)
+
+    state.logger.info(
+        f"{user.username} read {len(newly_read_message_ids)} message(s) "
+        f"in conversation {conversation_id}"
+    )
+
+
 def _recover_pending_rotations_for_user(state, user):
     """
     Reconnect recovery (Phase 7 -- Group Membership Management): for
@@ -1027,12 +1141,39 @@ def handle_client(state, client_socket, client_address):
 
                         sender_client = state.get_client(client_socket)
 
-                        persist_message(
+                        message = persist_message(
                             sender_id=user.id,
                             receiver_id=client["user_id"],
                             algorithm=(sender_client or {}).get("algorithm"),
                             packet=packet
                         )
+
+                        # C2 -- Read Receipts: the recipient was just
+                        # live-relayed to, above -- DELIVERED, not
+                        # QUEUED.
+                        try:
+                            _record_direct_recipient(
+                                message,
+                                uuid.UUID(client["user_id"]),
+                                delivered=True,
+                            )
+                        except Exception as error:  # noqa: BLE001
+
+                            # Intentionally broad and scoped to this
+                            # bookkeeping call alone -- the message was
+                            # already relayed and persisted above, so a
+                            # failure here (e.g. a transient DB error
+                            # writing the MessageRecipient row) must
+                            # never undo or interrupt a delivery that
+                            # already succeeded; only read-receipt
+                            # status tracking is at risk, not the
+                            # message itself. Reuses the same logging
+                            # as the OFFLINE branch's equivalent guard
+                            # below -- the failure is always visible,
+                            # never silently swallowed.
+                            print(f"[ERROR] {error}")
+
+                            state.logger.error(str(error))
 
                         break
 
@@ -1066,11 +1207,20 @@ def handle_client(state, client_socket, client_address):
                         try:
                             sender_client = state.get_client(client_socket)
 
-                            persist_message(
+                            message = persist_message(
                                 sender_id=user.id,
                                 receiver_id=offline_user.id,
                                 algorithm=(sender_client or {}).get("algorithm"),
                                 packet=packet
+                            )
+
+                            # C2 -- Read Receipts: nobody was
+                            # connected to relay to, above -- QUEUED,
+                            # not DELIVERED.
+                            _record_direct_recipient(
+                                message,
+                                offline_user.id,
+                                delivered=False,
                             )
 
                         except Exception as error:  # noqa: BLE001
@@ -1188,6 +1338,13 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "group_add_members":
 
                 handle_group_add_members(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Read Receipt Packet (C2)
+            # -----------------------------
+            elif packet.get("type") == "read_receipt":
+
+                handle_read_receipt(state, client_socket, user, packet)
 
     except Exception as e:
 
