@@ -830,3 +830,147 @@ def test_text_payload_still_stored_inline_not_as_blob(sender_and_recipient):
     assert saved is not None
     assert saved.ciphertext == "plain-text-ciphertext"
     assert saved.blob_ref is None
+
+
+# ----------------------------------------------------------------------
+# C1: Offline Direct-Message Persistence
+#
+# Distinct from test_failed_delivery_does_not_create_database_record()
+# above: that test's receiver ("no-such-connected-user") never
+# resolves to any real, registered user at all -- persistence is
+# correctly still skipped for it, unchanged by this fix (no valid
+# receiver_id foreign key exists to persist under). The tests below
+# instead use a REAL, registered recipient who simply isn't connected
+# right now -- the case that was previously silently dropped.
+# ----------------------------------------------------------------------
+
+
+def test_message_to_real_offline_user_is_persisted_and_reports_delivery_failure(
+    running_server,
+):
+    """Requirement A: a real, registered recipient who is currently
+    disconnected still gets their message saved. delivery_failure is
+    still sent -- its meaning is unchanged (not live-delivered right
+    now) -- but unlike before this fix, the message itself is not
+    lost."""
+    _state, port = running_server
+
+    sender_payload = _register_user("c1a_sender_")
+    recipient_payload = _register_user("c1a_recipient_")
+
+    sender_sock, sender_name = _connect_and_authenticate(port, sender_payload)
+
+    # Bob briefly connects (so he genuinely exists as a known user)
+    # then disconnects before Alice sends anything -- the "real user,
+    # currently offline" case this fix targets, distinct from a
+    # username that was never registered at all.
+    recipient_sock, recipient_name = _connect_and_authenticate(port, recipient_payload)
+    recipient_sock.close()
+    time.sleep(0.2)
+
+    session_key = b"O" * 32
+    plaintext = "a real message sent while bob is offline"
+    ciphertext = AESCipher(session_key).encrypt(plaintext)
+
+    try:
+        _send(
+            sender_sock,
+            create_chat_packet(
+                sender=sender_name,
+                receiver=recipient_name,
+                message=ciphertext,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        failure = _recv_until(
+            sender_sock, lambda p: p.get("type") == "delivery_failure"
+        )
+        assert failure is not None
+        assert failure["receiver"] == recipient_name
+        assert failure["reason"]
+
+        saved = _wait_for_persisted_message(
+            sender_payload["user_id"], recipient_payload["user_id"]
+        )
+        assert saved is not None
+        assert str(saved.sender_id) == sender_payload["user_id"]
+        assert str(saved.receiver_id) == recipient_payload["user_id"]
+        assert saved.conversation_id is not None
+        assert saved.ciphertext == ciphertext
+        assert plaintext not in saved.ciphertext
+
+        db = SessionLocal()
+        try:
+            messages = db.scalars(
+                select(Message).where(
+                    Message.sender_id == uuid.UUID(sender_payload["user_id"]),
+                    Message.receiver_id == uuid.UUID(recipient_payload["user_id"]),
+                )
+            ).all()
+            assert len(messages) == 1
+        finally:
+            db.close()
+    finally:
+        sender_sock.close()
+        _delete_user(sender_payload["username"])
+        _delete_user(recipient_payload["username"])
+
+
+def test_offline_message_appears_and_decrypts_in_recipient_history_after_reconnect(
+    running_server,
+):
+    """Requirement B: once Bob is back, load_conversation_history()
+    -- the existing method, unmodified -- finds and correctly decrypts
+    the message that was sent while he was offline."""
+    _state, port = running_server
+
+    sender_payload = _register_user("c1b_sender_")
+    recipient_payload = _register_user("c1b_recipient_")
+
+    sender_sock, sender_name = _connect_and_authenticate(port, sender_payload)
+
+    recipient_sock, recipient_name = _connect_and_authenticate(port, recipient_payload)
+    recipient_sock.close()
+    time.sleep(0.2)
+
+    session_key = b"R" * 32
+    plaintext = "waiting for bob to come back online"
+    ciphertext = AESCipher(session_key).encrypt(plaintext)
+
+    try:
+        _send(
+            sender_sock,
+            create_chat_packet(
+                sender=sender_name,
+                receiver=recipient_name,
+                message=ciphertext,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        _recv_until(sender_sock, lambda p: p.get("type") == "delivery_failure")
+
+        saved = _wait_for_persisted_message(
+            sender_payload["user_id"], recipient_payload["user_id"]
+        )
+        assert saved is not None
+
+        # Bob "comes back" -- a fresh session standing in for a new
+        # login, exactly like every other history test in this file
+        # (_make_session_for()).
+        recipient_view = _make_session_for(recipient_payload["user_id"], recipient_name)
+
+        conversation_id = recipient_view.conversation_store.ensure_direct_conversation_id(
+            recipient_payload["user_id"], sender_name
+        )
+        recipient_view.key_manager.store_key(conversation_id, session_key)
+
+        history = recipient_view.load_conversation_history(sender_name)
+
+        assert len(history) == 1
+        assert history[0]["text"] == plaintext
+        assert history[0]["is_own"] is False
+    finally:
+        sender_sock.close()
+        _delete_user(sender_payload["username"])
+        _delete_user(recipient_payload["username"])

@@ -1039,6 +1039,66 @@ def handle_client(state, client_socket, client_address):
                 else:
 
                     # Loop completed without finding a matching
+                    # connected recipient. The message is still
+                    # persisted (real-application bug fix, C1 --
+                    # Offline Direct-Message Persistence) exactly like
+                    # a group message already is regardless of which
+                    # members are connected (see persist_group_message()) --
+                    # only delivery_failure's live-relay-didn't-happen
+                    # meaning stays unchanged; it never claimed the
+                    # message was lost, only that it wasn't delivered
+                    # right now.
+                    #
+                    # A receiver that doesn't resolve to any real user
+                    # at all (typo, never registered) is unaffected --
+                    # persist_message() requires a real receiver_id
+                    # foreign key, so there is nothing to persist
+                    # under, exactly as before this fix.
+                    db = SessionLocal()
+
+                    try:
+                        offline_user = UserRepository(db).get_by_username(receiver)
+                    finally:
+                        db.close()
+
+                    if offline_user is not None:
+
+                        try:
+                            sender_client = state.get_client(client_socket)
+
+                            persist_message(
+                                sender_id=user.id,
+                                receiver_id=offline_user.id,
+                                algorithm=(sender_client or {}).get("algorithm"),
+                                packet=packet
+                            )
+
+                        except Exception as error:  # noqa: BLE001
+
+                            # Intentionally broad, not an oversight:
+                            # persist_message() can fail for reasons
+                            # spanning unrelated exception hierarchies
+                            # -- SQLAlchemyError from db.commit()/the
+                            # conversation lookup, OSError from
+                            # encrypted_blob_store's filesystem write
+                            # (FILE/IMAGE payloads), or AttributeError/
+                            # TypeError from a malformed packet -- and
+                            # no single specific except would isolate
+                            # all of them. This failure must be
+                            # isolated here so delivery_failure (below)
+                            # is still returned to the sender no matter
+                            # what went wrong; letting it propagate
+                            # would skip that response entirely. Reuses
+                            # the exact logging this file's own outer
+                            # exception handler already uses -- the
+                            # failure is always visible, never silently
+                            # swallowed, and nothing here ever reports
+                            # the message as successfully persisted.
+                            print(f"[ERROR] {error}")
+
+                            state.logger.error(str(error))
+
+                    # Loop completed without finding a matching
                     # connected recipient -- report delivery failure
                     # to the sender instead of silently dropping it.
                     state.logger.info(
