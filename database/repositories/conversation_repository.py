@@ -21,6 +21,13 @@ get_epoch_state(), confirm_epoch(), get_group_conversations_with_pending_rotatio
 -- all operating on the existing ConversationMember.left_at column and
 the new Conversation.current_key_epoch/confirmed_key_epoch columns,
 never a second membership-state mechanism.
+
+A later real-application bug-fix pass adds add_members() (Issue 2 --
+add members to an existing group, reusing the exact same epoch-
+rotation machinery a leave already uses) and
+get_active_group_conversation_ids() (Issue 4 -- reconnect key
+recovery), both still built on left_at/current_key_epoch/
+confirmed_key_epoch alone.
 """
 
 from collections import namedtuple
@@ -263,6 +270,87 @@ class ConversationRepository(BaseRepository):
         )
 
         return list(self.db.scalars(statement).all())
+
+    def get_active_group_conversation_ids(self, user_id):
+        """
+        Return the ids of every group conversation this user is
+        currently an active member of, unfiltered by epoch state
+        (real-application bug fix: "add members"/reconnect key
+        recovery both need the full set, not just the ones with a
+        pending rotation -- see
+        get_group_conversations_with_pending_rotation() for that
+        narrower, Phase-7-specific query this one is a sibling to).
+        """
+
+        member_conversation_ids = select(ConversationMember.conversation_id).where(
+            ConversationMember.user_id == user_id,
+            ConversationMember.left_at.is_(None),
+        )
+
+        statement = select(Conversation.id).where(
+            Conversation.id.in_(member_conversation_ids),
+            Conversation.type == Conversation.TYPE_GROUP,
+        )
+
+        return list(self.db.scalars(statement).all())
+
+    def add_members(self, conversation_id, user_ids):
+        """
+        Add users to an existing group conversation (real-application
+        bug fix: "add members after creation" -- Issue 2). Reuses
+        ConversationMember/left_at exactly as leave_conversation()
+        does, never a second membership mechanism:
+
+        - a user_id with no existing row gets a fresh one (a genuinely
+          new member);
+        - a user_id whose existing row has left_at set is rejoining --
+          left_at is cleared rather than inserting a second row, since
+          (conversation_id, user_id) is uniquely constrained;
+        - a user_id already an active member (left_at IS NULL) is a
+          no-op.
+
+        Returns the list of user_ids actually added or rejoined --
+        excludes already-active members -- so the caller knows whether
+        anything actually changed (and therefore whether a key epoch
+        needs reserving).
+        """
+
+        existing_rows = {
+            member.user_id: member
+            for member in self.db.scalars(
+                select(ConversationMember).where(
+                    ConversationMember.conversation_id == conversation_id,
+                    ConversationMember.user_id.in_(user_ids),
+                )
+            ).all()
+        }
+
+        affected = []
+
+        for user_id in user_ids:
+
+            row = existing_rows.get(user_id)
+
+            if row is None:
+
+                self.add(
+                    ConversationMember(
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                    )
+                )
+
+                affected.append(user_id)
+
+            elif row.left_at is not None:
+
+                row.left_at = None
+
+                affected.append(user_id)
+
+            # else: already an active member -- no-op.
+
+        return affected
 
     def get_conversation_previews_for_user(self, user_id):
         """

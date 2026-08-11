@@ -14,6 +14,7 @@ exactly like a plain string, with no extra (de)serialization step
 anywhere in the pipeline.
 """
 
+import mimetypes
 from enum import StrEnum
 
 
@@ -35,3 +36,22 @@ class PayloadType(StrEnum):
 # reaction/read-receipt marker) should not be silently routed to blob
 # storage just because it isn't TEXT.
 BLOB_STORAGE_PAYLOAD_TYPES = frozenset({PayloadType.FILE, PayloadType.IMAGE})
+
+
+def classify_attachment(filename: str) -> PayloadType:
+    """
+    Classify a local file by name into PayloadType.IMAGE or
+    PayloadType.FILE (Phase 8 -- File & Image Transfer), by MIME type
+    via the standard library's extension table -- not a hand-rolled
+    extension whitelist. Anything not recognized as an "image/*" MIME
+    type (including an unrecognized or missing extension) is a plain
+    FILE; there is no third bucket at attach time, and the caller never
+    asks the user to choose manually.
+    """
+
+    mime_type, _ = mimetypes.guess_type(filename)
+
+    if mime_type and mime_type.startswith("image/"):
+        return PayloadType.IMAGE
+
+    return PayloadType.FILE

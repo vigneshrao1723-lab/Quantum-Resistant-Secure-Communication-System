@@ -258,6 +258,46 @@ def create_group_key_rotation_complete_packet(conversation_id, epoch):
     }
 
 
+def create_group_add_members_packet(sender, conversation_id, member_usernames):
+    """
+    Ask the server to add one or more users to an existing group
+    conversation (real-application bug fix, Issue 2 -- Add Members
+    After Group Creation). The server derives who is *requesting* the
+    add from the authenticated socket, never from this packet's
+    `sender` field -- included only for logging/symmetry with the
+    other group packets, exactly like `group_leave`'s `sender` field.
+    """
+
+    return {
+        "type": "group_add_members",
+        "sender": sender,
+        "conversation_id": conversation_id,
+        "members": member_usernames
+    }
+
+
+def create_group_members_added_packet(conversation_id, name, members):
+    """
+    Notify every active member of a group -- both the ones who were
+    already there and the ones just added -- of its current,
+    authoritative participant list (Issue 2 -- Add Members After Group
+    Creation). Sent to everyone rather than split into an "old
+    members" and "new members" variant: ConversationStore.
+    add_or_update_group() is already safe to call whether or not the
+    recipient had this conversation before (it preserves
+    latest_message if it did, creates a fresh entry if it didn't), so
+    one packet shape serves both audiences with no client-side branch.
+    `members` is the complete, updated active-member username list.
+    """
+
+    return {
+        "type": "group_members_added",
+        "conversation_id": conversation_id,
+        "name": name,
+        "members": members
+    }
+
+
 def create_delivery_failure_packet(
     receiver,
     reason="User is offline."
@@ -330,10 +370,19 @@ def create_session_key_packet(
     sender,
     receiver,
     algorithm,
-    encrypted_key
+    encrypted_key,
+    epoch=None
 ):
     """
     Create an encrypted AES session key packet.
+
+    `epoch` (direct-message key desynchronization fix): which
+    server-reserved key epoch (Conversation.current_key_epoch --
+    the exact same counter and ConversationRepository.reserve_next_epoch()
+    Phase 7 already uses for group-key rotation, reused unchanged here)
+    this session key belongs to. Optional and additive: an omitted
+    epoch defaults to `None` on the wire, which handle_session_key()
+    already treats as 1, identical to pre-fix behavior.
     """
 
     return {
@@ -342,7 +391,8 @@ def create_session_key_packet(
         "algorithm": algorithm,
         "sender": sender,
         "receiver": receiver,
-        "encrypted_key": encrypted_key
+        "encrypted_key": encrypted_key,
+        "epoch": epoch
     }
 
 

@@ -7,18 +7,20 @@ and cryptography layers.
 """
 
 import base64
+import mimetypes
 import os
 import socket
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
 from client.conversation_store import ConversationStore
 from client.receiver import receive_messages
-from config import HOST, PORT
+from config import HOST, MAX_ATTACHMENT_SIZE_BYTES, PORT
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
 from database.connection import SessionLocal
@@ -28,14 +30,20 @@ from database.repositories.message_repository import MessageRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary, MessagePreview
 from domain.payload_envelope import PayloadEnvelope
-from domain.payload_type import PayloadType
+from domain.payload_type import (
+    BLOB_STORAGE_PAYLOAD_TYPES,
+    PayloadType,
+    classify_attachment,
+)
 from logger_config import setup_logger
 from payload.file_adapter import FilePayloadAdapter
 from payload.text_adapter import TextPayloadAdapter
 from security.tls import build_client_context
+from storage import encrypted_blob_store
 from utils.network import receive_message, send_message
 from utils.protocol import (
     create_auth_packet,
+    create_group_add_members_packet,
     create_group_create_packet,
     create_group_key_distribution_packet,
     create_group_key_rotation_complete_packet,
@@ -67,6 +75,14 @@ class ClientSession(QObject):
     users_updated = Signal(list)
     error_occurred = Signal(str)
     connection_changed = Signal(bool)
+
+    # Phase 8 -- File & Image Transfer: a separate signal for binary
+    # payload content (identity_key, sender, payload_type,
+    # content: bytes, content_metadata: dict). message_received stays
+    # Signal(str, str, str) and TEXT-only, unmodified -- Qt signals are
+    # fixed-type, so bytes cannot flow through it; this is additive,
+    # not a replacement.
+    payload_message_received = Signal(str, str, str, bytes, dict)
 
     def __init__(self):
         super().__init__()
@@ -430,6 +446,34 @@ class ClientSession(QObject):
         ``self.current_conversation_id`` -- the real conversation_id,
         already resolved by set_current_chat() via ConversationStore,
         never looked up here.
+
+        Key-desynchronization fix: every key established here is
+        stamped with a freshly RESERVED epoch (never an assumed
+        "epoch 1"), via the exact same
+        ConversationRepository.reserve_next_epoch()/current_key_epoch
+        counter Phase 7 already uses for group-key rotation -- reused
+        completely unchanged, just called from a second place. This
+        is what fixes the one-sided-restart bug: previously, a client
+        with no cached key always (re)established under the hardcoded
+        default epoch 1, which collided with -- and was silently
+        rejected by -- a still-connected partner who already had
+        epoch 1 cached (KeyManager.store_key() never overwrites an
+        existing epoch), leaving the two sides permanently talking
+        past each other. Reserving a genuinely new epoch every time
+        means the partner always receives it into a brand-new,
+        never-before-seen epoch slot -- no collision is possible, and
+        KeyManager's existing "current epoch is whichever is highest"
+        rule (already proven for groups) makes both sides converge on
+        it. A brand-new conversation "wastes" epoch 1 this way (its
+        first real key lands on epoch 2) -- a harmless, permanent
+        quirk, not a bug: epoch numbers only need to be unique and
+        monotonically increasing, never to start at exactly 1.
+
+        Reserving via the server-persisted counter (not a purely
+        local guess) is what makes this safe even when BOTH sides
+        have lost their cached key at once: the counter itself
+        survives any number of client restarts, so it can never
+        replay an epoch either side has already used.
         """
 
         if self.current_chat is None:
@@ -442,6 +486,19 @@ class ClientSession(QObject):
 
         if self.key_manager.has_key(conversation_id):
             return
+
+        db = SessionLocal()
+
+        try:
+            conversation_repo = ConversationRepository(db)
+
+            epoch = conversation_repo.reserve_next_epoch(
+                uuid.UUID(conversation_id)
+            )
+
+            conversation_repo.commit()
+        finally:
+            db.close()
 
         algorithm = self.key_manager.algorithm
 
@@ -471,19 +528,21 @@ class ClientSession(QObject):
 
         self.key_manager.store_key(
             conversation_id,
-            session_key
+            session_key,
+            epoch=epoch
         )
 
         self.logger.info(
             f"Generated AES session key for {receiver} "
-            f"({algorithm})"
+            f"({algorithm}, epoch {epoch})"
         )
 
         packet = create_session_key_packet(
             sender=self.username,
             receiver=receiver,
             algorithm=algorithm,
-            encrypted_key=encrypted_key
+            encrypted_key=encrypted_key,
+            epoch=epoch
         )
 
         send_message(
@@ -499,11 +558,87 @@ class ClientSession(QObject):
 
     def send_chat_message(self, message):
         """
-        Encrypt and send a message to the currently open conversation
-        -- direct or group (Phase 4 -- Secure Group Messaging
-        Foundation). One shared pipeline: only key lookup (group keys
-        need no live exchange) and packet addressing branch; encrypt,
-        log, send, and record steps are identical code for both.
+        Encrypt and send a text message to the currently open
+        conversation -- direct or group (Phase 4 -- Secure Group
+        Messaging Foundation). A thin, TEXT-specific wrapper around
+        _send_encrypted_payload() (Phase 8 -- File & Image Transfer):
+        signature and behavior are unchanged from before Phase 8.
+        """
+
+        self._send_encrypted_payload(
+            PayloadType.TEXT,
+            message,
+            content_metadata=None,
+            preview_text=message,
+        )
+
+    def send_attachment(self, file_path):
+        """
+        Read, classify, encrypt, and send a local file as the next
+        message in the currently open conversation -- direct or group
+        (Phase 8 -- File & Image Transfer). Classification (IMAGE vs.
+        FILE) is by MIME type (domain/payload_type.py::
+        classify_attachment()) -- never asked of the user.
+
+        Returns (payload_type, data, content_metadata) so the caller
+        (the GUI) can render the local "sent" bubble from the same
+        bytes just read, without a second disk read.
+
+        Size is checked via a stat() call, before the file is read
+        into memory or anything is encrypted -- config.py's
+        MAX_ATTACHMENT_SIZE_BYTES documents why this project enforces
+        a cap at all (the existing wire framing holds a whole message
+        in memory, with no chunking/streaming). Raises ValueError for
+        an oversized file or no open conversation, OSError if the file
+        cannot be read -- both before any network or crypto work, so a
+        rejection here has no side effects to unwind.
+        """
+
+        path = Path(file_path)
+
+        size_bytes = path.stat().st_size
+
+        if size_bytes > MAX_ATTACHMENT_SIZE_BYTES:
+            raise ValueError(
+                f"'{path.name}' is {size_bytes:,} bytes, which exceeds the "
+                f"maximum attachment size of {MAX_ATTACHMENT_SIZE_BYTES:,} bytes."
+            )
+
+        if self.current_chat is None:
+            raise ValueError(
+                "No chat partner selected."
+            )
+
+        data = path.read_bytes()
+
+        payload_type = classify_attachment(path.name)
+
+        content_metadata = {
+            "filename": path.name,
+            "mime_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            "size_bytes": len(data),
+        }
+
+        self._send_encrypted_payload(
+            payload_type,
+            data,
+            content_metadata=content_metadata,
+            preview_text=None,
+        )
+
+        return payload_type, data, content_metadata
+
+    def _send_encrypted_payload(self, payload_type, content, content_metadata, preview_text):
+        """
+        Shared encrypt-and-send pipeline for every payload type (Phase
+        8 -- File & Image Transfer): key lookup, epoch stamping, packet
+        addressing, send, and local conversation_store recording are
+        identical regardless of what ``content`` is -- only the
+        adapter chosen (via _adapter_for()) and the packet's
+        payload_type/content_metadata differ. Extracted from the body
+        send_chat_message() used to have; send_chat_message() and
+        send_attachment() are both thin callers now, so there is
+        exactly one place this logic exists.
         """
 
         if self.current_chat is None:
@@ -525,11 +660,17 @@ class ClientSession(QObject):
 
         aes = AESCipher(session_key)
 
-        envelope = self._adapter_for(PayloadType.TEXT).encrypt(message, aes)
-
-        self.logger.info(
-            f"SENT (Encrypted): {envelope.ciphertext}"
+        envelope = self._adapter_for(payload_type).encrypt(
+            content, aes, content_metadata=content_metadata
         )
+
+        if payload_type == PayloadType.TEXT:
+            self.logger.info(f"SENT (Encrypted): {envelope.ciphertext}")
+        else:
+            self.logger.info(
+                f"SENT (Encrypted {payload_type}): {len(envelope.ciphertext)} "
+                f"base64 chars"
+            )
 
         sent_at = datetime.now(timezone.utc)
 
@@ -570,9 +711,10 @@ class ClientSession(QObject):
         self.conversation_store.record_message(
             self.current_chat,
             MessagePreview(
-                payload_type=PayloadType.TEXT,
-                text=message,
+                payload_type=payload_type,
+                text=preview_text,
                 timestamp=sent_at.replace(tzinfo=None),
+                content_metadata=content_metadata or {},
             ),
             is_own=True,
             is_online=(
@@ -623,6 +765,51 @@ class ClientSession(QObject):
             return self._adapter_for(PayloadType.TEXT).decrypt(envelope, AESCipher(session_key))
         except Exception:
             return _UNDECRYPTABLE_PLACEHOLDER
+
+    def _load_blob_history_content(self, conversation_id, message, epoch):
+        """
+        Decrypt a stored FILE/IMAGE message's content for history
+        display (Phase 8 -- File & Image Transfer). Mirrors
+        _decrypt_history_message()'s epoch-aware, never-raise contract,
+        but reads the ciphertext from local blob storage (via
+        Message.blob_ref) instead of Message.ciphertext -- the exact
+        mirror of where persist_message() decided to write it.
+
+        Reuses storage.encrypted_blob_store.load_blob() directly --
+        the same reuse-the-existing-client-DB-access-model this
+        client already relies on for every other bit of history (see
+        SessionLocal usage throughout this class): no new client<->
+        server retrieval packet is introduced, since the client
+        already reads the database (and, with this addition, the
+        blob directory) directly rather than through the server.
+
+        Returns the decrypted bytes, or None if this client never
+        received this epoch's key, the blob is missing, or decryption
+        fails -- the binary equivalent of _UNDECRYPTABLE_PLACEHOLDER
+        (callers render their own placeholder for None; a text
+        placeholder string cannot stand in for missing bytes here).
+        """
+
+        if not message.blob_ref:
+            return None
+
+        session_key = self.key_manager.get_key(conversation_id, epoch=epoch)
+
+        if session_key is None:
+            return None
+
+        try:
+            ciphertext = encrypted_blob_store.load_blob(message.blob_ref).decode("utf-8")
+
+            envelope = PayloadEnvelope(
+                payload_type=message.payload_type,
+                ciphertext=ciphertext,
+                content_metadata=message.content_metadata or {},
+            )
+
+            return self._adapter_for(message.payload_type).decrypt(envelope, AESCipher(session_key))
+        except Exception:
+            return None
 
     def load_conversation_history(self, key, is_group=False):
         """
@@ -712,22 +899,128 @@ class ClientSession(QObject):
                 else:
                     sender_name = self.username if is_own else key
 
-                text = self._decrypt_history_message(
-                    decrypt_key,
-                    message.ciphertext,
-                    epoch=message.epoch or 1,
-                )
+                payload_type = message.payload_type or PayloadType.TEXT
+                epoch = message.epoch or 1
+
+                # Phase 8 -- File & Image Transfer: TEXT keeps using
+                # the existing inline-ciphertext path unchanged; a
+                # blob-stored payload_type (BLOB_STORAGE_PAYLOAD_TYPES)
+                # reads its ciphertext from local blob storage instead
+                # -- Message.ciphertext is NULL for those rows (see
+                # persist_message()), so message.ciphertext must never
+                # be passed to _decrypt_history_message() for them.
+                if payload_type in BLOB_STORAGE_PAYLOAD_TYPES:
+                    text = None
+                    content = self._load_blob_history_content(decrypt_key, message, epoch)
+                else:
+                    text = self._decrypt_history_message(
+                        decrypt_key,
+                        message.ciphertext,
+                        epoch=epoch,
+                    )
+                    content = None
 
                 history.append({
                     "sender": sender_name,
                     "text": text,
                     "timestamp": message.timestamp,
                     "is_own": is_own,
+                    "payload_type": payload_type,
+                    "content": content,
+                    "content_metadata": message.content_metadata or {},
                 })
 
             return history
         finally:
             db.close()
+
+    def find_user_by_id(self, user_id_str):
+        """
+        Look up a user by their unique ID (Issue 3 fix -- User Must Be
+        Searched By Unique ID). ``id`` (the UUID primary key) is used
+        as the identifier, not username/email -- see the diagnosis
+        given before implementation: it's the only field this schema
+        actually calls "id", it's globally unique by construction
+        (Postgres primary key), and unlike username/email it reveals
+        nothing about the person from the string alone.
+
+        A direct client-side DB read via UserRepository, exactly like
+        every other read this class already performs
+        (load_conversation_history(), load_conversations()) -- not a
+        new packet type; this app's client already holds live
+        database credentials for its own history/conversation reads,
+        and a lookup here grants no privilege of its own. Sending to
+        or opening a conversation with the found user still goes
+        through the server's existing sender-authentication and
+        group-membership checks, completely unchanged.
+
+        Returns a dict with only {"user_id", "username",
+        "display_name"} -- deliberately not the full User row (no
+        email, no password hash, no internal flags) -- to avoid
+        exposing more than a lookup-by-ID needs to. Returns None for a
+        malformed ID or one that matches nobody -- both are reported
+        identically ("not found") so a caller can't distinguish a
+        malformed guess from a well-formed-but-nonexistent one. Raises
+        PermissionError if this session itself isn't authenticated
+        yet, mirroring login()'s existing use of that exception for
+        the same kind of guard.
+        """
+
+        if not self.user_id:
+            raise PermissionError(
+                "You must be logged in to search for users."
+            )
+
+        try:
+            parsed_id = uuid.UUID(user_id_str)
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+        db = SessionLocal()
+
+        try:
+            user = UserRepository(db).get_by_id(parsed_id)
+        finally:
+            db.close()
+
+        if user is None:
+            return None
+
+        return {
+            "user_id": str(user.id),
+            "username": user.username,
+            "display_name": user.display_name,
+        }
+
+    def _build_latest_message_preview(self, conversation_id, latest_message_row):
+        """
+        Build the sidebar MessagePreview for one conversation's latest
+        stored message (Phase 8 -- File & Image Transfer extends this
+        beyond TEXT). A FILE/IMAGE preview never touches blob storage
+        at all -- MessagePreview.render() only needs payload_type and
+        content_metadata (e.g. filename) to show "\U0001F4C4 report.pdf",
+        not the decrypted bytes themselves, so the sidebar stays cheap
+        regardless of attachment size.
+        """
+
+        payload_type = latest_message_row.payload_type or PayloadType.TEXT
+
+        text = (
+            self._decrypt_history_message(
+                conversation_id,
+                latest_message_row.ciphertext,
+                epoch=latest_message_row.epoch or 1,
+            )
+            if payload_type == PayloadType.TEXT
+            else None
+        )
+
+        return MessagePreview(
+            payload_type=payload_type,
+            text=text,
+            timestamp=latest_message_row.timestamp,
+            content_metadata=latest_message_row.content_metadata or {},
+        )
 
     def load_conversations(self):
         """
@@ -763,17 +1056,8 @@ class ClientSession(QObject):
                     latest_message = None
 
                     if preview.latest_message is not None:
-
-                        text = self._decrypt_history_message(
-                            conversation_id,
-                            preview.latest_message.ciphertext,
-                            epoch=preview.latest_message.epoch or 1,
-                        )
-
-                        latest_message = MessagePreview(
-                            payload_type=PayloadType.TEXT,
-                            text=text,
-                            timestamp=preview.latest_message.timestamp,
+                        latest_message = self._build_latest_message_preview(
+                            conversation_id, preview.latest_message
                         )
 
                     summaries.append(
@@ -802,16 +1086,8 @@ class ClientSession(QObject):
                     # The real conversation_id, already known from
                     # this query -- the KeyManager identity (Phase 5),
                     # not the partner's username.
-                    text = self._decrypt_history_message(
-                        str(preview.conversation.id),
-                        preview.latest_message.ciphertext,
-                        epoch=preview.latest_message.epoch or 1,
-                    )
-
-                    latest_message = MessagePreview(
-                        payload_type=PayloadType.TEXT,
-                        text=text,
-                        timestamp=preview.latest_message.timestamp,
+                    latest_message = self._build_latest_message_preview(
+                        str(preview.conversation.id), preview.latest_message
                     )
 
                 summaries.append(
@@ -901,6 +1177,9 @@ class ClientSession(QObject):
 
         elif packet_type == "group_key_rotation_required":
             self.handle_group_key_rotation_required(packet)
+
+        elif packet_type == "group_members_added":
+            self.handle_group_members_added(packet)
 
         else:
 
@@ -1040,27 +1319,64 @@ class ClientSession(QObject):
             content_metadata=packet.get("content_metadata") or {},
         )
 
-        decrypted_message = self._adapter_for(envelope.payload_type).decrypt(envelope, aes)
+        decrypted_content = self._adapter_for(envelope.payload_type).decrypt(envelope, aes)
 
+        timestamp = self._parse_incoming_timestamp(packet.get("timestamp"))
+
+        if envelope.payload_type == PayloadType.TEXT:
+
+            self.logger.info(
+                f"RECEIVED: {sender}: {decrypted_content}"
+            )
+
+            self.conversation_store.record_message(
+                identity_key,
+                MessagePreview(
+                    payload_type=PayloadType.TEXT,
+                    text=decrypted_content,
+                    timestamp=timestamp,
+                ),
+                is_own=False,
+                is_online=(False if is_group else sender in self.online_users),
+            )
+
+            self.message_received.emit(
+                identity_key,
+                sender,
+                decrypted_content
+            )
+
+            return
+
+        # Binary payload (Phase 8 -- File & Image Transfer):
+        # decrypted_content is raw bytes (FilePayloadAdapter ->
+        # crypto/payload_cipher.py's generic passthrough) -- never
+        # routed through message_received, a fixed Signal(str, str,
+        # str) that cannot carry bytes. See payload_message_received's
+        # declaration for the full rationale.
         self.logger.info(
-            f"RECEIVED: {sender}: {decrypted_message}"
+            f"RECEIVED ({envelope.payload_type}): {sender}: "
+            f"{len(decrypted_content)} bytes"
         )
 
         self.conversation_store.record_message(
             identity_key,
             MessagePreview(
-                payload_type=PayloadType.TEXT,
-                text=decrypted_message,
-                timestamp=self._parse_incoming_timestamp(packet.get("timestamp")),
+                payload_type=envelope.payload_type,
+                text=None,
+                timestamp=timestamp,
+                content_metadata=envelope.content_metadata,
             ),
             is_own=False,
             is_online=(False if is_group else sender in self.online_users),
         )
 
-        self.message_received.emit(
+        self.payload_message_received.emit(
             identity_key,
             sender,
-            decrypted_message
+            envelope.payload_type,
+            decrypted_content,
+            envelope.content_metadata,
         )
 
     # ----------------------------------------------------------
@@ -1115,6 +1431,17 @@ class ClientSession(QObject):
         conversation_id (Phase 5), resolved via ConversationStore --
         never looked up or cached here. Decryption/decapsulation
         itself is unrelated to conversation identity and unchanged.
+
+        ``epoch`` (key-desynchronization fix): the epoch the sender
+        reserved for this key (see establish_session_key()'s
+        docstring). Stored under that exact epoch -- never assumed to
+        be 1 -- so a key established after the sender's own restart
+        lands in a fresh, never-before-seen epoch slot instead of
+        being silently dropped by KeyManager.store_key()'s existing
+        no-overwrite guarantee for an epoch this client already has.
+        Defaults to 1 for a packet that omits it (none do today, but
+        this mirrors every other epoch-aware packet's backward-
+        compatible default).
         """
 
         sender = packet["sender"]
@@ -1148,9 +1475,12 @@ class ClientSession(QObject):
                 )
             )
 
+        epoch = packet.get("epoch") or 1
+
         self.key_manager.store_key(
             conversation_id,
-            session_key
+            session_key,
+            epoch=epoch
         )
 
         self.logger.info(
@@ -1376,6 +1706,53 @@ class ClientSession(QObject):
         self.logger.info(
             f"Rotated group key for {conversation_id} to epoch {epoch} "
             f"({recipients})"
+        )
+
+    def handle_group_members_added(self, packet):
+        """
+        A group conversation this user belongs to gained one or more
+        members (Issue 2 fix -- Add Members After Group Creation).
+        Sent to every current active member, old and new alike --
+        add_or_update_group() is already safe to call either way (see
+        create_group_members_added_packet()'s docstring), so this
+        handler needs no branch for "am I new here or not". Key
+        material for any genuinely new member arrives separately, via
+        the existing handle_group_key_rotation_required() path (the
+        add reuses a key-epoch rotation, exactly like a leave does).
+        """
+
+        conversation_id = packet["conversation_id"]
+        name = packet["name"]
+        members = packet.get("members", [])
+
+        participants = [m for m in members if m != self.username]
+
+        self.conversation_store.add_or_update_group(conversation_id, name, participants)
+
+        self.logger.info(
+            f"Group {conversation_id} members updated: {members}"
+        )
+
+    def add_group_members(self, conversation_id, member_usernames):
+        """
+        Ask the server to add one or more users to an existing group
+        conversation (Issue 2 fix -- Add Members After Group
+        Creation). The result (participant-list refresh for everyone,
+        and key material for the new member(s)) arrives asynchronously
+        via handle_group_members_added() / handle_group_key_rotation_required()
+        -- there is no optimistic local update, matching every other
+        conversation-store change.
+        """
+
+        packet = create_group_add_members_packet(
+            sender=self.username,
+            conversation_id=conversation_id,
+            member_usernames=member_usernames,
+        )
+
+        send_message(
+            self.client_socket,
+            packet
         )
 
     def leave_group_conversation(self, conversation_id):

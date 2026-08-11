@@ -259,6 +259,18 @@ class ConversationStore(QObject):
 
         self.conversations_changed.emit()
 
+    def get(self, key):
+        """
+        Return the ConversationSummary for one key, or None if not
+        present (Issue 2 fix -- Add Members After Group Creation:
+        the GUI needs a group's current participant list to exclude
+        already-active members from the "add" candidate list). A
+        narrow, read-only accessor -- does not create or mutate
+        anything, unlike every method above it.
+        """
+
+        return self._summaries.get(key)
+
     def get_all(self):
         """
         Return every conversation, sorted by latest activity (most

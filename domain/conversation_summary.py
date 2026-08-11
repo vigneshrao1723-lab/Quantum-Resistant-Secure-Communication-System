@@ -7,8 +7,9 @@ This is the payload-independent preview shape from Architecture
 Blueprint v2 (S02 Payload Pipeline, S15 Communication Pipeline).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from domain.payload_type import PayloadType
 
@@ -18,28 +19,33 @@ class MessagePreview:
     """A short, renderable preview of one message.
 
     ``payload_type`` is the extension point every future content type
-    hangs off of. Only PayloadType.TEXT is ever produced today -- the
-    mapping for other payload types is documented in render() but not
-    implemented, since those payload types don't exist yet.
+    hangs off of. ``content_metadata`` (Phase 8 -- File & Image
+    Transfer) carries the non-secret descriptors (e.g. filename) a
+    non-text preview needs to render -- it is never decrypted content
+    itself, only what persist_message() already stored alongside the
+    ciphertext/blob_ref.
     """
 
     payload_type: PayloadType
     text: str | None = None
     timestamp: datetime | None = None
+    content_metadata: dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         """
         Return the display string for this preview -- the one place
-        payload-type branches into text. Adding image/file/voice/
-        video support later means adding a branch here, not touching
-        any widget:
-            "image" -> "\U0001F4F7 Photo"
-            "file"  -> f"\U0001F4C4 {filename}"
+        payload-type branches into text. Adding voice/video support
+        later means adding a branch here, not touching any widget:
             "voice" -> "\U0001F3A4 Voice Message"
             "video" -> "\U0001F3A5 Video"
         """
         if self.payload_type == PayloadType.TEXT:
             return self.text or ""
+        if self.payload_type == PayloadType.IMAGE:
+            return "\U0001F4F7 Photo"
+        if self.payload_type == PayloadType.FILE:
+            filename = self.content_metadata.get("filename")
+            return f"\U0001F4C4 {filename}" if filename else "\U0001F4C4 File"
         return "Unsupported message"
 
 

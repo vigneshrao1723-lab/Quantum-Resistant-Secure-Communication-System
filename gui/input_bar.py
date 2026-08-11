@@ -4,9 +4,10 @@ Input Bar
 Contains the message input field and send button.
 """
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget,
+    QFileDialog,
     QHBoxLayout,
     QLineEdit,
     QPushButton,
@@ -19,9 +20,17 @@ class InputBar(QWidget):
 
     Emits the entered message whenever the
     user presses Enter or clicks the Send button.
+
+    Also emits attachment_selected (Phase 8 -- File & Image Transfer)
+    when the user picks a local file via the Attach button -- a bare
+    file path, not its content; ChatWindow/ClientSession own reading,
+    classifying, and sending it. This widget has no opinion on File
+    vs. Image -- the user is never asked to choose (see
+    domain/payload_type.py::classify_attachment()).
     """
 
     message_sent = Signal(str)
+    attachment_selected = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -36,6 +45,20 @@ class InputBar(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setSpacing(10)
+
+        self.attach_button = QPushButton("\U0001F4CE")
+
+        self.attach_button.setObjectName("IconButton")
+
+        self.attach_button.setFixedSize(44, 44)
+
+        self.attach_button.setCursor(Qt.PointingHandCursor)
+
+        self.attach_button.setToolTip("Attach a file or image")
+
+        self.attach_button.clicked.connect(
+            self._handle_attach_clicked
+        )
 
         self.message_input = QLineEdit()
 
@@ -63,6 +86,8 @@ class InputBar(QWidget):
             self.send_message
         )
 
+        layout.addWidget(self.attach_button)
+
         layout.addWidget(self.message_input)
 
         layout.addWidget(self.send_button)
@@ -84,6 +109,8 @@ class InputBar(QWidget):
         """
 
         self.message_input.setEnabled(enabled)
+
+        self.attach_button.setEnabled(enabled)
 
         if enabled:
             self._update_send_button_state()
@@ -126,3 +153,18 @@ class InputBar(QWidget):
         )
 
         self.send_button.setEnabled(has_text)
+
+    def _handle_attach_clicked(self):
+        """
+        Open a native file picker and emit the chosen path (Phase 8 --
+        File & Image Transfer). One dialog, no File/Image filter split
+        -- classification happens downstream, never here.
+        """
+
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Attach File"
+        )
+
+        if path:
+            self.attachment_selected.emit(path)

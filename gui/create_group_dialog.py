@@ -9,6 +9,7 @@ post-creation membership changes.
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QDialogButtonBox,
     QLabel,
@@ -53,6 +54,18 @@ class CreateGroupDialog(QDialog):
 
         self.member_list = QListWidget()
 
+        # Bug fix (real-application testing): QListWidget's default
+        # selectionMode is SingleSelection, which only highlights the
+        # clicked row -- it does not toggle ItemIsUserCheckable's
+        # checkbox unless the user clicks the small checkbox glyph
+        # exactly. That made multi-member selection look broken (only
+        # whichever checkbox was hit dead-on ever got checked; every
+        # other click just moved the highlight). NoSelection removes
+        # the misleading highlight entirely -- the checkbox state is
+        # the only selection mechanism now, toggled by clicking
+        # anywhere on the row via _toggle_item_check_state() below.
+        self.member_list.setSelectionMode(QAbstractItemView.NoSelection)
+
         for username in online_users:
 
             item = QListWidgetItem(username)
@@ -62,6 +75,10 @@ class CreateGroupDialog(QDialog):
             item.setCheckState(Qt.Unchecked)
 
             self.member_list.addItem(item)
+
+        self.member_list.itemClicked.connect(
+            self._toggle_item_check_state
+        )
 
         layout.addWidget(self.member_list)
 
@@ -74,6 +91,22 @@ class CreateGroupDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout.addWidget(buttons)
+
+    # ==========================================================
+    # Events
+    # ==========================================================
+
+    def _toggle_item_check_state(self, item):
+        """
+        Toggle a member row's checkbox on click anywhere in the row --
+        the fix for the multi-member selection bug (see build_ui()).
+        Every checked row survives independently; clicking one member
+        never affects another's check state.
+        """
+
+        item.setCheckState(
+            Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+        )
 
     # ==========================================================
     # Public Methods

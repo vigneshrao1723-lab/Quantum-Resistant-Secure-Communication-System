@@ -106,6 +106,23 @@ FILE_STORAGE_ROOT = Path(
     os.environ.get("FILE_STORAGE_ROOT", str(ROOT_DIR / "storage_blobs"))
 )
 
+# ---------------------------------------------------------------
+# Attachment Size Limit (client-side, Phase 8 -- File & Image
+# Transfer)
+#
+# The existing wire framing (utils/network.py) is a single length-
+# prefixed JSON packet with no chunking/streaming -- an attachment is
+# base64-encoded and held fully in memory on both ends as one packet.
+# This cap is enforced client-side, before a file is read or
+# encrypted, to keep that whole-message-in-memory model within a
+# reasonable bound for this project's scope. Overridable via
+# environment for a deployment that wants a different limit.
+# ---------------------------------------------------------------
+
+MAX_ATTACHMENT_SIZE_BYTES = int(
+    os.environ.get("MAX_ATTACHMENT_SIZE_BYTES", str(25 * 1024 * 1024))
+)
+
 # Application Information
 APP_NAME = "Quantum-Resistant Secure Communication System"
 VERSION = "1.0.0"

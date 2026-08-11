@@ -17,8 +17,12 @@ from PySide6.QtWidgets import (
     QPushButton,
 )
 
+from domain.conversation_summary import ConversationSummary
+from domain.payload_type import PayloadType
+from gui.add_members_dialog import AddMembersDialog
 from gui.conversation_list_widget import ConversationListWidget
 from gui.create_group_dialog import CreateGroupDialog
+from gui.find_user_dialog import FindUserDialog
 from gui.message_widget import MessageWidget
 from gui.input_bar import InputBar
 from gui.status_bar import StatusBarWidget
@@ -73,6 +77,14 @@ class ChatWindow(QWidget):
 
         users_title.setObjectName("SectionTitle")
 
+        self.find_user_button = QPushButton("Find User")
+
+        self.find_user_button.setCursor(Qt.PointingHandCursor)
+
+        self.find_user_button.clicked.connect(
+            self.handle_find_user
+        )
+
         self.new_group_button = QPushButton("+ Group")
 
         self.new_group_button.setCursor(Qt.PointingHandCursor)
@@ -86,6 +98,8 @@ class ChatWindow(QWidget):
         conversations_header.addWidget(users_title)
 
         conversations_header.addStretch()
+
+        conversations_header.addWidget(self.find_user_button)
 
         conversations_header.addWidget(self.new_group_button)
 
@@ -121,6 +135,16 @@ class ChatWindow(QWidget):
             "font-size: 15px; font-weight: 700;"
         )
 
+        self.add_members_button = QPushButton("Add Members")
+
+        self.add_members_button.setCursor(Qt.PointingHandCursor)
+
+        self.add_members_button.clicked.connect(
+            self.handle_add_members
+        )
+
+        self.add_members_button.setVisible(False)
+
         self.leave_group_button = QPushButton("Leave Group")
 
         self.leave_group_button.setCursor(Qt.PointingHandCursor)
@@ -144,6 +168,8 @@ class ChatWindow(QWidget):
         header_top_row.addWidget(app_title)
 
         header_top_row.addStretch()
+
+        header_top_row.addWidget(self.add_members_button)
 
         header_top_row.addWidget(self.leave_group_button)
 
@@ -227,6 +253,10 @@ class ChatWindow(QWidget):
             self.send_message
         )
 
+        self.input_bar.attachment_selected.connect(
+            self.handle_attachment_selected
+        )
+
     # ==========================================================
     # Backend Callbacks
     # ==========================================================
@@ -245,6 +275,15 @@ class ChatWindow(QWidget):
 
         self.session.message_received.connect(
             self.receive_message
+        )
+
+        # payload_message_received carries binary content (Phase 8 --
+        # File & Image Transfer) that message_received's fixed
+        # Signal(str, str, str) cannot -- see ClientSession's
+        # declaration for why this is a separate signal rather than a
+        # change to the existing one.
+        self.session.payload_message_received.connect(
+            self.receive_payload_message
         )
 
         # connection_changed carries only True/False (client/session.py
@@ -291,6 +330,38 @@ class ChatWindow(QWidget):
     # Events
     # ==========================================================
 
+    def handle_find_user(self):
+        """
+        Search for a user by their unique ID and, if found, open a
+        direct conversation with them (Issue 3 fix -- User Must Be
+        Searched By Unique ID). Reuses the exact same conversation-
+        opening path a sidebar click already uses (open_conversation())
+        -- a ConversationSummary built from the lookup result is
+        indistinguishable to that method from one ConversationStore
+        would have produced for an online user with no history yet
+        (see ConversationStore.update_online_status()'s identical
+        placeholder shape).
+        """
+
+        dialog = FindUserDialog(self.session, self)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        found = dialog.get_result()
+
+        if found is None:
+            return
+
+        summary = ConversationSummary(
+            conversation_id=None,
+            username=found["username"],
+            is_online=found["username"] in self.session.get_online_users(),
+            latest_message=None,
+        )
+
+        self.open_conversation(summary)
+
     def handle_create_group(self):
         """
         Open the group-creation dialog and, if confirmed with a name
@@ -308,6 +379,54 @@ class ChatWindow(QWidget):
 
             if name and member_usernames:
                 self.session.create_group_conversation(name, member_usernames)
+
+    def handle_add_members(self):
+        """
+        Add one or more users to the currently open group conversation
+        (Issue 2 fix -- Add Members After Group Creation). Candidates
+        are the currently online users minus whoever is already a
+        participant (including this client itself) -- ConversationStore.
+        get() is the read-only accessor added for exactly this lookup.
+        No optimistic local update: the sidebar refreshes once the
+        server confirms via ClientSession.handle_group_members_added().
+        """
+
+        if not self.session.current_chat_is_group:
+            return
+
+        conversation_id = self.session.get_current_chat()
+
+        if conversation_id is None:
+            return
+
+        summary = self.session.conversation_store.get(conversation_id)
+
+        existing_participants = set(summary.participants or []) if summary else set()
+        existing_participants.add(self.session.get_username())
+
+        candidates = [
+            username for username in self.session.get_online_users()
+            if username not in existing_participants
+        ]
+
+        if not candidates:
+
+            QMessageBox.information(
+                self,
+                "Add Members",
+                "No additional online users are available to add."
+            )
+
+            return
+
+        dialog = AddMembersDialog(candidates, self)
+
+        if dialog.exec() == QDialog.Accepted:
+
+            selected = dialog.get_result()
+
+            if selected:
+                self.session.add_group_members(conversation_id, selected)
 
     def handle_leave_group(self):
         """
@@ -354,6 +473,8 @@ class ChatWindow(QWidget):
 
         self.leave_group_button.setVisible(summary.is_group)
 
+        self.add_members_button.setVisible(summary.is_group)
+
         display_name = summary.group_name if summary.is_group else summary.username
 
         label = (
@@ -392,20 +513,65 @@ class ChatWindow(QWidget):
                 timestamp.strftime("%H:%M") if timestamp else None
             )
 
-            if entry["is_own"]:
+            payload_type = entry.get("payload_type", PayloadType.TEXT)
 
-                self.messages.add_sent_message(
-                    entry["text"],
-                    timestamp=timestamp_text
-                )
+            if payload_type == PayloadType.TEXT:
+
+                if entry["is_own"]:
+
+                    self.messages.add_sent_message(
+                        entry["text"],
+                        timestamp=timestamp_text
+                    )
+
+                else:
+
+                    self.messages.add_received_message(
+                        entry["sender"],
+                        entry["text"],
+                        timestamp=timestamp_text
+                    )
+
+                continue
+
+            content = entry.get("content")
+            content_metadata = entry.get("content_metadata") or {}
+
+            if content is None:
+
+                # This client never received the epoch's key, or the
+                # blob is missing -- mirror the existing undecryptable-
+                # text placeholder rather than silently skipping it.
+                placeholder = "[Attachment unavailable]"
+
+                if entry["is_own"]:
+                    self.messages.add_sent_message(placeholder, timestamp=timestamp_text)
+                else:
+                    self.messages.add_received_message(
+                        entry["sender"], placeholder, timestamp=timestamp_text
+                    )
+
+                continue
+
+            if payload_type == PayloadType.IMAGE:
+
+                if entry["is_own"]:
+                    self.messages.add_sent_image(content, timestamp=timestamp_text)
+                else:
+                    self.messages.add_received_image(
+                        entry["sender"], content, timestamp=timestamp_text
+                    )
 
             else:
 
-                self.messages.add_received_message(
-                    entry["sender"],
-                    entry["text"],
-                    timestamp=timestamp_text
-                )
+                if entry["is_own"]:
+                    self.messages.add_sent_file(
+                        content, content_metadata, timestamp=timestamp_text
+                    )
+                else:
+                    self.messages.add_received_file(
+                        entry["sender"], content, content_metadata, timestamp=timestamp_text
+                    )
 
     def send_message(self, message):
 
@@ -430,6 +596,44 @@ class ChatWindow(QWidget):
         except Exception as error:
 
             self.show_error(str(error))
+
+    def handle_attachment_selected(self, file_path):
+        """
+        Send a locally-picked file/image as the next message in the
+        open conversation (Phase 8 -- File & Image Transfer).
+        Classification (IMAGE vs. FILE) happens inside
+        ClientSession.send_attachment() -- this method never decides
+        it. Renders the local "sent" bubble from the same bytes
+        send_attachment() already read, rather than reading the file
+        a second time.
+        """
+
+        if self.session.get_current_chat() is None:
+
+            QMessageBox.warning(
+                self,
+                "No User Selected",
+                "Please select a conversation."
+            )
+
+            return
+
+        try:
+
+            payload_type, content, content_metadata = (
+                self.session.send_attachment(file_path)
+            )
+
+        except (OSError, ValueError) as error:
+
+            self.show_error(str(error))
+
+            return
+
+        if payload_type == PayloadType.IMAGE:
+            self.messages.add_sent_image(content)
+        else:
+            self.messages.add_sent_file(content, content_metadata)
 
     def receive_message(self, conversation_key, sender, message):
         """
@@ -468,6 +672,31 @@ class ChatWindow(QWidget):
             sender,
             message
         )
+
+    def receive_payload_message(
+        self, conversation_key, sender, payload_type, content, content_metadata
+    ):
+        """
+        Display a received file/image (Phase 8 -- File & Image
+        Transfer). Mirrors receive_message()'s unread/current-
+        conversation handling exactly -- the two differ only in what
+        they hand to MessageWidget at the end, since binary content
+        cannot flow through message_received (see ClientSession's
+        payload_message_received declaration).
+        """
+
+        if conversation_key != self.session.get_current_chat():
+
+            self.session.increment_unread(conversation_key)
+
+            self.render_conversations()
+
+            return
+
+        if payload_type == PayloadType.IMAGE:
+            self.messages.add_received_image(sender, content)
+        else:
+            self.messages.add_received_file(sender, content, content_metadata)
 
     def show_error(self, message):
 

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from auth.authentication_service import AuthenticationService
 from config import KEY_EXCHANGE_ALGORITHM
 from database.connection import SessionLocal
+from database.models.conversation import Conversation
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.user_repository import UserRepository
@@ -30,6 +31,7 @@ from utils.protocol import (
     create_group_create_result_packet,
     create_group_key_rotation_required_packet,
     create_group_member_left_packet,
+    create_group_members_added_packet,
     create_join_packet,
     create_leave_packet,
     parse_packet,
@@ -574,6 +576,110 @@ def handle_group_key_rotation_complete(state, client_socket, user, packet):
     _dispatch_pending_rotation_if_needed(state, conversation_id)
 
 
+def handle_group_add_members(state, client_socket, user, packet):
+    """
+    Add one or more users to an existing group conversation
+    (real-application bug fix, Issue 2 -- Add Members After Group
+    Creation).
+
+    Security: who is requesting the add is derived entirely from the
+    authenticated socket (``user``), never trusted from the packet --
+    mirrors handle_group_leave()'s pattern exactly. Any active member
+    may add members: this app has no owner/role concept (Phase 7's own
+    "any active member" rotation-initiator selection already
+    established that trust model; this reuses it, not a new one). A
+    non-member requester is rejected silently, same as every other
+    group-authorization check in this file.
+
+    Deliberately reuses the exact epoch-rotation machinery a leave
+    already uses, rather than a new key-distribution path:
+    reserve_next_epoch() bumps current_key_epoch exactly as it does
+    for a leave, and the unchanged _dispatch_pending_rotation_if_needed()
+    picks a currently-connected active member to generate/redistribute
+    that new epoch's key to every current member, old and new alike.
+    Consequence (intentional, not a side effect): a newly added member
+    receives only the new epoch's key -- they cannot decrypt group
+    history from before they joined -- while existing members keep
+    their old epoch key (their own history stays readable) and also
+    receive the new one, so everyone can keep talking.
+    """
+
+    conversation_id = packet.get("conversation_id")
+    member_usernames = packet.get("members") or []
+
+    if not conversation_id or not member_usernames:
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        user_repo = UserRepository(db)
+        conversation_uuid = uuid.UUID(conversation_id)
+
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+        if user.id not in member_ids:
+
+            state.logger.warning(
+                f"Rejected group_add_members: {user.username} is not a "
+                f"member of {conversation_id}"
+            )
+
+            return
+
+        new_user_ids = []
+
+        for username in member_usernames:
+
+            candidate = user_repo.get_by_username(username)
+
+            if candidate is None or candidate.id in member_ids:
+                continue
+
+            new_user_ids.append(candidate.id)
+
+        if not new_user_ids:
+            return
+
+        affected = conversation_repo.add_members(conversation_uuid, new_user_ids)
+
+        if not affected:
+            return
+
+        conversation_repo.reserve_next_epoch(conversation_uuid)
+
+        conversation_repo.commit()
+
+        all_member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+        all_usernames = _usernames_for(db, all_member_ids)
+
+        conversation = db.get(Conversation, conversation_uuid)
+        name = conversation.name if conversation is not None else None
+    finally:
+        db.close()
+
+    members_added_packet = create_group_members_added_packet(
+        conversation_id=conversation_id,
+        name=name,
+        members=all_usernames,
+    )
+
+    all_member_id_strings = {str(member_id) for member_id in all_member_ids}
+
+    for sock, client in list(state.clients.items()):
+
+        if client.get("user_id") in all_member_id_strings:
+            send_to_client(sock, members_added_packet)
+
+    state.logger.info(
+        f"{user.username} added members to group {conversation_id} "
+        f"(now: {all_usernames})"
+    )
+
+    _dispatch_pending_rotation_if_needed(state, conversation_id)
+
+
 def _recover_pending_rotations_for_user(state, user):
     """
     Reconnect recovery (Phase 7 -- Group Membership Management): for
@@ -605,6 +711,81 @@ def _recover_pending_rotations_for_user(state, user):
 
     for conversation_id in pending_conversation_ids:
         _dispatch_pending_rotation_if_needed(state, str(conversation_id))
+
+
+def _ensure_group_keys_current_for_reconnecting_user(state, user):
+    """
+    Reconnect recovery, part 2 (real-application bug fix, Issue 4 --
+    group conversation history incorrectly appearing undecryptable
+    after a restart/reconnect).
+
+    _recover_pending_rotations_for_user() above only re-dispatches a
+    key when a rotation was left outstanding (confirmed_key_epoch <
+    current_key_epoch). It does nothing for the far more common case:
+    a member simply reconnecting with a brand-new, empty KeyManager --
+    i.e. every login -- where nothing was ever "pending" in the
+    epoch-counter sense, since no rotation happened at all. Without
+    this, such a client has no way to ever receive a group's current
+    key again unless some unrelated later rotation event happens to
+    include them.
+
+    For each of this user's active group conversations, if another
+    active member is currently connected, ask them (reusing
+    group_key_rotation_required / handle_group_key_rotation_required
+    completely unchanged -- no new client-side code) to redeliver the
+    *current* epoch's key to just this user. Safe to run
+    unconditionally on every reconnect, whether or not this user
+    actually still needs it: if they already have that epoch cached,
+    the redelivery is a harmless no-op on their end, since
+    KeyManager.store_key() never overwrites an existing epoch.
+    """
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        conversation_ids = conversation_repo.get_active_group_conversation_ids(user.id)
+    finally:
+        db.close()
+
+    for conversation_id in conversation_ids:
+
+        db = SessionLocal()
+
+        try:
+            conversation_repo = ConversationRepository(db)
+            current_epoch, _confirmed_epoch = conversation_repo.get_epoch_state(
+                conversation_id
+            )
+            member_ids = conversation_repo.get_member_user_ids(conversation_id)
+        finally:
+            db.close()
+
+        if current_epoch is None:
+            continue
+
+        selected = _select_connected_active_member(
+            state, member_ids, exclude_user_id=user.id
+        )
+
+        if selected is None:
+            continue
+
+        sock, _selected_username = selected
+
+        send_to_client(
+            sock,
+            create_group_key_rotation_required_packet(
+                conversation_id=str(conversation_id),
+                epoch=current_epoch,
+                members=[user.username],
+            ),
+        )
+
+        state.logger.info(
+            f"Requested current-epoch key redelivery for {conversation_id} "
+            f"to reconnecting member {user.username}"
+        )
 
 
 def authenticate_connection(state, client_socket, client_address):
@@ -747,6 +928,16 @@ def handle_client(state, client_socket, client_address):
             # bearing rather than incidental.
             # -----------------------------
             _recover_pending_rotations_for_user(state, user)
+
+            # -----------------------------
+            # Group key redelivery on plain reconnect (Issue 4 fix)
+            #
+            # Covers the case the above does not: no rotation is
+            # outstanding, but this reconnecting client's own
+            # KeyManager is empty (a fresh process/login). Same
+            # ordering requirement as above, for the same reason.
+            # -----------------------------
+            _ensure_group_keys_current_for_reconnecting_user(state, user)
 
         # -----------------------------
         # Notify other clients
@@ -930,6 +1121,13 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "group_key_rotation_complete":
 
                 handle_group_key_rotation_complete(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Group Add Members Packet (Issue 2 fix)
+            # -----------------------------
+            elif packet.get("type") == "group_add_members":
+
+                handle_group_add_members(state, client_socket, user, packet)
 
     except Exception as e:
 
