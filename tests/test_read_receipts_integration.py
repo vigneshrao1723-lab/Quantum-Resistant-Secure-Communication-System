@@ -44,6 +44,7 @@ from tests.tls_test_support import serve_tls_client, wrap_client_socket
 from utils.protocol import (
     create_auth_packet,
     create_chat_packet,
+    create_group_add_members_packet,
     create_group_create_packet,
     create_group_leave_packet,
     create_payload_packet,
@@ -739,3 +740,189 @@ def test_legacy_message_without_recipient_rows_has_none_read_status(sender_and_r
     assert len(history) == 1
     assert history[0]["is_own"] is True
     assert history[0]["read_status"] is None
+
+
+# ----------------------------------------------------------------------
+# 12: Group membership timing -- a member added after send is excluded
+# from that message's recipients and its read gate (post-commit audit
+# gap #2)
+# ----------------------------------------------------------------------
+
+
+def test_member_added_after_send_is_excluded_from_that_messages_recipients_and_read_gate(
+    running_server,
+):
+    """handle_group_chat_delivery() snapshots member_ids via
+    get_member_user_ids() fresh at send time, and record_recipients()
+    only ever creates rows for that snapshot (see both docstrings) --
+    so a member added afterward must have no MessageRecipient row at
+    all for a message sent before they joined, and _read_status_for_
+    own_message()'s member_ids-intersected filtering must not require
+    them for "fully read" either."""
+    _state, port = running_server
+
+    alice_payload = _register_user("timing_alice_")
+    bob_payload = _register_user("timing_bob_")
+    charlie_payload = _register_user("timing_charlie_")
+
+    alice_sock, alice_name = _connect_and_authenticate(port, alice_payload)
+    bob_sock, bob_name = _connect_and_authenticate(port, bob_payload)
+    charlie_sock, charlie_name = _connect_and_authenticate(port, charlie_payload)
+
+    try:
+        _send(
+            alice_sock,
+            create_group_create_packet(
+                sender=alice_name, name="Timing Group", member_usernames=[bob_name]
+            ),
+        )
+
+        conversation_id = None
+        for sock in (alice_sock, bob_sock):
+            result = _recv_until(sock, lambda p: p.get("type") == "group_create_result")
+            assert result is not None
+            conversation_id = result["conversation_id"]
+
+        # Alice sends a message while only Alice + Bob are members.
+        _send_group_message(alice_sock, alice_name, conversation_id)
+        _recv_until(bob_sock, lambda p: p.get("type") == "chat")
+
+        saved = _wait_for_group_message(uuid.UUID(conversation_id))
+        assert saved is not None
+
+        # Charlie joins AFTER that message was already sent/persisted.
+        _send(
+            alice_sock,
+            create_group_add_members_packet(
+                sender=alice_name,
+                conversation_id=conversation_id,
+                member_usernames=[charlie_name],
+            ),
+        )
+        added = _recv_until(
+            charlie_sock,
+            lambda p: p.get("type") == "group_members_added"
+            and p.get("conversation_id") == conversation_id,
+        )
+        assert added is not None
+
+        # Charlie must have no MessageRecipient row for the old message.
+        charlie_row = _get_recipient_row(saved.id, uuid.UUID(charlie_payload["user_id"]))
+        assert charlie_row is None
+
+        # Bob -- the message's one real recipient -- reads it, and it
+        # must become fully read without Charlie ever reading anything.
+        _send(bob_sock, create_read_receipt_packet(conversation_id=conversation_id))
+        _wait_for_recipient_status(
+            saved.id, uuid.UUID(bob_payload["user_id"]), MessageDeliveryStatus.READ
+        )
+
+        alice_view = _make_session_for(alice_payload["user_id"], alice_name)
+        history = alice_view.load_conversation_history(conversation_id, is_group=True)
+        assert history[-1]["read_status"] is True
+    finally:
+        alice_sock.close()
+        bob_sock.close()
+        charlie_sock.close()
+        _delete_user(alice_payload["username"])
+        _delete_user(bob_payload["username"])
+        _delete_user(charlie_payload["username"])
+
+
+# ----------------------------------------------------------------------
+# 13: Read-receipt spoofing -- forged identity fields are ignored
+# (post-commit audit gap #3)
+# ----------------------------------------------------------------------
+
+
+def _forged_read_receipt_packet(conversation_id, forged_user_id, forged_username):
+    """A hand-built packet bypassing create_read_receipt_packet()
+    entirely, carrying every identity-shaped field a malicious client
+    might try -- none of which handle_read_receipt() actually reads
+    (it only ever calls packet.get("conversation_id"); see its own
+    docstring/implementation in server/client_handler.py)."""
+    return {
+        "type": "read_receipt",
+        "conversation_id": conversation_id,
+        "user_id": forged_user_id,
+        "reader": forged_username,
+        "recipient_id": forged_user_id,
+    }
+
+
+def test_forged_identity_fields_in_read_receipt_packet_are_ignored(trio):
+    """member_c sends a packet forging member_b's identity into every
+    field a real client never sends. If any of them were consulted,
+    this would incorrectly mark member_b's row read and/or notify the
+    creator with the wrong reader name -- the reader must always be
+    member_c, the real, socket-derived identity."""
+    creator, member_b, member_c = trio["members"]
+    conversation_id = trio["conversation_id"]
+
+    _send_group_message(creator["sock"], creator["username"], conversation_id)
+    _recv_until(member_b["sock"], lambda p: p.get("type") == "chat")
+    _recv_until(member_c["sock"], lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_group_message(uuid.UUID(conversation_id))
+    assert saved is not None
+
+    _send(
+        member_c["sock"],
+        _forged_read_receipt_packet(
+            conversation_id, member_b["user_id"], member_b["username"]
+        ),
+    )
+
+    notification = _recv_until(
+        creator["sock"], lambda p: p.get("type") == "read_receipt_notification"
+    )
+    assert notification is not None
+    assert notification["reader"] == member_c["username"]
+
+    row_c = _wait_for_recipient_status(
+        saved.id, uuid.UUID(member_c["user_id"]), MessageDeliveryStatus.READ
+    )
+    assert row_c.status == MessageDeliveryStatus.READ
+
+    # member_b's row must be completely untouched by the forgery.
+    row_b = _get_recipient_row(saved.id, uuid.UUID(member_b["user_id"]))
+    assert row_b.status != MessageDeliveryStatus.READ
+
+
+def test_non_member_with_forged_identity_cannot_mark_group_conversation_read(
+    trio, running_server
+):
+    """Complements the test above: a complete outsider (never a
+    member at all) also cannot use forged identity fields to bypass
+    the membership check or affect a real member's row."""
+    creator, member_b, member_c = trio["members"]
+    conversation_id = trio["conversation_id"]
+
+    _send_group_message(creator["sock"], creator["username"], conversation_id)
+    _recv_until(member_b["sock"], lambda p: p.get("type") == "chat")
+    _recv_until(member_c["sock"], lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_group_message(uuid.UUID(conversation_id))
+    assert saved is not None
+
+    _state, port = running_server
+    outsider_payload = _register_user("spoof_outsider_")
+    outsider_sock, _outsider_name = _connect_and_authenticate(port, outsider_payload)
+
+    try:
+        _send(
+            outsider_sock,
+            _forged_read_receipt_packet(
+                conversation_id, member_b["user_id"], member_b["username"]
+            ),
+        )
+
+        _assert_no_packet(
+            creator["sock"], lambda p: p.get("type") == "read_receipt_notification"
+        )
+
+        row_b = _get_recipient_row(saved.id, uuid.UUID(member_b["user_id"]))
+        assert row_b.status != MessageDeliveryStatus.READ
+    finally:
+        outsider_sock.close()
+        _delete_user(outsider_payload["username"])

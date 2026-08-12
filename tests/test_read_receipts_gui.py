@@ -2,13 +2,23 @@
 GUI-level tests for C2 (Read Receipts).
 
 Follows the established offscreen-QApplication pattern (see
-tests/test_chat_window_connection_status.py). ChatWindow itself is
-deliberately not constructed here, for the same reason that file
-gives: it requires a fully authenticated session, a live socket, and a
-real database connection just to build. These tests instead exercise
-the two real pieces ChatWindow.handle_read_receipt_updated() wires
-together -- MessageWidget's bubble tracking/status display, and
-ClientSession's read_receipt_updated signal -- directly.
+tests/test_chat_window_connection_status.py). A full ChatWindow is
+never constructed, for the same reason that file gives: it requires a
+fully authenticated session, a live socket, and a real database
+connection just to build. The first two sections instead exercise the
+real pieces ChatWindow.handle_read_receipt_updated() wires together --
+MessageWidget's bubble tracking/status display, and ClientSession's
+read_receipt_updated signal -- directly.
+
+The final section calls ChatWindow.handle_read_receipt_updated()
+itself -- the real, unmodified production method, not a
+reimplementation of its logic -- against a minimal stand-in object
+carrying exactly the three attributes it reads/writes (session,
+messages, _read_receipt_readers). session and messages are always real
+production objects (a bare ClientSession, a real MessageWidget); only
+ChatWindow's own construction is stood in for, exactly matching this
+file's and test_chat_window_connection_status.py's established reason
+for avoiding it.
 
 Run with:
     pytest tests/test_read_receipts_gui.py -v
@@ -18,9 +28,12 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from types import SimpleNamespace
+
 from PySide6.QtWidgets import QApplication
 
 from client.session import ClientSession
+from gui.chat_window import ChatWindow
 from gui.message_widget import FileMessageBubble, MessageBubble, MessageWidget
 
 _app = QApplication.instance() or QApplication([])
@@ -200,3 +213,144 @@ def test_mark_conversation_read_is_a_no_op_without_a_conversation_id():
     session.mark_conversation_read(None)
 
     assert True
+
+
+# ----------------------------------------------------------------------
+# ChatWindow-level: handle_read_receipt_updated() itself
+# ----------------------------------------------------------------------
+
+
+def _make_window(session, messages):
+    """A minimal stand-in for ChatWindow -- see module docstring for
+    why a real one isn't constructed. Carries exactly the three
+    attributes handle_read_receipt_updated() reads/writes; the method
+    called against it below is the real, unmodified one from
+    gui/chat_window.py, not a reimplementation."""
+    return SimpleNamespace(
+        session=session,
+        messages=messages,
+        _read_receipt_readers=set(),
+    )
+
+
+def _direct_session(conversation_id, username="alice"):
+    session = ClientSession()
+    session.username = username
+    session.current_conversation_id = conversation_id
+    session.current_chat_is_group = False
+    return session
+
+
+def _group_session(conversation_id, participants, username="alice"):
+    """participants excludes ``username`` itself, exactly like
+    ClientSession.handle_group_create()/handle_group_members_added()
+    already populate conversation_store for a real group."""
+    session = ClientSession()
+    session.username = username
+    session.current_conversation_id = conversation_id
+    session.current_chat_is_group = True
+    session.conversation_store.add_or_update_group(
+        conversation_id, "Test Group", participants
+    )
+    return session
+
+
+def test_read_receipt_updated_ignores_notification_for_a_different_conversation():
+    session = _direct_session("conv-a")
+    messages = MessageWidget()
+    messages.add_sent_message("hi", message_id="m1", read_status=False)
+    window = _make_window(session, messages)
+
+    ChatWindow.handle_read_receipt_updated(window, "conv-b", "bob")
+
+    bubble = messages._sent_bubbles_by_message_id["m1"]
+    assert "✓✓" not in bubble.time_label.text()
+    assert window._read_receipt_readers == set()
+
+
+def test_read_receipt_updated_flips_direct_conversation_immediately():
+    session = _direct_session("conv-a")
+    messages = MessageWidget()
+    messages.add_sent_message("hi", message_id="m1", read_status=False)
+    window = _make_window(session, messages)
+
+    ChatWindow.handle_read_receipt_updated(window, "conv-a", "bob")
+
+    bubble = messages._sent_bubbles_by_message_id["m1"]
+    assert "✓✓" in bubble.time_label.text()
+
+
+def test_read_receipt_updated_group_partial_readers_does_not_flip():
+    session = _group_session("conv-g", ["bob", "charlie"])
+    messages = MessageWidget()
+    messages.add_sent_message("hi", message_id="m1", read_status=False)
+    window = _make_window(session, messages)
+
+    ChatWindow.handle_read_receipt_updated(window, "conv-g", "bob")
+
+    bubble = messages._sent_bubbles_by_message_id["m1"]
+    assert "✓✓" not in bubble.time_label.text()
+    assert window._read_receipt_readers == {"bob"}
+
+
+def test_read_receipt_updated_group_flips_once_every_active_reader_present():
+    session = _group_session("conv-g", ["bob", "charlie"])
+    messages = MessageWidget()
+    messages.add_sent_message("hi", message_id="m1", read_status=False)
+    window = _make_window(session, messages)
+
+    ChatWindow.handle_read_receipt_updated(window, "conv-g", "bob")
+    assert "✓✓" not in messages._sent_bubbles_by_message_id["m1"].time_label.text()
+
+    ChatWindow.handle_read_receipt_updated(window, "conv-g", "charlie")
+
+    bubble = messages._sent_bubbles_by_message_id["m1"]
+    assert "✓✓" in bubble.time_label.text()
+
+
+def test_read_receipt_updated_duplicate_notification_for_same_reader_is_harmless():
+    """A redundant notification for a reader already accounted for
+    must not do anything surprising -- readers is a set, so re-adding
+    the same one changes nothing."""
+    session = _group_session("conv-g", ["bob", "charlie"])
+    messages = MessageWidget()
+    messages.add_sent_message("hi", message_id="m1", read_status=False)
+    window = _make_window(session, messages)
+
+    ChatWindow.handle_read_receipt_updated(window, "conv-g", "bob")
+    ChatWindow.handle_read_receipt_updated(window, "conv-g", "bob")
+
+    assert window._read_receipt_readers == {"bob"}
+    assert "✓✓" not in messages._sent_bubbles_by_message_id["m1"].time_label.text()
+
+
+def test_read_receipt_updated_reader_state_resets_when_switching_conversations():
+    """Mirrors exactly what gui/chat_window.py::open_conversation()
+    does on every conversation switch (_read_receipt_readers = set(),
+    then a fresh render): proves stale accumulation from a previously
+    open group cannot leak into a freshly opened one and cause a
+    premature flip."""
+    session = _group_session("conv-g1", ["bob", "charlie"])
+    messages = MessageWidget()
+    window = _make_window(session, messages)
+
+    ChatWindow.handle_read_receipt_updated(window, "conv-g1", "bob")
+    assert window._read_receipt_readers == {"bob"}
+
+    # The exact reset open_conversation() performs before every fresh
+    # history load, immediately followed by switching to a second,
+    # unrelated group.
+    window._read_receipt_readers = set()
+    session.current_conversation_id = "conv-g2"
+    session.conversation_store.add_or_update_group(
+        "conv-g2", "Second Group", ["dave", "erin"]
+    )
+    messages.clear_messages()
+    messages.add_sent_message("hi again", message_id="m2", read_status=False)
+
+    # bob's earlier read of conv-g1 must not count toward conv-g2.
+    ChatWindow.handle_read_receipt_updated(window, "conv-g2", "dave")
+
+    bubble = messages._sent_bubbles_by_message_id["m2"]
+    assert "✓✓" not in bubble.time_label.text()
+    assert window._read_receipt_readers == {"dave"}
