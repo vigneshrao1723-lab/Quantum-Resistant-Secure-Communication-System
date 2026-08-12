@@ -29,7 +29,7 @@ import pytest
 
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
-from config import JWT_ALGORITHM, JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET_KEY
+from config_server import JWT_ALGORITHM, JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET_KEY
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository

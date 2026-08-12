@@ -17,7 +17,7 @@ from jwt import (
     InvalidTokenError,
 )
 
-from config import (
+from config_server import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
     JWT_AUDIENCE,

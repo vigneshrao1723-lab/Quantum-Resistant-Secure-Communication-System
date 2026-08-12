@@ -22,7 +22,7 @@ FILE_STORAGE_ROOT.
 
 import uuid
 
-from config import FILE_STORAGE_ROOT
+from config_server import FILE_STORAGE_ROOT
 
 
 def _path_for(reference: str):

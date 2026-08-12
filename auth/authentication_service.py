@@ -13,7 +13,7 @@ from auth.schemas import (
     RegistrationResult,
     TokenPair,
 )
-from config import (
+from config_server import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     MAX_FAILED_LOGIN_ATTEMPTS,
     REFRESH_TOKEN_EXPIRE_DAYS,

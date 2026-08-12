@@ -8,7 +8,7 @@ environment configuration loaded by config.py.
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from config import DATABASE_URL
+from config_server import DATABASE_URL
 
 engine = create_engine(
     DATABASE_URL,

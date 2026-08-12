@@ -148,13 +148,13 @@ def real_tls_server():
 def real_session(real_tls_server, monkeypatch):
     """
     A real, unmodified ClientSession, pointed at the ephemeral real
-    TLS server above via monkeypatched client.session.PORT --
-    client.session.HOST is already "127.0.0.1", matching the
-    development certificate's SAN, so only PORT needs to move for a
-    test run. Nothing about ClientSession itself is altered.
+    TLS server above via monkeypatched client.session.SERVER_PORT --
+    client.session.SERVER_HOST is already "127.0.0.1", matching the
+    development certificate's SAN, so only the port needs to move for
+    a test run. Nothing about ClientSession itself is altered.
     """
     _state, port = real_tls_server
-    monkeypatch.setattr(client_session_module, "PORT", port)
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
     session = ClientSession()
     yield session
@@ -223,7 +223,7 @@ def test_real_client_session_rejects_untrusted_server(tmp_path, monkeypatch):
     thread = threading.Thread(target=accept_once, daemon=True)
     thread.start()
 
-    monkeypatch.setattr(client_session_module, "PORT", port)
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
     session = ClientSession()
     try:

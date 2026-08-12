@@ -8,7 +8,7 @@ import socket
 import ssl
 import threading
 
-from config import HOST, PORT
+from config import SERVER_BIND_HOST, SERVER_PORT
 from security.tls import build_server_context
 from server.client_handler import handle_client
 from server.server_state import ServerState
@@ -66,18 +66,30 @@ def start_server():
         socket.SOCK_STREAM
     )
 
-    server_socket.bind((HOST, PORT))
+    # Binds SERVER_BIND_HOST -- the interface to listen on -- which is
+    # deliberately a separate setting from the client's SERVER_HOST
+    # (D0 -- Configuration & Network Separation). Defaults to loopback,
+    # so reachability from other devices is always an explicit choice
+    # (SERVER_BIND_HOST=0.0.0.0), never an accident.
+    server_socket.bind((SERVER_BIND_HOST, SERVER_PORT))
 
     server_socket.listen()
 
+    reachability = (
+        "all interfaces -- reachable from other devices"
+        if SERVER_BIND_HOST in ("0.0.0.0", "::")
+        else "loopback only -- not reachable from other devices"
+    )
+
     print("=" * 60)
     print(" Quantum-Resistant Secure Communication Server")
-    print(f" Listening on {HOST}:{PORT} (TLS)")
+    print(f" Listening on {SERVER_BIND_HOST}:{SERVER_PORT} (TLS)")
+    print(f" Bind scope: {reachability}")
     print(" Waiting for clients...")
     print("=" * 60)
 
     state.logger.info(
-        f"Server started on {HOST}:{PORT} (TLS)"
+        f"Server started on {SERVER_BIND_HOST}:{SERVER_PORT} (TLS) -- {reachability}"
     )
 
     while True:

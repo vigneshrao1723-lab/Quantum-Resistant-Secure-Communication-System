@@ -17,7 +17,7 @@ import pytest
 
 from auth.authentication_service import SessionInvalidError
 from auth.schemas import LoginRequest, RegisterRequest
-from config import (
+from config_server import (
     JWT_ALGORITHM,
     JWT_AUDIENCE,
     JWT_ISSUER,

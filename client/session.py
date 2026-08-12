@@ -20,7 +20,7 @@ from PySide6.QtCore import QObject, Signal
 
 from client.conversation_store import ConversationStore
 from client.receiver import receive_messages
-from config import HOST, MAX_ATTACHMENT_SIZE_BYTES, PORT
+from config import MAX_ATTACHMENT_SIZE_BYTES, SERVER_HOST, SERVER_PORT
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
 from database.connection import SessionLocal
@@ -251,7 +251,7 @@ class ClientSession(QObject):
         every test and the server's own context-building counterpart
         use; no second TLS implementation exists). The handshake --
         including verifying the server's certificate against the
-        configured CA and matching its SAN against HOST -- completes
+        configured CA and matching its SAN against SERVER_HOST -- completes
         before this method returns, so self.client_socket is never
         assigned until it is TLS-wrapped. Every packet sent afterwards
         by login()/send_public_key()/send_chat_message()/etc. --
@@ -270,14 +270,21 @@ class ClientSession(QObject):
             socket.SOCK_STREAM
         )
 
-        raw_socket.connect((HOST, PORT))
+        raw_socket.connect((SERVER_HOST, SERVER_PORT))
 
         tls_context = build_client_context()
 
         try:
             self.client_socket = tls_context.wrap_socket(
                 raw_socket,
-                server_hostname=HOST
+                # SERVER_HOST is both what we dialled and what the
+                # certificate's SAN must cover (D0 -- Configuration &
+                # Network Separation): pointing a client at a LAN IP
+                # or DNS name therefore also changes what the TLS
+                # handshake verifies, with no code change. The
+                # certificate must list that address -- see
+                # config.TLS_CERT_SANS.
+                server_hostname=SERVER_HOST
             )
         except Exception:
             # A failed handshake (untrusted certificate, wrong host,
@@ -293,7 +300,7 @@ class ClientSession(QObject):
         self.connection_changed.emit(True)
 
         self.logger.info(
-            f"Connected to server ({HOST}:{PORT}) over TLS "
+            f"Connected to server ({SERVER_HOST}:{SERVER_PORT}) over TLS "
             f"({self.client_socket.version()})"
         )
 

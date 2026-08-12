@@ -14,7 +14,11 @@ docs/architecture/tls_transport.md):
                    trusts this)
     ca.key      -- development CA private key (NEVER commit)
     server.crt  -- server certificate, signed by ca.key, with SAN
-                   covering 127.0.0.1 and localhost
+                   covering every entry in config.TLS_CERT_SANS
+                   (default 127.0.0.1 and localhost). Set the
+                   TLS_CERT_SANS environment variable to include a LAN
+                   IP or DNS name for multi-device deployment, e.g.
+                   TLS_CERT_SANS=192.168.1.42,127.0.0.1,localhost
     server.key  -- server private key (NEVER commit)
 
 Safe to re-run: overwrites any existing files in certs/dev/ with a
@@ -48,6 +52,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+from config import TLS_CERT_SANS
 
 CERTS_DIR = Path(__file__).resolve().parent.parent / "certs" / "dev"
 
@@ -183,11 +189,28 @@ def generate_server_cert(
 def main():
     CERTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # SANs come from config.TLS_CERT_SANS (D0 -- Configuration &
+    # Network Separation) instead of this function's previously
+    # hardcoded pair, so a LAN IP or DNS name can be included via
+    # TLS_CERT_SANS without editing this script. The default
+    # ("127.0.0.1,localhost") reproduces the previous behavior
+    # exactly. generate_server_cert() itself is unchanged -- it has
+    # always taken ``sans``; only what main() passes is now
+    # configurable.
+    sans = TLS_CERT_SANS
+
     ca_key, ca_cert = generate_dev_ca()
     _write_key(CERTS_DIR / "ca.key", ca_key)
     _write_cert(CERTS_DIR / "ca.crt", ca_cert)
 
-    server_key, server_cert = generate_server_cert(ca_key, ca_cert)
+    # The certificate's CN is cosmetic for verification purposes
+    # (Python's ssl matches SAN entries only, never CN -- see
+    # docs/architecture/tls_transport.md), but keeping it aligned with
+    # the primary SAN makes the certificate self-describing in
+    # openssl/browser output.
+    server_key, server_cert = generate_server_cert(
+        ca_key, ca_cert, common_name=sans[0], sans=sans
+    )
     _write_key(CERTS_DIR / "server.key", server_key)
     _write_cert(CERTS_DIR / "server.crt", server_cert)
 
@@ -196,7 +219,11 @@ def main():
         f"  CA valid {CA_VALIDITY_DAYS} days, "
         f"server cert valid {SERVER_VALIDITY_DAYS} days"
     )
-    print("  SAN: IP:127.0.0.1, DNS:localhost")
+    print(f"  SAN: {', '.join(sans)}")
+    print(
+        "  Clients verify SERVER_HOST against these entries -- every "
+        "address used to reach this server must be listed."
+    )
 
 
 if __name__ == "__main__":

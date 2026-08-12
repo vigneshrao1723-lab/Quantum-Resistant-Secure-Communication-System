@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import jwt as pyjwt
 import pytest
 
-from config import JWT_ALGORITHM, JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET_KEY
+from config_server import JWT_ALGORITHM, JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET_KEY
 from security.jwt_handler import JWTHandler, TokenExpiredError, TokenValidationError
 
 

@@ -11,7 +11,7 @@ from alembic import context
 # regardless of the working directory Alembic is invoked from.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import DATABASE_URL  # noqa: E402
+from config_server import DATABASE_URL  # noqa: E402
 from database.models.base import Base  # noqa: E402
 from database.models import conversation, conversation_member, message, message_recipient, session, user  # noqa: E402,F401  (registers tables on Base.metadata)
 
