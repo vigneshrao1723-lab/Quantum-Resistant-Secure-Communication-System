@@ -20,16 +20,28 @@ import socket
 import ssl
 import threading
 
-from security.tls import build_client_context, build_server_context
+from security.tls import build_client_context
 
 
-def wrap_server_socket(client_socket):
+def wrap_server_socket(client_socket, context):
     """
     TLS-wrap one accepted connection, server side -- the exact same
-    context builder and wrap_socket() call server/server.py uses.
+    wrap_socket() call server/server.py uses. ``context`` must be a
+    caller-supplied SSLContext (from build_server_context()), built
+    once per test server and reused for every connection it accepts --
+    never rebuilt here per connection. This mirrors
+    build_server_context()'s own documented contract ("built once...
+    and reused for every accepted connection -- never rebuilt per
+    client"), which server/server.py already follows (one context at
+    startup, reused for the process's lifetime). Test-harness
+    hardening: rebuilding a fresh SSLContext (and re-reading the
+    certificate/key from disk) on every one of a full suite's hundreds
+    of connections, concurrently across many per-connection threads,
+    is a load pattern production never exercises and is consistent
+    with the intermittent Windows SSL alert failures observed under
+    heavy concurrent full-suite runs.
     """
 
-    context = build_server_context()
     return context.wrap_socket(client_socket, server_side=True)
 
 
@@ -44,7 +56,9 @@ def wrap_client_socket(sock, server_hostname="127.0.0.1"):
     return context.wrap_socket(sock, server_hostname=server_hostname)
 
 
-def serve_tls_client(handle_client, state, client_socket, client_address, logger=None):
+def serve_tls_client(
+    handle_client, state, client_socket, client_address, logger=None, *, context
+):
     """
     Server-side accept-loop helper: TLS-wrap one accepted connection
     and dispatch to ``handle_client`` on success. A failed handshake is
@@ -54,10 +68,15 @@ def serve_tls_client(handle_client, state, client_socket, client_address, logger
     server/server.py's own per-connection handling exactly, so
     test_tls_transport.py's "plain TCP against a TLS-only server" test
     exercises the identical failure path the real server has.
+
+    ``context`` (keyword-only, required -- see wrap_server_socket())
+    must be built once by the caller's fixture, before its accept loop
+    starts, and passed to every call for connections that fixture
+    accepts -- not rebuilt per connection.
     """
 
     try:
-        tls_socket = wrap_server_socket(client_socket)
+        tls_socket = wrap_server_socket(client_socket, context)
     except (ssl.SSLError, OSError) as error:
         # OSError (not just ssl.SSLError): a client that aborts mid-
         # handshake -- e.g. because it just rejected our certificate,

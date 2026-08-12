@@ -37,6 +37,7 @@ from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import PayloadType
+from security.tls import build_server_context
 from server.client_handler import handle_client
 from server.server_state import ServerState
 from tests.tls_test_support import serve_tls_client, wrap_client_socket
@@ -108,6 +109,20 @@ def _assert_no_packet(sock, predicate, attempts=10, per_attempt_timeout=0.2):
 def running_server():
     state = ServerState()
 
+    # Test-harness hardening: one SSLContext per fixture instance,
+    # built once and reused for every connection this fixture's
+    # accept loop handles -- mirrors build_server_context()'s own
+    # documented contract ("built once... and reused for every
+    # accepted connection -- never rebuilt per client"), which
+    # server/server.py already follows. Previously each connection's
+    # serve_tls_client() call rebuilt a fresh SSLContext (and re-read
+    # the cert/key from disk) internally; under a full-suite run that
+    # meant hundreds of concurrent, independent SSLContext
+    # constructions across many threads -- a load pattern production
+    # never exercises -- consistent with the intermittent Windows SSL
+    # alert failures observed under heavy concurrent runs.
+    tls_context = build_server_context()
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("127.0.0.1", 0))
@@ -115,6 +130,15 @@ def running_server():
     port = server_socket.getsockname()[1]
 
     stop = threading.Event()
+    # Test-harness hardening: previously only accept_thread was
+    # joined at teardown -- an in-flight per-connection handler
+    # thread (blocked in recv()/the TLS handshake) could keep running
+    # into the next test's setup, racing that test's own socket
+    # teardown and surfacing as a raw OS-level error (observed:
+    # WinError 10038, "operation attempted on something that is not
+    # a socket") rather than a clean, isolated failure. Tracked here
+    # so every one can be joined below.
+    handler_threads = []
 
     def accept_loop():
         server_socket.settimeout(0.2)
@@ -125,11 +149,14 @@ def running_server():
                 continue
             except OSError:
                 break
-            threading.Thread(
+            handler_thread = threading.Thread(
                 target=serve_tls_client,
                 args=(handle_client, state, client_socket, addr, state.logger),
+                kwargs={"context": tls_context},
                 daemon=True,
-            ).start()
+            )
+            handler_thread.start()
+            handler_threads.append(handler_thread)
 
     accept_thread = threading.Thread(target=accept_loop, daemon=True)
     accept_thread.start()
@@ -139,6 +166,9 @@ def running_server():
     stop.set()
     server_socket.close()
     accept_thread.join(timeout=2)
+
+    for handler_thread in handler_threads:
+        handler_thread.join(timeout=2)
 
 
 def _register_user(suffix_hint=""):
