@@ -126,6 +126,20 @@ MAX_ATTACHMENT_SIZE_BYTES = int(
     os.environ.get("MAX_ATTACHMENT_SIZE_BYTES", str(25 * 1024 * 1024))
 )
 
+# ---------------------------------------------------------------
+# Request/Response Timeout (client-side, D1 -- Request/Response
+# Infrastructure)
+#
+# How long a caller using ClientSession.send_request()/
+# utils.request_registry.PendingRequestRegistry waits for a
+# correlated reply before giving up (see that module for the full
+# mechanism). Purely client-side -- the server never blocks waiting
+# for a reply, so it has no equivalent setting. Overridable via
+# environment for a slow/high-latency deployment.
+# ---------------------------------------------------------------
+
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
+
 # Application Information
 APP_NAME = "Quantum-Resistant Secure Communication System"
 VERSION = "1.0.0"
@@ -164,6 +178,9 @@ def validate_config():
             "TLS_CERT_SANS must list at least one Subject Alternative Name. "
             "Example: TLS_CERT_SANS=192.168.1.42,127.0.0.1,localhost"
         )
+
+    if REQUEST_TIMEOUT_SECONDS <= 0:
+        raise ValueError("REQUEST_TIMEOUT_SECONDS must be a positive number.")
 
 
 validate_config()

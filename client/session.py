@@ -20,7 +20,12 @@ from PySide6.QtCore import QObject, Signal
 
 from client.conversation_store import ConversationStore
 from client.receiver import receive_messages
-from config import MAX_ATTACHMENT_SIZE_BYTES, SERVER_HOST, SERVER_PORT
+from config import (
+    MAX_ATTACHMENT_SIZE_BYTES,
+    REQUEST_TIMEOUT_SECONDS,
+    SERVER_HOST,
+    SERVER_PORT,
+)
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
 from database.connection import SessionLocal
@@ -54,6 +59,7 @@ from utils.protocol import (
     create_read_receipt_packet,
     create_session_key_packet,
 )
+from utils.request_registry import PendingRequestRegistry, RequestTimeoutError
 
 # Placeholder shown for a historical message that cannot be decrypted
 # with the currently cached AES session key (e.g. it was encrypted in
@@ -159,6 +165,21 @@ class ClientSession(QObject):
         # ---------------------------------
 
         self.conversation_store = ConversationStore()
+
+        # ---------------------------------
+        # Request/Response Correlation (D1 -- Request/Response
+        # Infrastructure)
+        #
+        # Lets send_request() block the calling thread for its own
+        # reply while the receiver thread (client/receiver.py) keeps
+        # dispatching every other incoming packet normally -- see
+        # utils/request_registry.py. Rebuilt fresh per ClientSession
+        # instance/connection; nothing here survives a reconnect, so a
+        # request from a previous connection can never be resolved by
+        # a reply on a new one.
+        # ---------------------------------
+
+        self._pending_requests = PendingRequestRegistry()
 
         # ---------------------------------
         # Payload Pipeline (Phase 3)
@@ -303,6 +324,57 @@ class ClientSession(QObject):
             f"Connected to server ({SERVER_HOST}:{SERVER_PORT}) over TLS "
             f"({self.client_socket.version()})"
         )
+
+    def send_request(self, packet, timeout=REQUEST_TIMEOUT_SECONDS):
+        """
+        Send ``packet`` and block the calling thread until a response
+        carrying a matching ``request_id`` arrives, or ``timeout``
+        seconds elapse (D1 -- Request/Response Infrastructure).
+
+        Requires the receiver thread to already be running (see
+        start_receiver()) -- the response is delivered by
+        handle_packet() being called from that thread, exactly like
+        every other incoming packet; nothing here reads the socket
+        itself. Calling this before start_receiver() (or after
+        disconnect()) will simply time out, since nothing will ever
+        call handle_packet() to resolve it.
+
+        Purely correlation plumbing: it attaches a request_id, sends,
+        and waits. It has no opinion on packet shape or content --
+        the caller passes a complete packet dict (any existing
+        create_*_packet() helper's output, or a plain dict), and gets
+        the raw response packet dict back. No packet type currently
+        opts into this path; adding one is a later phase's job (see
+        docs/architecture -- D1 only adds the mechanism).
+
+        Raises ``utils.request_registry.RequestTimeoutError`` if no
+        matching response arrives in time. Any exception raised while
+        sending (e.g. a dead socket) propagates immediately, and the
+        pending registration is cleaned up first so nothing is left
+        waiting for a request that was never actually sent.
+        """
+
+        request_id = self._pending_requests.new_request_id()
+
+        packet = dict(packet)
+        packet["request_id"] = request_id
+
+        self._pending_requests.register(request_id)
+
+        try:
+            send_message(self.client_socket, packet)
+        except Exception:
+            self._pending_requests.cancel(request_id)
+            raise
+
+        try:
+            return self._pending_requests.wait(request_id, timeout)
+        except RequestTimeoutError:
+            self.logger.warning(
+                f"Timed out waiting for a response to "
+                f"{packet.get('type')!r} (request_id={request_id})"
+            )
+            raise
 
     def login(self, username):
         """
@@ -1217,7 +1289,21 @@ class ClientSession(QObject):
         """
         Route an incoming packet to the
         appropriate handler.
+
+        D1 -- Request/Response Infrastructure: a packet carrying a
+        request_id that matches an in-flight send_request() call is a
+        correlated response, not an independent notification -- it is
+        delivered straight to whichever thread is blocked in
+        PendingRequestRegistry.wait() and never reaches the type-based
+        dispatch below. A request_id that matches nothing pending
+        (unknown, already timed out, or simply absent -- every packet
+        type before D1 has no request_id at all) falls through to
+        normal dispatch unchanged, so this is a no-op for every
+        existing packet type today.
         """
+
+        if self._pending_requests.resolve(packet.get("request_id"), packet):
+            return
 
         packet_type = packet.get("type")
 
