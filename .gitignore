@@ -19,3 +19,13 @@ logs/
 # deployment) -- generated locally by scripts/generate_dev_certs.py,
 # never committed. See docs/architecture/tls_transport.md.
 certs/
+
+# Local environment configuration -- contains real database
+# credentials and the JWT signing secret, and must never be
+# committed. Copy .env.example to .env and fill in local values.
+.env
+
+# Encrypted payload blobs written at runtime by
+# storage/encrypted_blob_store.py (FILE_STORAGE_ROOT). Generated
+# artifacts, not source -- same rationale as logs/ and certs/ above.
+storage_blobs/
