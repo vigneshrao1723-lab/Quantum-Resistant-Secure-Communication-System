@@ -4,23 +4,45 @@ Broadcaster Module
 Handles broadcasting and sending packets to clients.
 """
 
+from logger_config import setup_logger
 from utils.network import send_message
-from utils.protocol import (
-    create_public_key_packet,
-    create_user_list_packet
-)
+from utils.protocol import create_public_key_packet, create_user_list_packet
+
+# Same singleton logger ServerState.logger already is (setup_logger()
+# returns the existing "server_logger" instance once it's been
+# configured once, rather than creating a second one) -- so a send
+# failure logged here lands in the exact same server.log a caller's
+# own state.logger calls do, without send_to_client() needing state
+# threaded through every one of its call sites just to log.
+_logger = setup_logger("server_logger", "server.log")
 
 
 def send_to_client(client_socket, packet):
     """
     Send a packet to a single client.
+
+    Returns True if the send actually succeeded, False otherwise --
+    the exception is logged, never silently discarded. A caller must
+    check this return value before reporting delivery (e.g. logging
+    "Forwarded X to Y", or recording a message as DELIVERED rather
+    than QUEUED) -- the fact that this function was called and didn't
+    raise past this point is not itself proof the packet arrived.
     """
 
     try:
         send_message(client_socket, packet)
+        return True
 
-    except Exception:
-        pass
+    except Exception as error:  # noqa: BLE001
+
+        # Intentionally broad: a failed send can surface as ssl.SSLError,
+        # OSError (connection reset/aborted), or BrokenPipeError,
+        # depending on platform and exactly when the peer went away --
+        # all of them mean the same thing here (this send did not
+        # happen) and must be reported the same way, not partially
+        # missed by a narrower except.
+        _logger.warning(f"Failed to send to client: {error}")
+        return False
 
 
 def broadcast(state, packet, sender_socket):
@@ -35,10 +57,7 @@ def broadcast(state, packet, sender_socket):
         if client_socket == sender_socket:
             continue
 
-        try:
-            send_message(client_socket, packet)
-
-        except Exception:
+        if not send_to_client(client_socket, packet):
             disconnected_clients.append(client_socket)
 
     # Remove disconnected clients safely

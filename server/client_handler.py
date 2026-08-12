@@ -282,10 +282,14 @@ def handle_group_chat_delivery(state, client_socket, user, conversation_id, pack
         if sock == client_socket:
             continue
 
-        if client.get("user_id") in member_id_strings:
-
-            send_to_client(sock, packet)
-
+        # Only actually-successful sends count as "connected" here --
+        # connected_member_ids feeds persist_group_message()'s
+        # DELIVERED/QUEUED split below, so a failed relay must not be
+        # recorded as delivered.
+        if (
+            client.get("user_id") in member_id_strings
+            and send_to_client(sock, packet)
+        ):
             connected_member_ids.append(uuid.UUID(client["user_id"]))
 
     state.logger.info(
@@ -463,7 +467,7 @@ def _dispatch_pending_rotation_if_needed(state, conversation_id_str):
 
     recipients = [u for u in member_usernames if u != selected_username]
 
-    send_to_client(
+    dispatched = send_to_client(
         sock,
         create_group_key_rotation_required_packet(
             conversation_id=conversation_id_str,
@@ -471,6 +475,20 @@ def _dispatch_pending_rotation_if_needed(state, conversation_id_str):
             members=recipients,
         ),
     )
+
+    if not dispatched:
+        # No retry here -- this is a best-effort dispatch to whichever
+        # active member happened to be selected; the docstring's own
+        # self-healing already covers this (the next connection or
+        # rotation-complete event calls this function again and picks
+        # a member fresh). Reporting the actual outcome only, not
+        # attempting a second delivery.
+        state.logger.warning(
+            f"Failed to dispatch group key rotation for "
+            f"{conversation_id_str} epoch {next_epoch} to "
+            f"{selected_username}"
+        )
+        return
 
     state.logger.info(
         f"Dispatched group key rotation for {conversation_id_str} epoch "
@@ -887,7 +905,7 @@ def _ensure_group_keys_current_for_reconnecting_user(state, user):
 
         sock, _selected_username = selected
 
-        send_to_client(
+        redelivery_requested = send_to_client(
             sock,
             create_group_key_rotation_required_packet(
                 conversation_id=str(conversation_id),
@@ -895,6 +913,17 @@ def _ensure_group_keys_current_for_reconnecting_user(state, user):
                 members=[user.username],
             ),
         )
+
+        if not redelivery_requested:
+            # No retry here -- matches _dispatch_pending_rotation_if_needed()'s
+            # identical reasoning: this runs again on this user's next
+            # reconnect, and is a harmless no-op if they already have
+            # the key by then.
+            state.logger.warning(
+                f"Failed to request current-epoch key redelivery for "
+                f"{conversation_id} to reconnecting member {user.username}"
+            )
+            continue
 
         state.logger.info(
             f"Requested current-epoch key redelivery for {conversation_id} "
@@ -1134,7 +1163,7 @@ def handle_client(state, client_socket, client_address):
                             f"[Encrypted Message]"
                         )
 
-                        send_to_client(
+                        delivered = send_to_client(
                             sock,
                             packet
                         )
@@ -1148,14 +1177,19 @@ def handle_client(state, client_socket, client_address):
                             packet=packet
                         )
 
-                        # C2 -- Read Receipts: the recipient was just
-                        # live-relayed to, above -- DELIVERED, not
-                        # QUEUED.
+                        # C2 -- Read Receipts: DELIVERED only if the
+                        # live relay above actually succeeded -- a
+                        # send_to_client() failure (dead socket,
+                        # aborted connection) must not be recorded as
+                        # delivered; QUEUED is exactly the correct,
+                        # already-existing status for "persisted but
+                        # not yet confirmed delivered" (the same status
+                        # the offline branch below uses).
                         try:
                             _record_direct_recipient(
                                 message,
                                 uuid.UUID(client["user_id"]),
-                                delivered=True,
+                                delivered=delivered,
                             )
                         except Exception as error:  # noqa: BLE001
 
@@ -1275,15 +1309,19 @@ def handle_client(state, client_socket, client_address):
 
                     if client["username"] == receiver:
 
-                        send_to_client(
-                            sock,
-                            packet
-                        )
+                        if send_to_client(sock, packet):
 
-                        state.logger.info(
-                            f"Forwarded session key "
-                            f"from {username} to {receiver}"
-                        )
+                            state.logger.info(
+                                f"Forwarded session key "
+                                f"from {username} to {receiver}"
+                            )
+
+                        else:
+
+                            state.logger.warning(
+                                f"Failed to forward session key "
+                                f"from {username} to {receiver}"
+                            )
 
                         break
 
@@ -1305,16 +1343,21 @@ def handle_client(state, client_socket, client_address):
 
                     if client["username"] == recipient:
 
-                        send_to_client(
-                            sock,
-                            packet
-                        )
+                        if send_to_client(sock, packet):
 
-                        state.logger.info(
-                            f"Forwarded group key for "
-                            f"{packet.get('conversation_id')} "
-                            f"from {username} to {recipient}"
-                        )
+                            state.logger.info(
+                                f"Forwarded group key for "
+                                f"{packet.get('conversation_id')} "
+                                f"from {username} to {recipient}"
+                            )
+
+                        else:
+
+                            state.logger.warning(
+                                f"Failed to forward group key for "
+                                f"{packet.get('conversation_id')} "
+                                f"from {username} to {recipient}"
+                            )
 
                         break
 
