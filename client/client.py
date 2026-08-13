@@ -6,43 +6,35 @@ Client Entry Point
 
 import getpass
 
-from auth.authentication_service import AuthenticationService
-from auth.schemas import LoginRequest
-from client.session import ClientSession
 from client.sender import send_messages
-from database.connection import SessionLocal
-
+from client.session import ClientSession
 from utils.console_ui import (
     display_chat,
+    display_online_users,
     display_system,
     display_warning,
-    display_online_users,
 )
 
 
 def authenticate(session):
     """
-    Prompt for credentials and authenticate against the database,
-    storing the resulting JWT/session info on the session object.
+    Prompt for credentials and authenticate against the server,
+    storing the resulting JWT/session info on the session object (D2
+    -- Server-Side API / Authentication Migration; final slice,
+    replacing this function's previous direct, local
+    AuthenticationService.authenticate_user() call).
 
-    Mirrors the DB-backed login gui/main_window.py performs before
-    ever touching the socket -- the terminal client needs the same
-    JWT in hand before ClientSession.login() can authenticate the
-    connection with the server.
+    Uses ClientSession.authenticate_credentials(), which opens and
+    tears down its own short-lived connection -- this must be called
+    before start_client()'s own session.connect(), not after (see
+    start_client(): connecting for real, and sending the resulting
+    JWT via session.login(), both now happen only once this returns).
     """
 
     identifier = input("Username or email: ").strip()
     password = getpass.getpass("Password: ")
 
-    db = SessionLocal()
-
-    try:
-        auth_service = AuthenticationService(db)
-        result = auth_service.authenticate_user(
-            LoginRequest(identifier=identifier, password=password)
-        )
-    finally:
-        db.close()
+    result = session.authenticate_credentials(identifier, password)
 
     if not result.success:
         raise PermissionError(
@@ -109,14 +101,17 @@ def start_client():
     try:
 
         # ---------------------------------
+        # Login (authenticate_credentials()
+        # uses its own short-lived connection;
+        # nothing here is connected yet)
+        # ---------------------------------
+        username = authenticate(session)
+
+        # ---------------------------------
         # Connect to Server
         # ---------------------------------
         session.connect()
 
-        # ---------------------------------
-        # Login
-        # ---------------------------------
-        username = authenticate(session)
         session.login(username)
 
         # ---------------------------------

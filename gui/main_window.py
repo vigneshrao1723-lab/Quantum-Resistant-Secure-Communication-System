@@ -6,10 +6,7 @@ Root window of the Quantum-Resistant Secure Communication System.
 
 from PySide6.QtWidgets import QMainWindow
 
-from auth.authentication_service import AuthenticationService
-from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
-from database.connection import SessionLocal
 from gui.chat_window import ChatWindow
 from gui.login_window import LoginWindow
 
@@ -26,7 +23,6 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.session = ClientSession()
-        self.db_factory = SessionLocal
 
         self.login_window = None
         self.chat_window = None
@@ -96,17 +92,13 @@ class MainWindow(QMainWindow):
     ):
 
         try:
-            with self.db_factory() as db:
-                auth_service = AuthenticationService(db)
-                result = auth_service.register_user(
-                    RegisterRequest(
-                        full_name=full_name,
-                        username=username,
-                        email=email,
-                        password=password,
-                        confirm_password=confirm_password,
-                    )
-                )
+            result = self.session.register(
+                full_name=full_name,
+                username=username,
+                email=email,
+                password=password,
+                confirm_password=confirm_password,
+            )
         except Exception as error:
             self.login_window.show_connection_error(str(error))
             return
@@ -131,14 +123,7 @@ class MainWindow(QMainWindow):
     def handle_login(self, username, password):
 
         try:
-            with self.db_factory() as db:
-                auth_service = AuthenticationService(db)
-                result = auth_service.authenticate_user(
-                    LoginRequest(
-                        identifier=username,
-                        password=password,
-                    )
-                )
+            result = self.session.authenticate_credentials(username, password)
         except Exception as error:
             self.login_window.show_connection_error(str(error))
             return
@@ -183,14 +168,10 @@ class MainWindow(QMainWindow):
 
     def handle_logout(self):
 
-        session_id = self.session.session_id
-
-        if session_id:
+        if self.session.session_id:
 
             try:
-                with self.db_factory() as db:
-                    auth_service = AuthenticationService(db)
-                    auth_service.logout(session_id)
+                self.session.logout()
             except Exception as error:
                 self.session.logger.error(
                     f"Failed to revoke session on logout: {error}"

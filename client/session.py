@@ -18,6 +18,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from auth.schemas import AuthenticationResult, RegistrationResult, TokenPair
 from client.conversation_store import ConversationStore
 from client.receiver import receive_messages
 from config import (
@@ -54,10 +55,14 @@ from utils.protocol import (
     create_group_key_distribution_packet,
     create_group_key_rotation_complete_packet,
     create_group_leave_packet,
+    create_login_request_packet,
+    create_logout_request_packet,
     create_payload_packet,
     create_public_key_packet,
     create_read_receipt_packet,
+    create_register_request_packet,
     create_session_key_packet,
+    create_user_lookup_request_packet,
 )
 from utils.request_registry import PendingRequestRegistry, RequestTimeoutError
 
@@ -376,6 +381,83 @@ class ClientSession(QObject):
             )
             raise
 
+    def authenticate_credentials(self, identifier, password):
+        """
+        Authenticate a username/email + password against the server
+        (D2 -- Server-Side API / Authentication Migration; final slice,
+        replacing gui/main_window.py's and client/client.py's previous
+        direct, local AuthenticationService.authenticate_user() call).
+        This is what obtains the JWT access/refresh tokens login()
+        below then sends -- password verification and token issuance
+        happen only on the server (AuthenticationService.
+        authenticate_user(), unchanged); nothing here duplicates or
+        second-guesses it, and the password hash is never part of the
+        response.
+
+        Opens and tears down its own short-lived connection, exactly
+        like register(): this runs before any user identity, JWT, or
+        receiver thread exists, so -- like register() and login()
+        itself -- it talks to the server directly (send_message()/
+        receive_message() on the calling thread) rather than through
+        send_request()/D1's PendingRequestRegistry, which requires
+        start_receiver() to already be running. The connection this
+        method opens is always closed again before returning,
+        regardless of outcome; the caller makes a completely separate,
+        subsequent connect() (see start_chat_session()) before ever
+        calling login() with the tokens this returns.
+
+        Returns an auth.schemas.AuthenticationResult reconstructed from
+        the server's response -- the same shape
+        AuthenticationService.authenticate_user() already returned
+        locally, so callers need no changes beyond how this result is
+        obtained.
+
+        Raises ConnectionError if the server's response is missing or
+        malformed. Any exception raised by connect() itself (e.g. a
+        failed TLS handshake) propagates unchanged.
+        """
+
+        self.connect()
+
+        try:
+            packet = create_login_request_packet(
+                identifier=identifier,
+                password=password,
+            )
+            packet["request_id"] = str(uuid.uuid4())
+
+            send_message(self.client_socket, packet)
+
+            response = receive_message(self.client_socket)
+        finally:
+            self.disconnect()
+
+        if not isinstance(response, dict) or response.get("type") != "login_result":
+            raise ConnectionError(
+                "Server did not respond to the login request."
+            )
+
+        token_pair = None
+
+        if response.get("access_token") and response.get("refresh_token"):
+            token_pair = TokenPair(
+                access_token=response["access_token"],
+                refresh_token=response["refresh_token"],
+                expires_in=response.get("expires_in"),
+                token_type=response.get("token_type") or "Bearer",
+            )
+
+        return AuthenticationResult(
+            success=bool(response.get("success")),
+            message=response.get("message") or "Authentication failed.",
+            user_id=response.get("user_id"),
+            username=response.get("username"),
+            role=response.get("role"),
+            session_id=response.get("session_id"),
+            token_pair=token_pair,
+            errors=response.get("errors"),
+        )
+
     def login(self, username):
         """
         Authenticate this client with the server using the JWT
@@ -431,6 +513,116 @@ class ClientSession(QObject):
         self.logger.info(
             f"Authenticated as {self.username}."
         )
+
+    def register(
+        self,
+        full_name,
+        username,
+        email,
+        password,
+        confirm_password
+    ):
+        """
+        Register a new user account via the server (D2 -- Server-Side
+        API / Authentication Migration; second slice, replacing
+        gui/main_window.py's previous direct, local
+        AuthenticationService/PostgreSQL call).
+
+        Opens and tears down its own short-lived connection: this is
+        called from the login screen, before any user identity, JWT,
+        or receiver thread exists -- self.connect() is otherwise only
+        ever reached via a successful login (see
+        start_chat_session()). The connection is always closed again
+        before returning, regardless of outcome, so login() (untouched
+        by this migration) still always starts from its own fresh
+        connect() afterward.
+
+        Like login() -- the only other request/response exchange that
+        also runs before any receiver thread exists -- this talks to
+        the server directly (send_message()/receive_message() on the
+        calling thread) rather than through send_request()/D1's
+        PendingRequestRegistry, which requires start_receiver() to
+        already be running; forcing that machinery on for a single,
+        exclusive, one-shot exchange would add no correlation benefit.
+
+        Returns an auth.schemas.RegistrationResult reconstructed from
+        the server's response -- the same shape
+        AuthenticationService.register_user() already returned
+        locally, so gui/main_window.py::handle_registration() needed
+        no changes beyond how this result is obtained. Validation
+        (password policy, username/email uniqueness, etc.) is still
+        performed entirely server-side by that same, unchanged
+        register_user() -- nothing here duplicates or second-guesses
+        it.
+
+        Raises ConnectionError if the server's response is missing or
+        malformed. Any exception raised by connect() itself (e.g. a
+        failed TLS handshake) propagates unchanged.
+        """
+
+        self.connect()
+
+        try:
+            packet = create_register_request_packet(
+                full_name=full_name,
+                username=username,
+                email=email,
+                password=password,
+                confirm_password=confirm_password,
+            )
+            packet["request_id"] = str(uuid.uuid4())
+
+            send_message(self.client_socket, packet)
+
+            response = receive_message(self.client_socket)
+        finally:
+            self.disconnect()
+
+        if not isinstance(response, dict) or response.get("type") != "register_result":
+            raise ConnectionError(
+                "Server did not respond to the registration request."
+            )
+
+        return RegistrationResult(
+            success=bool(response.get("success")),
+            message=response.get("message") or "Registration failed.",
+            user_id=response.get("user_id"),
+            errors=response.get("errors"),
+        )
+
+    def logout(self):
+        """
+        Ask the server to revoke this session (D2 -- Server-Side API /
+        Authentication Migration; final slice, replacing
+        gui/main_window.py's previous direct, local
+        AuthenticationService.logout(session_id) call).
+
+        Unlike authenticate_credentials()/register(), this runs on the
+        already-established, already-authenticated connection -- the
+        receiver thread is already running by the time logout is
+        reachable from the GUI (chat is only ever entered after
+        start_chat_session()'s start_receiver() call) -- so this uses
+        D1's send_request(), exactly like find_user_by_id(), rather
+        than the throwaway-connection pattern those two pre-auth
+        operations use.
+
+        This method never sends self.session_id or any other identity
+        field -- create_logout_request_packet() carries none. The
+        server derives which session to revoke entirely from its own
+        authenticated connection state (see server/client_handler.py::
+        handle_logout_request()), so there is nothing for a caller to
+        get wrong or forge here.
+
+        Returns True if the server confirms the session was revoked,
+        False if it reports it could not (e.g. already logged out).
+        Does not disconnect the socket itself -- the caller
+        (gui/main_window.py::handle_logout()) still owns that decision
+        and timing, unchanged from before this migration.
+        """
+
+        response = self.send_request(create_logout_request_packet())
+
+        return bool(response.get("success"))
 
     def send_public_key(self):
         """
@@ -1098,14 +1290,17 @@ class ClientSession(QObject):
         (Postgres primary key), and unlike username/email it reveals
         nothing about the person from the string alone.
 
-        A direct client-side DB read via UserRepository, exactly like
-        every other read this class already performs
-        (load_conversation_history(), load_conversations()) -- not a
-        new packet type; this app's client already holds live
-        database credentials for its own history/conversation reads,
-        and a lookup here grants no privilege of its own. Sending to
-        or opening a conversation with the found user still goes
-        through the server's existing sender-authentication and
+        D2 -- Server-Side API / Authentication Migration: this used to
+        be a direct client-side DB read via UserRepository; it is now
+        the first operation migrated onto a server request/response
+        pair (user_lookup_request/user_lookup_result -- see
+        server/client_handler.py::handle_user_lookup()), using D1's
+        send_request() for the correlation and blocking. The
+        signature, return shape, and every existing behavior below are
+        unchanged -- gui/find_user_dialog.py needed no changes for
+        this migration. A lookup still grants no privilege of its own;
+        sending to or opening a conversation with the found user still
+        goes through the server's existing sender-authentication and
         group-membership checks, completely unchanged.
 
         Returns a dict with only {"user_id", "username",
@@ -1114,10 +1309,18 @@ class ClientSession(QObject):
         exposing more than a lookup-by-ID needs to. Returns None for a
         malformed ID or one that matches nobody -- both are reported
         identically ("not found") so a caller can't distinguish a
-        malformed guess from a well-formed-but-nonexistent one. Raises
+        malformed guess from a well-formed-but-nonexistent one; the
+        malformed case is still short-circuited client-side, before
+        any request is sent, exactly as before. Raises
         PermissionError if this session itself isn't authenticated
         yet, mirroring login()'s existing use of that exception for
-        the same kind of guard.
+        the same kind of guard. Raises
+        utils.request_registry.RequestTimeoutError if the server
+        doesn't respond in time -- a genuinely new failure mode this
+        method didn't have as a local DB read, deliberately left
+        uncaught here rather than folded into the "not found" result,
+        since a timeout and a definitive "no such user" are not the
+        same thing.
         """
 
         if not self.user_id:
@@ -1126,24 +1329,21 @@ class ClientSession(QObject):
             )
 
         try:
-            parsed_id = uuid.UUID(user_id_str)
+            uuid.UUID(user_id_str)
         except (ValueError, AttributeError, TypeError):
             return None
 
-        db = SessionLocal()
+        response = self.send_request(
+            create_user_lookup_request_packet(user_id=user_id_str)
+        )
 
-        try:
-            user = UserRepository(db).get_by_id(parsed_id)
-        finally:
-            db.close()
-
-        if user is None:
+        if not response.get("user_id"):
             return None
 
         return {
-            "user_id": str(user.id),
-            "username": user.username,
-            "display_name": user.display_name,
+            "user_id": response["user_id"],
+            "username": response["username"],
+            "display_name": response["display_name"],
         }
 
     def _build_latest_message_preview(self, conversation_id, latest_message_row):

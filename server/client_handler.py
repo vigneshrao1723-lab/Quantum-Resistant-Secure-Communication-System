@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timezone
 
 from auth.authentication_service import AuthenticationService
+from auth.schemas import LoginRequest, RegisterRequest
 from config import KEY_EXCHANGE_ALGORITHM
 from database.connection import SessionLocal
 from database.models.conversation import Conversation
@@ -143,6 +144,46 @@ def persist_message(sender_id, receiver_id, algorithm, packet, conversation_id=N
         db.commit()
 
         return message
+    finally:
+        db.close()
+
+
+def _resolve_direct_conversation_id(sender_id, receiver_id):
+    """
+    Get-or-create the direct conversation between two users and return
+    its id as a string (D3.1 -- Conversation Operations Migration,
+    first slice).
+
+    Called from the "chat" and "session_key" relay branches below,
+    before either packet is ever sent to its recipient, so the
+    resolved id can be attached to the outgoing packet -- the
+    receiving client no longer has to resolve or create it itself via
+    a direct database call (see client/conversation_store.py::
+    ensure_direct_conversation_id(), not yet migrated by this slice,
+    but no longer reached from handle_chat()/handle_session_key() once
+    they consume the field this populates).
+
+    Reuses ConversationRepository.get_or_create_direct_conversation()
+    completely unchanged, including its pg_advisory_xact_lock()-based
+    concurrency guard (D3.1) -- what makes it safe to call this from
+    two different connections' handler threads for the same pair at
+    the same time, which is now a real possibility with resolution
+    centralized here rather than spread across independent client
+    processes.
+    """
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+
+        conversation = conversation_repo.get_or_create_direct_conversation(
+            sender_id, receiver_id
+        )
+
+        conversation_repo.commit()
+
+        return str(conversation.id)
     finally:
         db.close()
 
@@ -812,6 +853,73 @@ def handle_read_receipt(state, client_socket, user, packet):
     )
 
 
+def handle_user_lookup(state, client_socket, user, packet):
+    """
+    Look up a user by their unique ID on behalf of the authenticated
+    connection (D2 -- Server-Side API / Authentication Migration;
+    first slice of the client -> server API migration, moving
+    ClientSession.find_user_by_id() off its previous direct
+    PostgreSQL access).
+
+    Security: matches find_user_by_id()'s pre-migration model exactly
+    -- any authenticated user may look up any other by id (a lookup
+    grants no privilege of its own; sending to or opening a
+    conversation with the result still goes through this file's
+    existing sender-authentication and group-membership checks,
+    completely unchanged). ``user`` is derived from the authenticated
+    socket by dispatch before this function is ever reached -- the
+    same structural guarantee every other packet handler in this file
+    already relies on -- so there is no additional per-request
+    authorization check to perform here; the packet's own fields are
+    never a source of identity. Returns only {user_id, username,
+    display_name} for both a match and a "not found" result -- never
+    email, password hash, or any other User field -- so a caller can't
+    distinguish a malformed guess from a well-formed-but-nonexistent
+    one, exactly like the pre-migration behavior.
+
+    A missing request_id/user_id is silently ignored (mirrors
+    handle_read_receipt()'s identical guard for a missing
+    conversation_id). A user_id that fails to parse as a UUID is
+    intentionally NOT specially guarded -- it propagates to this
+    file's outer exception handler exactly like every other packet
+    field parsed with uuid.UUID() elsewhere in this file (conversation_id
+    in handle_read_receipt()/handle_group_leave(), etc.); this is an
+    existing, already-accepted class of gap, not something introduced
+    here. A well-behaved client never triggers it: ClientSession.
+    find_user_by_id() already validates the id format itself before
+    ever sending a request.
+    """
+
+    request_id = packet.get("request_id")
+    user_id = packet.get("user_id")
+
+    if not request_id or not user_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        found = UserRepository(db).get_by_id(uuid.UUID(user_id))
+    finally:
+        db.close()
+
+    if found is None:
+        response = create_user_lookup_result_packet(request_id=request_id)
+    else:
+        response = create_user_lookup_result_packet(
+            request_id=request_id,
+            user_id=str(found.id),
+            username=found.username,
+            display_name=found.display_name,
+        )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send user_lookup_result to {user.username} "
+            f"(request_id={request_id})"
+        )
+
+
 def _recover_pending_rotations_for_user(state, user):
     """
     Reconnect recovery (Phase 7 -- Group Membership Management): for
@@ -931,6 +1039,188 @@ def _ensure_group_keys_current_for_reconnecting_user(state, user):
         )
 
 
+def handle_register_request(state, client_socket, packet):
+    """
+    Register a new user account on behalf of an as-yet-unauthenticated
+    connection (D2 -- Server-Side API / Authentication Migration;
+    second slice, migrating gui/main_window.py's registration path off
+    its previous direct, local AuthenticationService/PostgreSQL call).
+
+    Unlike every other handler in this file, this one runs before
+    authenticate_connection() ever succeeds -- there is no JWT and no
+    authenticated `user` to derive an identity from, because
+    registration's entire purpose is creating one. This is not a new
+    trust boundary: gui/main_window.py::handle_registration() already
+    called AuthenticationService.register_user() with no authentication
+    of its own, before this migration -- the server enforces exactly
+    the same validation (AuthenticationService.register_user() itself,
+    completely unchanged) it always would have, just now over the wire
+    instead of via direct DB access from the client machine.
+
+    A missing request_id is silently ignored -- there is no correlated
+    caller to answer (mirrors handle_user_lookup()'s identical guard).
+    Every other missing/malformed field is left entirely to
+    RegisterRequest/register_user()'s own existing validation, exactly
+    as before this migration.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        result = AuthenticationService(db).register_user(
+            RegisterRequest(
+                full_name=packet.get("full_name"),
+                username=packet.get("username"),
+                email=packet.get("email"),
+                password=packet.get("password"),
+                confirm_password=packet.get("confirm_password"),
+            )
+        )
+    finally:
+        db.close()
+
+    response = create_register_result_packet(
+        request_id=request_id,
+        success=result.success,
+        message=result.message,
+        user_id=result.user_id,
+        errors=result.errors,
+    )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send register_result (request_id={request_id})"
+        )
+
+
+def handle_login_request(state, client_socket, packet):
+    """
+    Authenticate a not-yet-authenticated connection via username/email
+    + password (D2 -- Server-Side API / Authentication Migration; final
+    slice, migrating gui/main_window.py's and client/client.py's
+    previous direct, local AuthenticationService.authenticate_user()
+    call off the client). Runs from authenticate_connection(), before
+    any JWT exists -- obtaining that JWT is exactly what this does.
+    Mirrors handle_register_request() closely: same pre-auth placement,
+    same fresh-SessionLocal()-per-call pattern, same "always return
+    None afterward" contract from its caller.
+
+    Password verification and token issuance are entirely
+    AuthenticationService.authenticate_user()'s existing, unchanged
+    responsibility -- nothing here duplicates or second-guesses it
+    (including its failed-login-attempt lockout bookkeeping). The
+    response is built solely from the returned AuthenticationResult, so
+    it can never carry a password hash or any other internal User
+    field -- only what AuthenticationResult itself already exposes.
+
+    A missing request_id is silently ignored -- there is no correlated
+    caller to answer (mirrors handle_register_request()'s identical
+    guard). identifier/password are the only fields ever read from the
+    packet; there is no client-supplied identity here to distrust in
+    the first place -- user_id/username/session_id/tokens are all
+    computed fresh, server-side, by authenticate_user().
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        result = AuthenticationService(db).authenticate_user(
+            LoginRequest(
+                identifier=packet.get("identifier"),
+                password=packet.get("password"),
+            )
+        )
+    finally:
+        db.close()
+
+    token_pair = result.token_pair
+
+    response = create_login_result_packet(
+        request_id=request_id,
+        success=result.success,
+        message=result.message,
+        user_id=result.user_id,
+        username=result.username,
+        role=result.role,
+        session_id=result.session_id,
+        access_token=token_pair.access_token if token_pair else None,
+        refresh_token=token_pair.refresh_token if token_pair else None,
+        expires_in=token_pair.expires_in if token_pair else None,
+        token_type=token_pair.token_type if token_pair else None,
+        errors=result.errors,
+    )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send login_result (request_id={request_id})"
+        )
+
+
+def handle_logout_request(state, client_socket, user, packet):
+    """
+    Revoke the authenticated connection's own session (D2 -- Server-
+    Side API / Authentication Migration; final slice, migrating
+    gui/main_window.py's previous direct, local
+    AuthenticationService.logout(session_id) call off the client).
+
+    Security: the session revoked is always this connection's own --
+    session_id is read from state.get_client(client_socket) (the
+    server's own record, established once from the validated JWT at
+    authenticate_connection() time), never from the packet. The packet
+    itself (see create_logout_request_packet()) carries no identity
+    fields at all, so there is nothing for a client to forge here to
+    log out a session other than its own. ``user`` is likewise the
+    authenticated identity dispatch already resolved -- used only for
+    the failure-to-send log line, matching handle_user_lookup()'s
+    identical pattern.
+
+    A missing request_id is silently ignored, mirroring every other D2
+    handler's identical guard.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    client = state.get_client(client_socket)
+    session_id = client.get("session_id") if client else None
+
+    if not session_id:
+        response = create_logout_result_packet(
+            request_id, False, "No active session to log out."
+        )
+    else:
+        db = SessionLocal()
+
+        try:
+            revoked = AuthenticationService(db).logout(session_id)
+        finally:
+            db.close()
+
+        response = create_logout_result_packet(
+            request_id,
+            revoked,
+            "Logged out." if revoked else "Session was already logged out.",
+        )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send logout_result to {user.username} "
+            f"(request_id={request_id})"
+        )
+
+
 def authenticate_connection(state, client_socket, client_address):
     """
     Receive and validate the client's JWT access token.
@@ -938,6 +1228,19 @@ def authenticate_connection(state, client_socket, client_address):
     Returns the authenticated (user, session) pair on success, or
     None on failure. In both cases an "auth_result" packet is sent
     back to the client before returning.
+
+    A first packet of type "register_request" or "login_request" is
+    handled here too (D2), before the "auth" check below: a
+    registering or logging-in client has no token to send yet, so
+    neither can wait for the normal post-authentication dispatch loop
+    the way user_lookup_request/logout_request do. Both always return
+    None afterward -- like every other rejection path in this function
+    -- so the connection is closed by handle_client()'s existing
+    teardown without ever being registered as a live client; obtaining
+    a login_result's tokens is always a separate, throwaway connection
+    from the one that later sends them via the "auth" packet below
+    (see ClientSession.authenticate_credentials()). The pre-existing
+    "auth" branch below is otherwise untouched.
     """
 
     auth_packet = receive_message(client_socket)
@@ -1388,6 +1691,20 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "read_receipt":
 
                 handle_read_receipt(state, client_socket, user, packet)
+
+            # -----------------------------
+            # User Lookup Request (D2)
+            # -----------------------------
+            elif packet.get("type") == "user_lookup_request":
+
+                handle_user_lookup(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Logout Request (D2)
+            # -----------------------------
+            elif packet.get("type") == "logout_request":
+
+                handle_logout_request(state, client_socket, user, packet)
 
     except Exception as e:
 

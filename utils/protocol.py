@@ -333,6 +333,214 @@ def create_read_receipt_notification_packet(conversation_id, reader):
     }
 
 
+def create_user_lookup_request_packet(user_id):
+    """
+    Ask the server to look up a user by their unique ID (D2 -- Server-
+    Side API / Authentication Migration; migrates the read
+    ClientSession.find_user_by_id() previously performed directly
+    against PostgreSQL onto this request/response pair instead).
+    Carries only the id being searched for -- who is asking is derived
+    from the authenticated socket server-side, matching every other
+    request handler in server/client_handler.py. Correlated via D1's
+    request_id mechanism, attached by ClientSession.send_request()
+    itself -- never set here.
+    """
+
+    return {
+        "type": "user_lookup_request",
+        "user_id": user_id
+    }
+
+
+def create_user_lookup_result_packet(
+    request_id,
+    user_id=None,
+    username=None,
+    display_name=None
+):
+    """
+    Server -> client: the result of a user_lookup_request (D2). A
+    match returns exactly the same minimal projection
+    ClientSession.find_user_by_id() has always returned -- user_id,
+    username, display_name -- deliberately never email, password
+    hash, or any other User field. No match (a well-formed id that
+    doesn't exist) leaves every field None, matching
+    find_user_by_id()'s existing contract of not letting a caller
+    distinguish a malformed guess from a well-formed-but-nonexistent
+    one. request_id is echoed from the request so
+    ClientSession.send_request()'s pending correlation resolves.
+    """
+
+    return {
+        "type": "user_lookup_result",
+        "request_id": request_id,
+        "user_id": user_id,
+        "username": username,
+        "display_name": display_name
+    }
+
+
+def create_register_request_packet(
+    full_name,
+    username,
+    email,
+    password,
+    confirm_password
+):
+    """
+    Ask the server to register a new user account (D2 -- Server-Side
+    API / Authentication Migration; migrates registration off its
+    previous direct-PostgreSQL client-side implementation in
+    gui/main_window.py). Sent on a connection that has not
+    authenticated and never will for this operation -- there is no
+    user yet to authenticate as. Carries the same fields
+    auth.schemas.RegisterRequest already defines; the server performs
+    exactly the same validation (AuthenticationService.register_user(),
+    unchanged) it always would have, just now over the wire instead of
+    via direct client-side DB access. request_id is attached by
+    ClientSession.send_request() itself, never set here.
+    """
+
+    return {
+        "type": "register_request",
+        "full_name": full_name,
+        "username": username,
+        "email": email,
+        "password": password,
+        "confirm_password": confirm_password
+    }
+
+
+def create_register_result_packet(
+    request_id,
+    success,
+    message,
+    user_id=None,
+    errors=None
+):
+    """
+    Server -> client: the result of a register_request (D2). Mirrors
+    auth.schemas.RegistrationResult's own shape exactly (success,
+    message, user_id, errors) so the client can reconstruct one
+    without any new client-side validation logic. request_id is
+    echoed from the request so ClientSession.send_request()'s pending
+    correlation resolves.
+    """
+
+    return {
+        "type": "register_result",
+        "request_id": request_id,
+        "success": success,
+        "message": message,
+        "user_id": user_id,
+        "errors": errors
+    }
+
+
+def create_login_request_packet(identifier, password):
+    """
+    Ask the server to authenticate a username/email + password (D2 --
+    Server-Side API / Authentication Migration; final slice, migrating
+    login off its previous direct-PostgreSQL client-side implementation
+    in gui/main_window.py and client/client.py). Sent on a connection
+    that has not authenticated yet -- there is no JWT to present until
+    this succeeds. Carries only what auth.schemas.LoginRequest's two
+    callers here have ever actually populated (identifier, password);
+    device/platform metadata is left to a future caller that needs it,
+    exactly as before this migration. request_id is attached by the
+    caller itself (mirrors create_register_request_packet() -- this
+    also runs before any receiver thread exists, so
+    ClientSession.send_request() is not used here either).
+    """
+
+    return {
+        "type": "login_request",
+        "identifier": identifier,
+        "password": password
+    }
+
+
+def create_login_result_packet(
+    request_id,
+    success,
+    message,
+    user_id=None,
+    username=None,
+    role=None,
+    session_id=None,
+    access_token=None,
+    refresh_token=None,
+    expires_in=None,
+    token_type=None,
+    errors=None
+):
+    """
+    Server -> client: the result of a login_request (D2). Mirrors
+    auth.schemas.AuthenticationResult's shape exactly, with TokenPair's
+    fields flattened in rather than nested -- every packet in this
+    protocol is a flat dict, and the client reconstructs both
+    dataclasses from these fields (see ClientSession.
+    authenticate_credentials()). Deliberately carries nothing beyond
+    what AuthenticationResult itself already exposes -- never a
+    password hash or any other internal User field. request_id is
+    echoed from the request for symmetry with every other *_result
+    packet, though this one is read synchronously rather than via D1's
+    correlation (see create_login_request_packet()).
+    """
+
+    return {
+        "type": "login_result",
+        "request_id": request_id,
+        "success": success,
+        "message": message,
+        "user_id": user_id,
+        "username": username,
+        "role": role,
+        "session_id": session_id,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": expires_in,
+        "token_type": token_type,
+        "errors": errors
+    }
+
+
+def create_logout_request_packet():
+    """
+    Ask the server to revoke this connection's session (D2 -- Server-
+    Side API / Authentication Migration; final slice, migrating logout
+    off its previous direct-PostgreSQL client-side implementation).
+    Sent on the already-authenticated connection -- unlike
+    register_request/login_request, this carries no identity fields at
+    all: which session to revoke is derived server-side from the
+    authenticated connection/state (see server/client_handler.py::
+    handle_logout_request()), never from anything client-supplied, so
+    there is nothing here a malicious client could forge to log out a
+    different session.
+    """
+
+    return {
+        "type": "logout_request"
+    }
+
+
+def create_logout_result_packet(request_id, success, message):
+    """
+    Server -> client: the result of a logout_request (D2). Echoes
+    request_id so ClientSession.send_request()'s pending correlation
+    resolves -- unlike login/register, logout runs on the already-
+    authenticated connection with the receiver thread already running,
+    so it uses D1's normal request/response path.
+    """
+
+    return {
+        "type": "logout_result",
+        "request_id": request_id,
+        "success": success,
+        "message": message
+    }
+
+
 def create_delivery_failure_packet(
     receiver,
     reason="User is offline."
