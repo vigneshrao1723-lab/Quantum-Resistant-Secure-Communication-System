@@ -51,6 +51,7 @@ from utils.network import receive_message, send_message
 from utils.protocol import (
     create_auth_packet,
     create_direct_conversation_request_packet,
+    create_epoch_reservation_request_packet,
     create_group_add_members_packet,
     create_group_create_packet,
     create_group_key_distribution_packet,
@@ -733,11 +734,16 @@ class ClientSession(QObject):
 
         Key-desynchronization fix: every key established here is
         stamped with a freshly RESERVED epoch (never an assumed
-        "epoch 1"), via the exact same
-        ConversationRepository.reserve_next_epoch()/current_key_epoch
-        counter Phase 7 already uses for group-key rotation -- reused
-        completely unchanged, just called from a second place. This
-        is what fixes the one-sided-restart bug: previously, a client
+        "epoch 1"), via the same current_key_epoch counter Phase 7
+        already uses for group-key rotation. D4.1 -- Message/History
+        Operations Migration: the reservation itself is now a server
+        request/response (epoch_reservation_request/result, via D1's
+        send_request()) rather than a direct, local
+        ConversationRepository.reserve_next_epoch() call -- the server
+        reuses that exact same repository method unchanged, now behind
+        an authorization check (the caller must be a member of the
+        conversation) this direct-DB path never had. This is what
+        fixes the one-sided-restart bug: previously, a client
         with no cached key always (re)established under the hardcoded
         default epoch 1, which collided with -- and was silently
         rejected by -- a still-connected partner who already had
@@ -771,18 +777,16 @@ class ClientSession(QObject):
         if self.key_manager.has_key(conversation_id):
             return
 
-        db = SessionLocal()
+        response = self.send_request(
+            create_epoch_reservation_request_packet(conversation_id)
+        )
 
-        try:
-            conversation_repo = ConversationRepository(db)
+        error = response.get("error")
 
-            epoch = conversation_repo.reserve_next_epoch(
-                uuid.UUID(conversation_id)
-            )
+        if error:
+            raise ValueError(error)
 
-            conversation_repo.commit()
-        finally:
-            db.close()
+        epoch = response.get("epoch")
 
         algorithm = self.key_manager.algorithm
 

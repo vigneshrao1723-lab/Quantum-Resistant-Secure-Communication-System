@@ -586,6 +586,50 @@ def create_direct_conversation_result_packet(
     }
 
 
+def create_epoch_reservation_request_packet(conversation_id):
+    """
+    Ask the server to reserve the next key epoch for a direct
+    conversation, before establishing a fresh AES session key (D4.1 --
+    Message/History Operations Migration, first slice). Replaces
+    ClientSession.establish_session_key()'s previous direct, client-
+    side ConversationRepository.reserve_next_epoch() call -- the last
+    remaining client-side database write anywhere in direct-
+    conversation key establishment. Carries only the conversation_id
+    being keyed -- who the caller is comes from the authenticated
+    connection server-side, never from this packet. request_id is
+    attached by ClientSession.send_request() itself, never set here.
+    """
+
+    return {
+        "type": "epoch_reservation_request",
+        "conversation_id": conversation_id
+    }
+
+
+def create_epoch_reservation_result_packet(
+    request_id,
+    epoch=None,
+    error=None
+):
+    """
+    Server -> client: the result of an epoch_reservation_request
+    (D4.1). ``epoch`` is set on success; ``error`` is set (and epoch
+    left None) if conversation_id is missing/malformed or the
+    authenticated caller is not currently a member of that
+    conversation -- mirrors create_direct_conversation_result_packet()'s
+    identical success/error shape. request_id is echoed from the
+    request so ClientSession.send_request()'s pending correlation
+    resolves.
+    """
+
+    return {
+        "type": "epoch_reservation_result",
+        "request_id": request_id,
+        "epoch": epoch,
+        "error": error
+    }
+
+
 def create_delivery_failure_packet(
     receiver,
     reason="User is offline."

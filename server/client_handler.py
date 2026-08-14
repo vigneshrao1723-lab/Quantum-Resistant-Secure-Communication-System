@@ -30,6 +30,7 @@ from utils.protocol import (
     create_auth_result_packet,
     create_delivery_failure_packet,
     create_direct_conversation_result_packet,
+    create_epoch_reservation_result_packet,
     create_group_create_result_packet,
     create_group_key_rotation_required_packet,
     create_group_member_left_packet,
@@ -1309,6 +1310,98 @@ def handle_direct_conversation_request(state, client_socket, user, packet):
         )
 
 
+def handle_epoch_reservation_request(state, client_socket, user, packet):
+    """
+    Reserve the next key epoch for a direct conversation on behalf of
+    the authenticated connection (D4.1 -- Message/History Operations
+    Migration, first slice), replacing ClientSession.
+    establish_session_key()'s previous direct, client-side
+    ConversationRepository.reserve_next_epoch() call -- the last
+    remaining client-side database write anywhere in direct-
+    conversation key establishment.
+
+    Security: the caller's identity is always user.id -- the
+    authenticated identity from the JWT validated at
+    authenticate_connection() time -- never anything read from the
+    packet. Before reserving, the authenticated caller must be an
+    active member of conversation_id (get_member_user_ids() -- the
+    identical check handle_group_leave()/handle_group_chat_delivery()/
+    handle_read_receipt() already use). This is a genuinely new
+    authorization boundary: the previous direct, client-side database
+    call had nothing stopping it from reserving an epoch for any
+    conversation_id at all, member or not.
+
+    A missing/malformed conversation_id and a well-formed but
+    nonexistent or non-member one all resolve to the same rejection --
+    get_member_user_ids() simply returns no rows either way -- so none
+    of those cases are distinguishable from each other on the wire,
+    mirroring this codebase's existing "don't let an error message
+    reveal which guess was closer" convention (e.g. find_user_by_id()).
+
+    Reuses ConversationRepository.reserve_next_epoch() completely
+    unchanged -- the exact same counter Phase 7's group-key rotation
+    and this method's own prior client-side implementation both
+    already used.
+
+    A missing request_id is silently ignored, mirroring every other
+    D2/D3/D4 handler's identical guard.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    conversation_id = packet.get("conversation_id")
+
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except (TypeError, ValueError, AttributeError):
+        conversation_uuid = None
+
+    epoch = None
+    error = None
+
+    if conversation_uuid is None:
+        error = "Invalid or missing conversation_id."
+    else:
+        db = SessionLocal()
+
+        try:
+            conversation_repo = ConversationRepository(db)
+
+            member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+            if user.id not in member_ids:
+
+                state.logger.warning(
+                    f"Rejected epoch_reservation_request: {user.username} is "
+                    f"not a member of conversation {conversation_id}"
+                )
+
+                error = "Not a member of this conversation."
+
+            else:
+
+                epoch = conversation_repo.reserve_next_epoch(conversation_uuid)
+
+                conversation_repo.commit()
+        finally:
+            db.close()
+
+    response = create_epoch_reservation_result_packet(
+        request_id=request_id,
+        epoch=epoch,
+        error=error,
+    )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send epoch_reservation_result to {user.username} "
+            f"(request_id={request_id})"
+        )
+
+
 def authenticate_connection(state, client_socket, client_address):
     """
     Receive and validate the client's JWT access token.
@@ -1867,6 +1960,13 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "direct_conversation_request":
 
                 handle_direct_conversation_request(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Epoch Reservation Request (D4.1)
+            # -----------------------------
+            elif packet.get("type") == "epoch_reservation_request":
+
+                handle_epoch_reservation_request(state, client_socket, user, packet)
 
     except Exception as e:
 
