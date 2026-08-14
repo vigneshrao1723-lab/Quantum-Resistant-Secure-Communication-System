@@ -35,7 +35,11 @@ from utils.protocol import (
     create_group_members_added_packet,
     create_join_packet,
     create_leave_packet,
+    create_login_result_packet,
+    create_logout_result_packet,
     create_read_receipt_notification_packet,
+    create_register_result_packet,
+    create_user_lookup_result_packet,
     parse_packet,
 )
 
@@ -1249,6 +1253,14 @@ def authenticate_connection(state, client_socket, client_address):
         return None
 
     auth_packet = parse_packet(auth_packet)
+
+    if isinstance(auth_packet, dict) and auth_packet.get("type") == "register_request":
+        handle_register_request(state, client_socket, auth_packet)
+        return None
+
+    if isinstance(auth_packet, dict) and auth_packet.get("type") == "login_request":
+        handle_login_request(state, client_socket, auth_packet)
+        return None
 
     if not isinstance(auth_packet, dict) or auth_packet.get("type") != "auth":
         send_to_client(
