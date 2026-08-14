@@ -1442,6 +1442,21 @@ def handle_client(state, client_socket, client_address):
             if packet.get("type") == "chat":
                 packet["sender"] = username
 
+            # D3.1 -- Conversation Operations Migration: the identical
+            # hardening for a direct session_key packet's sender field,
+            # not previously overwritten here. Needed now because the
+            # direct-conversation resolution below uses the
+            # authenticated sender's id, never whatever the packet
+            # claims -- so the displayed/attributed identity and the
+            # one actually used to resolve the conversation can never
+            # diverge. Persistence is not affected: session_key packets
+            # are relay-only and were never stored.
+            if (
+                packet.get("type") == "key_exchange"
+                and packet.get("operation") == "session_key"
+            ):
+                packet["sender"] = username
+
             # -----------------------------
             # Private Chat Packet
             # -----------------------------
@@ -1478,6 +1493,23 @@ def handle_client(state, client_socket, client_address):
                             f"[Encrypted Message]"
                         )
 
+                        # D3.1 -- Conversation Operations Migration:
+                        # resolved here, before relay, so the receiving
+                        # client can read it straight off the packet
+                        # instead of resolving/creating it itself via a
+                        # direct database call. Deliberately a NEW
+                        # field, never "conversation_id" -- the
+                        # receiving client's handle_chat() derives
+                        # is_group from that field's mere presence
+                        # (group packets set it, direct ones never
+                        # did), so reusing it here would misclassify
+                        # every direct message as a group one the
+                        # moment a client is updated to read it.
+                        direct_conversation_id = _resolve_direct_conversation_id(
+                            user.id, client["user_id"]
+                        )
+                        packet["direct_conversation_id"] = direct_conversation_id
+
                         delivered = send_to_client(
                             sock,
                             packet
@@ -1489,7 +1521,8 @@ def handle_client(state, client_socket, client_address):
                             sender_id=user.id,
                             receiver_id=client["user_id"],
                             algorithm=(sender_client or {}).get("algorithm"),
-                            packet=packet
+                            packet=packet,
+                            conversation_id=direct_conversation_id,
                         )
 
                         # C2 -- Read Receipts: DELIVERED only if the
@@ -1556,11 +1589,24 @@ def handle_client(state, client_socket, client_address):
                         try:
                             sender_client = state.get_client(client_socket)
 
+                            # D3.1 -- Conversation Operations Migration:
+                            # resolved the same way as the online branch
+                            # above, even though nothing is relayed live
+                            # here -- persist_message() still needs it,
+                            # and a later reconnect's history/list
+                            # request (a future slice) must see the same
+                            # conversation an online delivery would have
+                            # used.
+                            direct_conversation_id = _resolve_direct_conversation_id(
+                                user.id, offline_user.id
+                            )
+
                             message = persist_message(
                                 sender_id=user.id,
                                 receiver_id=offline_user.id,
                                 algorithm=(sender_client or {}).get("algorithm"),
-                                packet=packet
+                                packet=packet,
+                                conversation_id=direct_conversation_id,
                             )
 
                             # C2 -- Read Receipts: nobody was
@@ -1623,6 +1669,19 @@ def handle_client(state, client_socket, client_address):
                 for sock, client in state.clients.items():
 
                     if client["username"] == receiver:
+
+                        # D3.1 -- Conversation Operations Migration:
+                        # resolved from the authenticated sender
+                        # (user.id) and the matched recipient's own
+                        # user_id -- never from anything the packet
+                        # claims. A session_key packet is always
+                        # direct (group keys use group_key_distribution
+                        # instead), so there is no is_group ambiguity
+                        # here the way there is for "chat" -- reusing
+                        # the field name "conversation_id" is safe.
+                        packet["conversation_id"] = _resolve_direct_conversation_id(
+                            user.id, client["user_id"]
+                        )
 
                         if send_to_client(sock, packet):
 

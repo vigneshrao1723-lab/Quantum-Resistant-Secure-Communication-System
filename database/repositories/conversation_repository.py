@@ -30,10 +30,11 @@ recovery), both still built on left_at/current_key_epoch/
 confirmed_key_epoch alone.
 """
 
+import hashlib
 from collections import namedtuple
 from datetime import datetime, timezone
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.orm import aliased
 
 from database.models.conversation import Conversation
@@ -50,6 +51,37 @@ def _utc_now() -> datetime:
     shared, matching this codebase's existing per-file convention.
     """
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _direct_conversation_lock_key(user_a_id, user_b_id):
+    """
+    A deterministic, order-independent 64-bit signed integer for
+    pg_advisory_xact_lock() (D3.1 -- Conversation Operations
+    Migration), derived from the two users' ids sorted into a
+    canonical order first -- so concurrent calls with the arguments
+    swapped still contend for the exact same lock, matching
+    get_or_create_direct_conversation()'s own documented "argument
+    order does not matter" contract.
+
+    Application-level locking rather than a schema change: nothing in
+    the current conversations/conversation_members tables prevents two
+    concurrent check-then-insert calls from both finding "no existing
+    conversation" for the same pair and both creating one (their only
+    unique constraint is per-membership-row, (conversation_id,
+    user_id), which says nothing about *which* conversation two users
+    end up in). A partial unique index encoding "at most one direct
+    conversation per unordered pair" would fix this too, but requires
+    a migration and a place to store the canonical pair; this achieves
+    the same safety with no schema change, which is all that's needed
+    now that every direct-conversation creation funnels through this
+    one method (server-side, D3.1) rather than being spread across
+    independent, uncoordinated client processes as before.
+    """
+
+    sorted_ids = sorted([str(user_a_id), str(user_b_id)])
+    digest = hashlib.sha256("|".join(sorted_ids).encode("utf-8")).digest()
+
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 # One row per conversation this user belongs to: the Conversation
 # itself, its latest Message (None if it has none yet), and the
@@ -71,7 +103,28 @@ class ConversationRepository(BaseRepository):
 
         Argument order does not matter -- the same conversation is
         returned regardless of which user is passed first.
+
+        Concurrency (D3.1 -- Conversation Operations Migration): takes
+        a transaction-scoped Postgres advisory lock keyed on this pair
+        (see _direct_conversation_lock_key()) before the check-then-
+        insert below, so two concurrent calls for the same pair -- now
+        a real possibility once this is called from the server on
+        behalf of two different connections, rather than only ever
+        from one client's own decentralized, uncoordinated process --
+        serialize instead of racing to both create a conversation. The
+        second caller blocks until the first commits (or rolls back),
+        then its own _find_direct_conversation() call, running under
+        Postgres's default READ COMMITTED isolation, sees the first
+        caller's now-committed row and returns it instead of creating
+        a duplicate. pg_advisory_xact_lock() releases automatically at
+        transaction end (commit, rollback, or connection loss) -- no
+        manual unlock, no risk of a lock stuck past its caller's
+        commit()/rollback().
         """
+
+        lock_key = _direct_conversation_lock_key(user_a_id, user_b_id)
+
+        self.db.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
 
         existing = self._find_direct_conversation(user_a_id, user_b_id)
 
