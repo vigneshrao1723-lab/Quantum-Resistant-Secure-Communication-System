@@ -1625,11 +1625,22 @@ class ClientSession(QObject):
         unchanged since Phase 4 (conversation_id for group, sender's
         username for direct). ``key_conversation_id`` (Phase 5 --
         Secure Group Key Distribution) is the KeyManager lookup
-        identity -- always the real conversation_id, resolved via
-        ConversationStore for a direct message (a cache hit in the
-        common case: the conversation was already opened, or a
-        message was already exchanged, either of which already
-        resolved it).
+        identity -- always the real conversation_id.
+
+        D3.2 -- Conversation Operations Migration: for a direct
+        message, key_conversation_id now comes straight from
+        direct_conversation_id, resolved server-side before this
+        packet was ever relayed (see server/client_handler.py --
+        the server derives it from the authenticated sender and the
+        matched recipient, never from anything client-supplied). This
+        runs on the receiver thread, so it must never call
+        ConversationStore.ensure_direct_conversation_id() (a database
+        round trip) -- that's exactly the deadlock risk this migration
+        removes; only the DB-free ConversationStore.
+        record_direct_conversation_id() is used here, to keep the
+        sidebar's cached id in sync with what the server already
+        resolved. The group case (conversation_id already present on
+        the packet) is completely unchanged.
         """
 
         sender = packet["sender"]
@@ -1640,12 +1651,29 @@ class ClientSession(QObject):
 
         identity_key = conversation_id if is_group else sender
 
-        key_conversation_id = (
-            conversation_id if is_group
-            else self.conversation_store.ensure_direct_conversation_id(
-                self.user_id, sender
-            )
-        )
+        if is_group:
+
+            key_conversation_id = conversation_id
+
+        else:
+
+            key_conversation_id = packet.get("direct_conversation_id")
+
+            if not key_conversation_id:
+
+                self.logger.error(
+                    f"No direct_conversation_id supplied by the server "
+                    f"for a direct chat packet from {sender} -- this is "
+                    f"a protocol/server problem, not a missing key; "
+                    f"treating it like an undecryptable message rather "
+                    f"than resolving the conversation locally."
+                )
+
+            else:
+
+                self.conversation_store.record_direct_conversation_id(
+                    sender, key_conversation_id
+                )
 
         encrypted_message = packet["message"]
 
@@ -1799,9 +1827,27 @@ class ClientSession(QObject):
     def handle_session_key(self, packet):
         """
         Store an incoming direct session key under the real
-        conversation_id (Phase 5), resolved via ConversationStore --
-        never looked up or cached here. Decryption/decapsulation
-        itself is unrelated to conversation identity and unchanged.
+        conversation_id. Decryption/decapsulation itself is unrelated
+        to conversation identity and unchanged.
+
+        D3.2 -- Conversation Operations Migration: conversation_id now
+        comes straight from the packet -- resolved server-side before
+        relay, from the authenticated sender and the matched
+        recipient, never from anything client-supplied (see
+        server/client_handler.py). This runs on the receiver thread,
+        so it must never call ConversationStore.
+        ensure_direct_conversation_id() (a database round trip) --
+        that's exactly the deadlock risk this migration removes.
+        record_direct_conversation_id() (DB-free) keeps the sidebar's
+        cached id in sync with what the server already resolved.
+
+        A missing conversation_id is treated as an invalid server
+        response, not a locally-recoverable condition: logged clearly
+        and the packet discarded before any decapsulation/decryption
+        work happens or anything is stored under a useless key --
+        there is no equivalent of handle_chat()'s "no session key yet,
+        retry" path here, since establishing a key is exactly what
+        this method exists to do.
 
         ``epoch`` (key-desynchronization fix): the epoch the sender
         reserved for this key (see establish_session_key()'s
@@ -1817,8 +1863,21 @@ class ClientSession(QObject):
 
         sender = packet["sender"]
 
-        conversation_id = self.conversation_store.ensure_direct_conversation_id(
-            self.user_id, sender
+        conversation_id = packet.get("conversation_id")
+
+        if not conversation_id:
+
+            self.logger.error(
+                f"No conversation_id supplied by the server for a "
+                f"session_key packet from {sender} -- this is a "
+                f"protocol/server problem; discarding the packet "
+                f"rather than resolving the conversation locally."
+            )
+
+            return
+
+        self.conversation_store.record_direct_conversation_id(
+            sender, conversation_id
         )
 
         algorithm = packet.get(

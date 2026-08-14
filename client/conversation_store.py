@@ -172,17 +172,25 @@ class ConversationStore(QObject):
         Resolve the real conversation_id for a direct conversation
         with ``username``, creating it if it doesn't exist yet, and
         cache it on the stored summary so every later call is a plain
-        dictionary lookup, not a database round trip.
+        dictionary lookup, not a database round trip. Caching itself
+        is delegated to record_direct_conversation_id() below.
 
         This is intentionally the ONE place in the client that ever
-        resolves or creates a direct conversation's identity --
-        ConversationRepository owns persistence, this method is the
-        sole caller of it for this purpose, and ClientSession (Phase 5
-        -- Secure Group Key Distribution) never performs a database
-        lookup or keeps a second cache; it only ever calls this and
-        consumes the result. A group conversation never needs this --
-        its conversation_id is already known synchronously at
-        creation (see add_or_update_group()).
+        resolves or creates a direct conversation's identity via the
+        database -- ConversationRepository owns persistence, this
+        method is the sole caller of it for this purpose. It remains
+        the only path for the two GUI-thread callers that don't
+        already have an id from elsewhere (load_conversation_history(),
+        set_current_chat()). ClientSession's receiver-thread packet
+        handlers (D3.2 -- Conversation Operations Migration:
+        handle_chat()/handle_session_key()) no longer call this at
+        all -- the server now resolves a direct conversation's
+        identity before ever relaying the packet, so those two callers
+        use record_direct_conversation_id() directly with the
+        server-supplied id instead, never touching the database from
+        the receiver thread. A group conversation never needs either
+        method -- its conversation_id is already known synchronously
+        at creation (see add_or_update_group()).
 
         Design note for future growth: if conversation lifecycle
         responsibilities expand significantly (group administration,
@@ -220,6 +228,37 @@ class ConversationStore(QObject):
         finally:
             db.close()
 
+        self.record_direct_conversation_id(username, conversation_id)
+
+        return conversation_id
+
+    def record_direct_conversation_id(self, username, conversation_id):
+        """
+        Cache an already-resolved direct conversation id -- no database
+        access (D3.2 -- Conversation Operations Migration: the DB-free
+        half of ensure_direct_conversation_id() above, extracted so a
+        caller that already has the id -- a server-supplied packet
+        field, see ClientSession.handle_chat()/handle_session_key() --
+        never needs the DB-touching half at all, and in particular
+        never needs it from the receiver thread, where a database call
+        is not just wasteful but the deadlock risk this migration
+        exists to remove). ensure_direct_conversation_id() itself calls
+        this for its own caching step -- this is the same behavior it
+        always had, just named and shared rather than duplicated.
+
+        Creates a fresh, online placeholder summary if none exists yet
+        for ``username``, otherwise updates the existing one's
+        conversation_id in place -- exactly matching
+        ensure_direct_conversation_id()'s prior inline behavior; every
+        other field of an existing summary (latest_message, is_online,
+        group fields) is left untouched. Always emits
+        conversations_changed: both branches represent a real,
+        externally-observable change (a conversation either just
+        became known to this client, or just gained/confirmed its id).
+        """
+
+        existing = self._summaries.get(username)
+
         if existing is not None:
             existing.conversation_id = conversation_id
         else:
@@ -231,8 +270,6 @@ class ConversationStore(QObject):
             )
 
         self.conversations_changed.emit()
-
-        return conversation_id
 
     def update_online_status(self, usernames_online):
         """
