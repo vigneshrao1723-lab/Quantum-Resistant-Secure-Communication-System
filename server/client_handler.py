@@ -29,6 +29,7 @@ from utils.network import receive_message
 from utils.protocol import (
     create_auth_result_packet,
     create_delivery_failure_packet,
+    create_direct_conversation_result_packet,
     create_group_create_result_packet,
     create_group_key_rotation_required_packet,
     create_group_member_left_packet,
@@ -1225,6 +1226,89 @@ def handle_logout_request(state, client_socket, user, packet):
         )
 
 
+def handle_direct_conversation_request(state, client_socket, user, packet):
+    """
+    Get-or-create the direct conversation between the authenticated
+    connection and a named partner (D3.3 -- Conversation Operations
+    Migration), on demand. This is the request/response counterpart to
+    what D3.1 already resolves automatically ahead of a direct chat/
+    session_key relay -- needed here for the one client-side caller
+    that isn't triggered by an incoming packet at all: ClientSession.
+    set_current_chat() opening a chat with someone never messaged
+    before (a genuine "create", unlike every other former caller of
+    ConversationStore.ensure_direct_conversation_id(), which either
+    already has the id from a relayed packet since D3.2, or is left
+    for a later slice).
+
+    Security: the caller's own half of the pair is always user.id --
+    the authenticated identity from the JWT validated at
+    authenticate_connection() time -- never anything read from the
+    packet. The partner is chosen by username, exactly like the
+    receiver of a chat packet or the identifier on a login_request;
+    that field addresses who the caller wants to interact with, it is
+    never a source of identity for the caller itself.
+
+    Reuses _resolve_direct_conversation_id() completely unchanged --
+    the exact same pg_advisory_xact_lock()-protected path D3.1 already
+    uses for live relay -- so a request from here and a simultaneous
+    first message between the same pair still safely converge on one
+    conversation.
+
+    A missing request_id is silently ignored, mirroring every other
+    D2/D3 handler's identical guard. A username that doesn't resolve
+    to a real user reports an error field rather than crashing or
+    silently creating something -- mirrors ensure_direct_conversation_id()'s
+    existing "Unknown user" contract, now surfaced over the wire
+    instead of a local exception. A username that resolves to the
+    caller's own account also reports an error field instead of
+    reaching _resolve_direct_conversation_id() -- a self-pair would
+    violate ConversationMember's (conversation_id, user_id) uniqueness
+    constraint there. Usernames are not treated as secret
+    here (unlike user_lookup_request's id-based lookup) -- they are
+    already freely addressable and observable elsewhere in this
+    protocol (the online user list, a chat packet's receiver field),
+    so reporting "unknown" plainly introduces no new enumeration risk.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    username = packet.get("username")
+
+    db = SessionLocal()
+
+    try:
+        partner = UserRepository(db).get_by_username(username)
+    finally:
+        db.close()
+
+    if partner is None:
+        response = create_direct_conversation_result_packet(
+            request_id=request_id,
+            error=f"Unknown user: {username}",
+        )
+    elif partner.id == user.id:
+        response = create_direct_conversation_result_packet(
+            request_id=request_id,
+            error="Cannot open a conversation with yourself.",
+        )
+    else:
+        conversation_id = _resolve_direct_conversation_id(user.id, partner.id)
+
+        response = create_direct_conversation_result_packet(
+            request_id=request_id,
+            conversation_id=conversation_id,
+        )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send direct_conversation_result to {user.username} "
+            f"(request_id={request_id})"
+        )
+
+
 def authenticate_connection(state, client_socket, client_address):
     """
     Receive and validate the client's JWT access token.
@@ -1776,6 +1860,13 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "logout_request":
 
                 handle_logout_request(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Direct Conversation Request (D3.3)
+            # -----------------------------
+            elif packet.get("type") == "direct_conversation_request":
+
+                handle_direct_conversation_request(state, client_socket, user, packet)
 
     except Exception as e:
 

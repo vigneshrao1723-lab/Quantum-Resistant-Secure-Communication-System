@@ -9,20 +9,41 @@ ends up addressed by the real conversation_id, resolved without
 ClientSession ever touching the database itself, and cached so a
 second resolution is free.
 
+D3.3 -- Conversation Operations Migration: set_current_chat() no
+longer calls ConversationStore.ensure_direct_conversation_id() (a
+direct database round trip) for a direct conversation with no cached
+id yet -- it now asks the server via a direct_conversation_request
+(D1's send_request()), which requires a real, connected, authenticated
+ClientSession rather than the bare one this file used before. Only
+test_set_current_chat_resolves_conversation_id_for_a_new_direct_summary()
+below needed that upgrade; ensure_direct_conversation_id() itself is
+unchanged (still the direct-DB path load_conversation_history() uses),
+so the other tests in this file are untouched.
+
 Run with:
     pytest tests/test_conversation_store_key_resolution.py -v
 """
 
+import socket
+import threading
 import uuid
 
+import pytest
+
+import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
-from auth.schemas import RegisterRequest
+from auth.schemas import LoginRequest, RegisterRequest
 from client.conversation_store import ConversationStore
 from client.session import ClientSession
 from database.connection import SessionLocal
+from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
+from security.tls import build_server_context
+from server.client_handler import handle_client
+from server.server_state import ServerState
+from tests.tls_test_support import serve_tls_client
 
 
 def _register_user(suffix_hint=""):
@@ -56,6 +77,82 @@ def _delete_user(username):
             db.commit()
     finally:
         db.close()
+
+
+@pytest.fixture()
+def running_server():
+    state = ServerState()
+
+    tls_context = build_server_context()
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(("127.0.0.1", 0))
+    server_socket.listen()
+    port = server_socket.getsockname()[1]
+
+    stop = threading.Event()
+    handler_threads = []
+
+    def accept_loop():
+        server_socket.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                client_socket, addr = server_socket.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            handler_thread = threading.Thread(
+                target=serve_tls_client,
+                args=(handle_client, state, client_socket, addr, state.logger),
+                kwargs={"context": tls_context},
+                daemon=True,
+            )
+            handler_thread.start()
+            handler_threads.append(handler_thread)
+
+    accept_thread = threading.Thread(target=accept_loop, daemon=True)
+    accept_thread.start()
+
+    yield state, port
+
+    stop.set()
+    server_socket.close()
+    accept_thread.join(timeout=2)
+
+    for handler_thread in handler_threads:
+        handler_thread.join(timeout=2)
+
+
+def _login_and_get_token(payload):
+    db = SessionLocal()
+    try:
+        auth_service = AuthenticationService(db)
+        result = auth_service.authenticate_user(
+            LoginRequest(identifier=payload["username"], password=payload["password"])
+        )
+        assert result.success, result.errors
+        return result.token_pair.access_token
+    finally:
+        db.close()
+
+
+def _make_connected_session(payload):
+    """Real ClientSession: connect() -> login() -> send_public_key()
+    -> start_receiver(), exactly gui/main_window.py::
+    start_chat_session()'s sequence -- required because
+    set_current_chat() now uses send_request() (D3.3), which can only
+    be resolved by a running receiver thread reading real socket
+    data."""
+    session = ClientSession()
+    session.user_id = payload["user_id"]
+    session.access_token = _login_and_get_token(payload)
+    session.connect()
+    session.login(payload["username"])
+    session.send_public_key()
+    session.start_receiver()
+    return session
 
 
 def test_ensure_direct_conversation_id_creates_and_caches():
@@ -103,19 +200,25 @@ def test_ensure_direct_conversation_id_updates_existing_summary():
         _delete_user(b["username"])
 
 
-def test_set_current_chat_resolves_conversation_id_for_a_new_direct_summary():
+def test_set_current_chat_resolves_conversation_id_for_a_new_direct_summary(
+    running_server, monkeypatch
+):
     """The full ClientSession-facing claim: opening a brand-new direct
     conversation (conversation_id unknown) leaves current_conversation_id
-    populated with a real id, ready for KeyManager -- with zero database
-    code inside ClientSession itself (only conversation_store is called)."""
+    populated with a real id, ready for KeyManager. D3.3 -- Conversation
+    Operations Migration: this now goes through a real
+    direct_conversation_request/result round trip rather than a local
+    database call -- proved here with a real running server and a real,
+    connected, authenticated ClientSession, not a bare one."""
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     a = _register_user("a_")
     b = _register_user("b_")
 
-    try:
-        session = ClientSession()
-        session.user_id = a["user_id"]
-        session.username = a["username"]
+    session = _make_connected_session(a)
 
+    try:
         summary = ConversationSummary(
             conversation_id=None,
             username=b["username"],
@@ -130,13 +233,27 @@ def test_set_current_chat_resolves_conversation_id_for_a_new_direct_summary():
         assert session.current_conversation_id is not None
         uuid.UUID(session.current_conversation_id)
 
-        # Matches what ensure_direct_conversation_id() would itself
-        # resolve for the same pair -- single source of truth.
-        expected = session.conversation_store.ensure_direct_conversation_id(
-            a["user_id"], b["username"]
-        )
-        assert session.current_conversation_id == expected
+        # Matches what ConversationRepository would itself resolve for
+        # the same pair -- single source of truth, now server-side --
+        # cross-checked directly against the database, independent of
+        # ClientSession's own code.
+        db = SessionLocal()
+        try:
+            expected = ConversationRepository(db)._find_direct_conversation(
+                uuid.UUID(a["user_id"]), uuid.UUID(b["user_id"])
+            )
+            assert expected is not None
+            assert session.current_conversation_id == str(expected.id)
+        finally:
+            db.close()
+
+        # Cached client-side too, exactly as ensure_direct_conversation_id()
+        # would have left it.
+        cached_summary = session.conversation_store.get(b["username"])
+        assert cached_summary is not None
+        assert cached_summary.conversation_id == session.current_conversation_id
     finally:
+        session.disconnect()
         _delete_user(a["username"])
         _delete_user(b["username"])
 

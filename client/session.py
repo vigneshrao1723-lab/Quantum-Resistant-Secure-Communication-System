@@ -50,6 +50,7 @@ from storage import encrypted_blob_store
 from utils.network import receive_message, send_message
 from utils.protocol import (
     create_auth_packet,
+    create_direct_conversation_request_packet,
     create_group_add_members_packet,
     create_group_create_packet,
     create_group_key_distribution_packet,
@@ -2300,6 +2301,48 @@ class ClientSession(QObject):
         """
         return self.online_users
 
+    def _resolve_direct_conversation_id(self, username):
+        """
+        Ask the server to get-or-create the direct conversation with
+        ``username`` (D3.3 -- Conversation Operations Migration), via
+        D1's send_request(). This is the one remaining case that
+        needed a database round trip anywhere in ClientSession: every
+        other former caller of ConversationStore.
+        ensure_direct_conversation_id() either already has the id from
+        a relayed packet (D3.2) or is migrated in a later slice
+        (load_conversation_history(), still direct-DB for now -- see
+        that method's own docstring). Only ever called from the GUI
+        thread (set_current_chat(), below) -- send_request() would
+        deadlock if ever called from the receiver thread.
+
+        Caches the result via ConversationStore.
+        record_direct_conversation_id() (DB-free) -- the same caching
+        step ensure_direct_conversation_id() itself still performs for
+        its own remaining caller, so both paths leave the sidebar in
+        an identical state.
+
+        Raises ValueError (matching ensure_direct_conversation_id()'s
+        existing contract exactly) if the server reports the username
+        doesn't resolve to a real user.
+        """
+
+        response = self.send_request(
+            create_direct_conversation_request_packet(username)
+        )
+
+        error = response.get("error")
+
+        if error:
+            raise ValueError(error)
+
+        conversation_id = response.get("conversation_id")
+
+        self.conversation_store.record_direct_conversation_id(
+            username, conversation_id
+        )
+
+        return conversation_id
+
     def set_current_chat(self, summary):
         """
         Select the active conversation from its ConversationSummary
@@ -2316,9 +2359,11 @@ class ClientSession(QObject):
         conversation_id, direct or group alike -- the only identity
         ever passed to KeyManager from this point on. For a group it's
         already known (summary.conversation_id). For a direct
-        conversation it's resolved via ConversationStore -- which may
-        create it, for a conversation with no messages yet -- never
-        looked up or cached by ClientSession itself.
+        conversation with no cached id yet, it's resolved via
+        _resolve_direct_conversation_id() (D3.3 -- Conversation
+        Operations Migration: a server request/response, which may
+        create the conversation server-side for one with no messages
+        yet -- never a direct database lookup here).
         """
 
         self.current_chat = summary.key
@@ -2327,10 +2372,8 @@ class ClientSession(QObject):
         if summary.is_group or summary.conversation_id is not None:
             self.current_conversation_id = summary.conversation_id
         else:
-            self.current_conversation_id = (
-                self.conversation_store.ensure_direct_conversation_id(
-                    self.user_id, summary.username
-                )
+            self.current_conversation_id = self._resolve_direct_conversation_id(
+                summary.username
             )
 
     def get_current_chat(self):

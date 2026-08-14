@@ -541,6 +541,51 @@ def create_logout_result_packet(request_id, success, message):
     }
 
 
+def create_direct_conversation_request_packet(username):
+    """
+    Ask the server to get-or-create the direct conversation with
+    ``username`` (D3.3 -- Conversation Operations Migration). This is
+    the request/response counterpart to what D3.1 already resolves
+    automatically ahead of a direct chat/session_key relay -- used for
+    the one remaining case that isn't triggered by an incoming packet:
+    ClientSession.set_current_chat() opening a chat with someone never
+    messaged before. Carries only the partner's username -- who the
+    caller itself is comes from the authenticated connection
+    server-side, never from this packet. request_id is attached by
+    ClientSession.send_request() itself, never set here.
+    """
+
+    return {
+        "type": "direct_conversation_request",
+        "username": username
+    }
+
+
+def create_direct_conversation_result_packet(
+    request_id,
+    conversation_id=None,
+    error=None
+):
+    """
+    Server -> client: the result of a direct_conversation_request
+    (D3.3). ``conversation_id`` is set on success; ``error`` is set
+    (and conversation_id left None) if the given username doesn't
+    resolve to a real user -- mirrors ConversationStore.
+    ensure_direct_conversation_id()'s existing "unknown user" contract
+    (a raised ValueError), now surfaced as a field over the wire
+    instead of a local exception. request_id is echoed from the
+    request so ClientSession.send_request()'s pending correlation
+    resolves.
+    """
+
+    return {
+        "type": "direct_conversation_result",
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "error": error
+    }
+
+
 def create_delivery_failure_packet(
     receiver,
     reason="User is offline."

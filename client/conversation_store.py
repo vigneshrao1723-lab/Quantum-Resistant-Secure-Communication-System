@@ -178,19 +178,22 @@ class ConversationStore(QObject):
         This is intentionally the ONE place in the client that ever
         resolves or creates a direct conversation's identity via the
         database -- ConversationRepository owns persistence, this
-        method is the sole caller of it for this purpose. It remains
-        the only path for the two GUI-thread callers that don't
-        already have an id from elsewhere (load_conversation_history(),
-        set_current_chat()). ClientSession's receiver-thread packet
-        handlers (D3.2 -- Conversation Operations Migration:
-        handle_chat()/handle_session_key()) no longer call this at
-        all -- the server now resolves a direct conversation's
-        identity before ever relaying the packet, so those two callers
-        use record_direct_conversation_id() directly with the
-        server-supplied id instead, never touching the database from
-        the receiver thread. A group conversation never needs either
-        method -- its conversation_id is already known synchronously
-        at creation (see add_or_update_group()).
+        method is the sole caller of it for this purpose. Its only
+        remaining caller is ClientSession.load_conversation_history()
+        -- always a "get" there (only reached once messages already
+        exist, meaning the conversation was necessarily already
+        created), left as direct database access until that method's
+        own migration. Every other former caller now avoids the
+        database here entirely: ClientSession's receiver-thread packet
+        handlers (D3.2: handle_chat()/handle_session_key()) use
+        record_direct_conversation_id() directly with a server-
+        supplied id, and ClientSession.set_current_chat() (D3.3: the
+        one former caller here that was a genuine "create") now asks
+        the server via a direct_conversation_request instead (see
+        ClientSession._resolve_direct_conversation_id()). A group
+        conversation never needs either method -- its conversation_id
+        is already known synchronously at creation (see
+        add_or_update_group()).
 
         Design note for future growth: if conversation lifecycle
         responsibilities expand significantly (group administration,
