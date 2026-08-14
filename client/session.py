@@ -30,7 +30,6 @@ from config import (
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
 from database.connection import SessionLocal
-from database.models.conversation import Conversation
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.user_repository import UserRepository
@@ -50,6 +49,7 @@ from storage import encrypted_blob_store
 from utils.network import receive_message, send_message
 from utils.protocol import (
     create_auth_packet,
+    create_conversation_list_request_packet,
     create_direct_conversation_request_packet,
     create_epoch_reservation_request_packet,
     create_group_add_members_packet,
@@ -1351,7 +1351,7 @@ class ClientSession(QObject):
             "display_name": response["display_name"],
         }
 
-    def _build_latest_message_preview(self, conversation_id, latest_message_row):
+    def _build_latest_message_preview(self, conversation_id, latest_message):
         """
         Build the sidebar MessagePreview for one conversation's latest
         stored message (Phase 8 -- File & Image Transfer extends this
@@ -1360,15 +1360,24 @@ class ClientSession(QObject):
         content_metadata (e.g. filename) to show "\U0001F4C4 report.pdf",
         not the decrypted bytes themselves, so the sidebar stays cheap
         regardless of attachment size.
+
+        D4.2 -- Message/History Operations Migration: ``latest_message``
+        is now the server-supplied dict from a conversation_list_result
+        packet's per-conversation entry (see load_conversations()),
+        never a live Message ORM row -- every field this method reads
+        was already opaque/non-secret to begin with (payload_type,
+        epoch, timestamp, content_metadata, and TEXT's own already-
+        encrypted ciphertext), so nothing about what is exposed
+        changes, only where it comes from.
         """
 
-        payload_type = latest_message_row.payload_type or PayloadType.TEXT
+        payload_type = latest_message.get("payload_type") or PayloadType.TEXT
 
         text = (
             self._decrypt_history_message(
                 conversation_id,
-                latest_message_row.ciphertext,
-                epoch=latest_message_row.epoch or 1,
+                latest_message.get("ciphertext"),
+                epoch=latest_message.get("epoch") or 1,
             )
             if payload_type == PayloadType.TEXT
             else None
@@ -1377,90 +1386,98 @@ class ClientSession(QObject):
         return MessagePreview(
             payload_type=payload_type,
             text=text,
-            timestamp=latest_message_row.timestamp,
-            content_metadata=latest_message_row.content_metadata or {},
+            timestamp=self._parse_incoming_timestamp(latest_message.get("timestamp")),
+            content_metadata=latest_message.get("content_metadata") or {},
         )
 
     def load_conversations(self):
         """
-        Load this user's conversations from PostgreSQL into
-        conversation_store -- the single source of truth for sidebar
-        state (see client/conversation_store.py). Called once, at
-        chat startup; from then on the store is updated incrementally
-        by send_chat_message(), handle_chat(), and handle_user_list(),
+        Load this user's conversations into conversation_store -- the
+        single source of truth for sidebar state (see
+        client/conversation_store.py). Called once, at chat startup;
+        from then on the store is updated incrementally by
+        send_chat_message(), handle_chat(), and handle_user_list(),
         never by another full reload.
+
+        D4.2 -- Message/History Operations Migration: resolved via a
+        server request/response (conversation_list_request/result,
+        via D1's send_request()) rather than a direct, local
+        ConversationRepository.get_conversation_previews_for_user()
+        call -- the last remaining client-side database read for the
+        sidebar's initial population. The server reuses that exact
+        same repository method unchanged, already scoped to the
+        authenticated connection's own user.id; there is no
+        client-supplied identity for a malicious client to forge here
+        (create_conversation_list_request_packet() carries no fields
+        at all).
 
         Reuses the existing best-effort decrypt helper
         (_decrypt_history_message) -- no new cryptography.
         """
 
-        db = SessionLocal()
+        response = self.send_request(create_conversation_list_request_packet())
 
-        try:
-            conversation_repo = ConversationRepository(db)
+        conversations = response.get("conversations") or []
 
-            previews = conversation_repo.get_conversation_previews_for_user(
-                uuid.UUID(self.user_id)
-            )
+        summaries = []
 
-            summaries = []
+        for conversation in conversations:
 
-            for preview in previews:
+            latest_message_data = conversation.get("latest_message")
 
-                if preview.conversation.type == Conversation.TYPE_GROUP:
+            if conversation.get("is_group"):
 
-                    conversation_id = str(preview.conversation.id)
-                    participant_usernames = [p.username for p in preview.participants]
-
-                    latest_message = None
-
-                    if preview.latest_message is not None:
-                        latest_message = self._build_latest_message_preview(
-                            conversation_id, preview.latest_message
-                        )
-
-                    summaries.append(
-                        ConversationSummary(
-                            conversation_id=conversation_id,
-                            username=None,
-                            is_online=False,
-                            latest_message=latest_message,
-                            is_group=True,
-                            group_name=preview.conversation.name,
-                            participants=participant_usernames,
-                        )
-                    )
-
-                    continue
-
-                partner = preview.participants[0] if preview.participants else None
-
-                if partner is None:
-                    continue
+                conversation_id = conversation["conversation_id"]
+                participant_usernames = conversation.get("participants") or []
 
                 latest_message = None
 
-                if preview.latest_message is not None:
-
-                    # The real conversation_id, already known from
-                    # this query -- the KeyManager identity (Phase 5),
-                    # not the partner's username.
+                if latest_message_data is not None:
                     latest_message = self._build_latest_message_preview(
-                        str(preview.conversation.id), preview.latest_message
+                        conversation_id, latest_message_data
                     )
 
                 summaries.append(
                     ConversationSummary(
-                        conversation_id=str(preview.conversation.id),
-                        username=partner.username,
-                        is_online=partner.username in self.online_users,
+                        conversation_id=conversation_id,
+                        username=None,
+                        is_online=False,
                         latest_message=latest_message,
+                        is_group=True,
+                        group_name=conversation.get("group_name"),
+                        participants=participant_usernames,
                     )
                 )
 
-            self.conversation_store.set_initial(summaries)
-        finally:
-            db.close()
+                continue
+
+            participants = conversation.get("participants") or []
+            partner_username = participants[0] if participants else None
+
+            if partner_username is None:
+                continue
+
+            latest_message = None
+
+            if latest_message_data is not None:
+
+                # The real conversation_id, already known from this
+                # response -- the KeyManager identity (Phase 5), not
+                # the partner's username.
+                latest_message = self._build_latest_message_preview(
+                    conversation["conversation_id"], latest_message_data
+                )
+
+            summaries.append(
+                ConversationSummary(
+                    conversation_id=conversation["conversation_id"],
+                    username=partner_username,
+                    is_online=partner_username in self.online_users,
+                    latest_message=latest_message,
+                )
+            )
+
+        self.conversation_store.set_initial(summaries)
 
     @staticmethod
     def _parse_incoming_timestamp(raw_timestamp):

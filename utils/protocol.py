@@ -630,6 +630,53 @@ def create_epoch_reservation_result_packet(
     }
 
 
+def create_conversation_list_request_packet():
+    """
+    Ask the server for every conversation the authenticated caller
+    currently belongs to (D4.2 -- Message/History Operations
+    Migration, second slice). Replaces ClientSession.
+    load_conversations()'s previous direct, client-side
+    ConversationRepository.get_conversation_previews_for_user() call --
+    the last remaining client-side database read for the sidebar's
+    initial population. Carries no fields at all -- which user's
+    conversations to return comes entirely from the authenticated
+    connection server-side, mirroring create_logout_request_packet()'s
+    identical "nothing here a malicious client could forge" shape.
+    request_id is attached by ClientSession.send_request() itself,
+    never set here.
+    """
+
+    return {
+        "type": "conversation_list_request"
+    }
+
+
+def create_conversation_list_result_packet(request_id, conversations):
+    """
+    Server -> client: the result of a conversation_list_request
+    (D4.2). ``conversations`` is a list of plain dicts, one per
+    conversation the caller belongs to, each shaped to carry exactly
+    what ClientSession.load_conversations()/_build_latest_message_preview()
+    need to reconstruct a ConversationSummary/MessagePreview --
+    everything ConversationRepository.get_conversation_previews_for_user()
+    already returned as ORM rows, now serialized:
+    {conversation_id, is_group, group_name, participants,
+    latest_message: {payload_type, ciphertext, epoch, timestamp,
+    content_metadata} | None}. ``ciphertext``/``content_metadata`` stay
+    exactly as opaque here as they were as a direct database read --
+    decryption remains entirely client-side; nothing here is
+    decrypted, inspected, or altered by the server. request_id is
+    echoed from the request so ClientSession.send_request()'s pending
+    correlation resolves.
+    """
+
+    return {
+        "type": "conversation_list_result",
+        "request_id": request_id,
+        "conversations": conversations
+    }
+
+
 def create_delivery_failure_packet(
     receiver,
     reason="User is offline."

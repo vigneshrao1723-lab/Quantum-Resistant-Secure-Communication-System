@@ -161,8 +161,14 @@ class MainWindow(QMainWindow):
             self.session.connect()
             self.session.login(username)
             self.session.send_public_key()
-            self.show_chat()
+            # D4.2 -- Message/History Operations Migration:
+            # show_chat() constructs ChatWindow, whose initialize_ui()
+            # calls ClientSession.load_conversations() synchronously --
+            # which now blocks on send_request(), resolvable only by
+            # the receiver thread. The receiver must therefore already
+            # be running before show_chat() is reached, not after.
             self.session.start_receiver()
+            self.show_chat()
         except Exception as error:
             self.login_window.show_connection_error(str(error))
 

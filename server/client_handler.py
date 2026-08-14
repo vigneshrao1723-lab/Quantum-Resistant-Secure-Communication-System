@@ -28,6 +28,7 @@ from storage import encrypted_blob_store
 from utils.network import receive_message
 from utils.protocol import (
     create_auth_result_packet,
+    create_conversation_list_result_packet,
     create_delivery_failure_packet,
     create_direct_conversation_result_packet,
     create_epoch_reservation_result_packet,
@@ -1402,6 +1403,98 @@ def handle_epoch_reservation_request(state, client_socket, user, packet):
         )
 
 
+def handle_conversation_list_request(state, client_socket, user, packet):
+    """
+    Return every conversation the authenticated connection currently
+    belongs to (D4.2 -- Message/History Operations Migration, second
+    slice), replacing ClientSession.load_conversations()'s previous
+    direct, client-side ConversationRepository.
+    get_conversation_previews_for_user() call -- the last remaining
+    client-side database read for the sidebar's initial population.
+
+    Security: the caller's identity is always user.id -- the
+    authenticated identity from the JWT validated at
+    authenticate_connection() time -- never anything read from the
+    packet (this request carries no fields at all). Unlike D4.1's
+    epoch reservation, no additional membership check is needed here:
+    get_conversation_previews_for_user() is already fully scoped to
+    exactly one user_id -- there is no "list someone else's
+    conversations" surface for a client-supplied id to have ever
+    reached, since the id was never client-supplied in the first
+    place.
+
+    Reuses ConversationRepository.get_conversation_previews_for_user()
+    completely unchanged. Each row is serialized into a plain dict --
+    conversation_id, is_group, group_name, participants (usernames),
+    and an optional latest_message (payload_type, ciphertext, epoch,
+    timestamp, content_metadata) -- mirroring exactly what
+    ClientSession.load_conversations()/_build_latest_message_preview()
+    used to read directly off the ORM rows. ``ciphertext`` is only
+    ever this already-encrypted, opaque value -- decryption stays
+    entirely client-side; the server does not decrypt, inspect, or
+    alter it. A FILE/IMAGE latest_message's ciphertext is None here
+    exactly as it is in the database (see persist_message()) --
+    previews never need blob content, only payload_type/
+    content_metadata (e.g. filename) to render.
+
+    A missing request_id is silently ignored, mirroring every other
+    D2/D3/D4 handler's identical guard.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+
+        previews = conversation_repo.get_conversation_previews_for_user(user.id)
+
+        conversations = []
+
+        for preview in previews:
+
+            is_group = preview.conversation.type == Conversation.TYPE_GROUP
+
+            latest_message = None
+
+            if preview.latest_message is not None:
+
+                latest_message = {
+                    "payload_type": preview.latest_message.payload_type,
+                    "ciphertext": preview.latest_message.ciphertext,
+                    "epoch": preview.latest_message.epoch,
+                    "timestamp": preview.latest_message.timestamp.isoformat(),
+                    "content_metadata": preview.latest_message.content_metadata or {},
+                }
+
+            conversations.append({
+                "conversation_id": str(preview.conversation.id),
+                "is_group": is_group,
+                "group_name": preview.conversation.name,
+                "participants": [
+                    participant.username for participant in preview.participants
+                ],
+                "latest_message": latest_message,
+            })
+    finally:
+        db.close()
+
+    response = create_conversation_list_result_packet(
+        request_id=request_id,
+        conversations=conversations,
+    )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send conversation_list_result to {user.username} "
+            f"(request_id={request_id})"
+        )
+
+
 def authenticate_connection(state, client_socket, client_address):
     """
     Receive and validate the client's JWT access token.
@@ -1967,6 +2060,13 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "epoch_reservation_request":
 
                 handle_epoch_reservation_request(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Conversation List Request (D4.2)
+            # -----------------------------
+            elif packet.get("type") == "conversation_list_request":
+
+                handle_conversation_list_request(state, client_socket, user, packet)
 
     except Exception as e:
 
