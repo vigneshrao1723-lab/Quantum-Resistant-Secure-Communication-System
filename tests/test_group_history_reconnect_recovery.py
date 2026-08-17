@@ -4,10 +4,16 @@ conversation history appearing to show "session expired" instead of
 previous messages.
 
 Diagnosis (given before implementation): no literal "session expired"
-text exists anywhere in gui/, and load_conversation_history() is a
-pure local-DB read that never touches the socket or the JWT -- a real
-auth-token expiry cannot affect it. What the user almost certainly saw
-is the existing, correctly-working placeholder
+text exists anywhere in gui/. At the time this diagnosis was written,
+load_conversation_history() was a pure local-DB read that never
+touched the socket or the JWT; D4.3 (Message/History Operations
+Migration) later moved it behind a server request/response, but the
+conclusion below is unaffected -- a valid, already-authenticated
+connection's history request cannot itself produce anything
+resembling "session expired" either, real auth-token expiry is
+handled entirely at connection time (authenticate_connection()), long
+before load_conversation_history() is ever reachable. What the user
+almost certainly saw is the existing, correctly-working placeholder
 (ClientSession._UNDECRYPTABLE_PLACEHOLDER, "Message unavailable
 (encrypted in a previous session)"). Two distinct situations sit
 behind it:
@@ -46,6 +52,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
@@ -56,6 +63,7 @@ from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
+from domain.conversation_summary import ConversationSummary
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import PayloadType
 from security.tls import build_server_context
@@ -559,20 +567,41 @@ def test_no_literal_session_expired_text_anywhere_in_the_flow(pair):
 # ----------------------------------------------------------------------
 
 
-def _make_bare_session(user_id, username):
+def _make_connected_session(payload):
+    """Real ClientSession: connect() -> login() -> send_public_key()
+    -> start_receiver() -- required because load_conversation_history()
+    now uses send_request() (D4.3), which can only be resolved by a
+    running receiver thread reading real socket data."""
     session = ClientSession()
-    session.user_id = user_id
-    session.username = username
+    session.user_id = payload["user_id"]
+    session.access_token = _login_and_get_token(payload)
+    session.connect()
+    session.login(payload["username"])
+    session.send_public_key()
+    session.start_receiver()
     return session
 
 
-def test_direct_history_placeholder_after_restart_is_not_an_auth_error(running_server):
+def _open_direct_chat(session, partner_username):
+    summary = ConversationSummary(
+        conversation_id=None, username=partner_username, is_online=True, latest_message=None,
+    )
+    session.set_current_chat(summary)
+
+
+def test_direct_history_placeholder_after_restart_is_not_an_auth_error(
+    running_server, monkeypatch
+):
     """The other half of Issue 4's diagnosis: a direct conversation's
     session key is ephemeral by design, so a fresh ClientSession
     genuinely has no key for it. The correct, tested behavior is the
     existing placeholder -- never an exception, never anything
-    resembling an authentication failure."""
+    resembling an authentication failure. D4.3: this now also proves
+    the same for the migrated request/response history path -- a
+    genuine server round trip on a real, freshly-reconnected session,
+    not just a local decrypt call."""
     _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
     sender_payload = _register_user("d_sender_")
     recipient_payload = _register_user("d_recipient_")
@@ -624,14 +653,16 @@ def test_direct_history_placeholder_after_restart_is_not_an_auth_error(running_s
         finally:
             message_repo_db.close()
 
-        # A brand-new ClientSession standing in for a full app restart
-        # -- no exception must escape, and the result must be the
-        # documented placeholder, not an empty list or a crash.
-        fresh_session = _make_bare_session(
-            recipient_payload["user_id"], recipient_payload["username"]
-        )
-
-        history = fresh_session.load_conversation_history(sender_payload["username"])
+        # A brand-new, really-reconnected ClientSession standing in
+        # for a full app restart -- no exception must escape, and the
+        # result must be the documented placeholder, not an empty
+        # list or a crash.
+        fresh_session = _make_connected_session(recipient_payload)
+        try:
+            _open_direct_chat(fresh_session, sender_payload["username"])
+            history = fresh_session.load_conversation_history(sender_payload["username"])
+        finally:
+            fresh_session.disconnect()
 
         assert len(history) == 1
         assert history[0]["text"] == (

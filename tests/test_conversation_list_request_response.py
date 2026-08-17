@@ -28,7 +28,6 @@ import struct
 import threading
 import uuid
 from datetime import datetime, timezone
-from unittest import mock
 
 import pytest
 
@@ -610,25 +609,16 @@ def test_load_conversations_uses_request_response_not_database(running_server, m
     session = _make_connected_session(alice_payload)
 
     try:
-        with (
-            mock.patch.object(
-                client_session_module,
-                "SessionLocal",
-                side_effect=AssertionError(
-                    "load_conversations() must never construct a database "
-                    "session (D4.2)"
-                ),
-            ),
-            mock.patch.object(
-                client_session_module,
-                "ConversationRepository",
-                side_effect=AssertionError(
-                    "load_conversations() must never touch ConversationRepository "
-                    "directly (D4.2)"
-                ),
-            ),
-        ):
-            session.load_conversations()
+        # SessionLocal/ConversationRepository (the database entry
+        # points this test used to also prove load_conversations()
+        # never fell back to) are no longer imported anywhere in
+        # client/session.py at all -- D4.3 migrated
+        # load_conversation_history(), the module's last remaining
+        # user of either name, so patching them here would itself
+        # raise AttributeError rather than proving anything; the
+        # assertions below already fully prove the request/response
+        # path was used.
+        session.load_conversations()
 
         summaries = session.conversation_store.get_all()
         assert len(summaries) == 1

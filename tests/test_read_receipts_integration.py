@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import select
 
+import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
@@ -35,6 +36,7 @@ from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
+from domain.conversation_summary import ConversationSummary
 from domain.message_delivery_status import MessageDeliveryStatus
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import PayloadType
@@ -236,14 +238,40 @@ def _connect_and_authenticate(port, user_payload):
     return sock, username
 
 
-def _make_session_for(user_id, username):
-    """A bare ClientSession standing in for a logged-in user -- see
-    test_message_persistence_integration.py's identical helper for
-    the full rationale."""
+def _make_connected_session(payload):
+    """Real ClientSession: connect() -> login() -> send_public_key()
+    -> start_receiver() -- required because load_conversation_history()
+    now uses send_request() (D4.3), which can only be resolved by a
+    running receiver thread reading real socket data. Replaces the
+    former bare _make_session_for() helper -- see
+    test_message_persistence_integration.py's identical helper for the
+    full rationale."""
     session = ClientSession()
-    session.user_id = user_id
-    session.username = username
+    session.user_id = payload["user_id"]
+    session.access_token = _login_and_get_token(payload)
+    session.connect()
+    session.login(payload["username"])
+    session.send_public_key()
+    session.start_receiver()
     return session
+
+
+def _open_direct_chat(session, partner_username):
+    summary = ConversationSummary(
+        conversation_id=None, username=partner_username, is_online=True, latest_message=None,
+    )
+    session.set_current_chat(summary)
+
+
+def _open_group_chat(session, conversation_id):
+    summary = ConversationSummary(
+        conversation_id=conversation_id,
+        username=None,
+        is_online=False,
+        latest_message=None,
+        is_group=True,
+    )
+    session.set_current_chat(summary)
 
 
 def _get_recipient_row(message_id, recipient_id):
@@ -315,6 +343,8 @@ def sender_and_recipient(running_server):
     yield {
         "sender": (sender_sock, sender_name, sender_payload["user_id"]),
         "recipient": (recipient_sock, recipient_name, recipient_payload["user_id"]),
+        "sender_payload": sender_payload,
+        "recipient_payload": recipient_payload,
     }
 
     sender_sock.close()
@@ -331,7 +361,12 @@ def trio(running_server):
     connections = [_connect_and_authenticate(port, p) for p in payloads]
 
     members = [
-        {"sock": sock, "username": username, "user_id": payload["user_id"]}
+        {
+            "sock": sock,
+            "username": username,
+            "user_id": payload["user_id"],
+            "payload": payload,
+        }
         for (sock, username), payload in zip(connections, payloads)
     ]
 
@@ -510,7 +545,12 @@ def test_read_receipt_marks_direct_message_read_and_notifies_sender(sender_and_r
     assert row.status == MessageDeliveryStatus.READ
 
 
-def test_read_status_survives_fresh_session_restart(sender_and_recipient):
+def test_read_status_survives_fresh_session_restart(
+    sender_and_recipient, running_server, monkeypatch
+):
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
     recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
@@ -526,12 +566,16 @@ def test_read_status_survives_fresh_session_restart(sender_and_recipient):
     )
     _wait_for_recipient_status(saved.id, uuid.UUID(recipient_id), MessageDeliveryStatus.READ)
 
-    # A brand-new ClientSession standing in for the sender logging
-    # back in after a full restart -- read_status must be re-derived
-    # from the database, not lost with the old process's memory.
-    fresh_sender_view = _make_session_for(sender_id, sender_name)
-
-    history = fresh_sender_view.load_conversation_history(recipient_name)
+    # A brand-new, really-reconnected ClientSession standing in for
+    # the sender logging back in after a full restart -- read_status
+    # must be re-derived from the database, not lost with the old
+    # process's memory.
+    fresh_sender_view = _make_connected_session(sender_and_recipient["sender_payload"])
+    try:
+        _open_direct_chat(fresh_sender_view, recipient_name)
+        history = fresh_sender_view.load_conversation_history(recipient_name)
+    finally:
+        fresh_sender_view.disconnect()
 
     assert len(history) == 1
     assert history[0]["is_own"] is True
@@ -656,7 +700,11 @@ def test_group_members_have_independent_read_states(trio):
 # ----------------------------------------------------------------------
 
 
-def test_group_message_fully_read_only_when_all_active_recipients_have_read(trio):
+def test_group_message_fully_read_only_when_all_active_recipients_have_read(
+    trio, monkeypatch
+):
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", trio["port"])
+
     creator, member_b, member_c = trio["members"]
     conversation_id = trio["conversation_id"]
 
@@ -666,32 +714,38 @@ def test_group_message_fully_read_only_when_all_active_recipients_have_read(trio
 
     _wait_for_group_message(uuid.UUID(conversation_id))
 
-    creator_view = _make_session_for(creator["user_id"], creator["username"])
+    creator_view = _make_connected_session(creator["payload"])
+    try:
+        _open_group_chat(creator_view, conversation_id)
 
-    history = creator_view.load_conversation_history(conversation_id, is_group=True)
-    assert history[-1]["read_status"] is False
+        history = creator_view.load_conversation_history(conversation_id, is_group=True)
+        assert history[-1]["read_status"] is False
 
-    _send(member_b["sock"], create_read_receipt_packet(conversation_id=conversation_id))
-    saved = _wait_for_group_message(uuid.UUID(conversation_id))
-    _wait_for_recipient_status(
-        saved.id, uuid.UUID(member_b["user_id"]), MessageDeliveryStatus.READ
-    )
+        _send(member_b["sock"], create_read_receipt_packet(conversation_id=conversation_id))
+        saved = _wait_for_group_message(uuid.UUID(conversation_id))
+        _wait_for_recipient_status(
+            saved.id, uuid.UUID(member_b["user_id"]), MessageDeliveryStatus.READ
+        )
 
-    # Only member_b has read -- member_c hasn't yet.
-    history = creator_view.load_conversation_history(conversation_id, is_group=True)
-    assert history[-1]["read_status"] is False
+        # Only member_b has read -- member_c hasn't yet.
+        history = creator_view.load_conversation_history(conversation_id, is_group=True)
+        assert history[-1]["read_status"] is False
 
-    _send(member_c["sock"], create_read_receipt_packet(conversation_id=conversation_id))
-    _wait_for_recipient_status(
-        saved.id, uuid.UUID(member_c["user_id"]), MessageDeliveryStatus.READ
-    )
+        _send(member_c["sock"], create_read_receipt_packet(conversation_id=conversation_id))
+        _wait_for_recipient_status(
+            saved.id, uuid.UUID(member_c["user_id"]), MessageDeliveryStatus.READ
+        )
 
-    # Every active recipient has now read it.
-    history = creator_view.load_conversation_history(conversation_id, is_group=True)
-    assert history[-1]["read_status"] is True
+        # Every active recipient has now read it.
+        history = creator_view.load_conversation_history(conversation_id, is_group=True)
+        assert history[-1]["read_status"] is True
+    finally:
+        creator_view.disconnect()
 
 
-def test_departed_member_does_not_block_all_read_condition(trio):
+def test_departed_member_does_not_block_all_read_condition(trio, monkeypatch):
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", trio["port"])
+
     creator, member_b, member_c = trio["members"]
     conversation_id = trio["conversation_id"]
 
@@ -718,8 +772,12 @@ def test_departed_member_does_not_block_all_read_condition(trio):
         saved.id, uuid.UUID(member_b["user_id"]), MessageDeliveryStatus.READ
     )
 
-    creator_view = _make_session_for(creator["user_id"], creator["username"])
-    history = creator_view.load_conversation_history(conversation_id, is_group=True)
+    creator_view = _make_connected_session(creator["payload"])
+    try:
+        _open_group_chat(creator_view, conversation_id)
+        history = creator_view.load_conversation_history(conversation_id, is_group=True)
+    finally:
+        creator_view.disconnect()
 
     # member_c's row is still whatever it was (never READ) -- but
     # since they're no longer active, that must not block "fully read".
@@ -731,8 +789,13 @@ def test_departed_member_does_not_block_all_read_condition(trio):
 # ----------------------------------------------------------------------
 
 
-def test_legacy_message_without_recipient_rows_has_none_read_status(sender_and_recipient):
-    _sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+def test_legacy_message_without_recipient_rows_has_none_read_status(
+    sender_and_recipient, running_server, monkeypatch
+):
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
+    _sender_sock, _sender_name, sender_id = sender_and_recipient["sender"]
     _recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
     # Persist a message directly, bypassing the server's C2
@@ -764,8 +827,12 @@ def test_legacy_message_without_recipient_rows_has_none_read_status(sender_and_r
     finally:
         db.close()
 
-    sender_view = _make_session_for(sender_id, sender_name)
-    history = sender_view.load_conversation_history(recipient_name)
+    sender_view = _make_connected_session(sender_and_recipient["sender_payload"])
+    try:
+        _open_direct_chat(sender_view, recipient_name)
+        history = sender_view.load_conversation_history(recipient_name)
+    finally:
+        sender_view.disconnect()
 
     assert len(history) == 1
     assert history[0]["is_own"] is True
@@ -780,16 +847,18 @@ def test_legacy_message_without_recipient_rows_has_none_read_status(sender_and_r
 
 
 def test_member_added_after_send_is_excluded_from_that_messages_recipients_and_read_gate(
-    running_server,
+    running_server, monkeypatch,
 ):
     """handle_group_chat_delivery() snapshots member_ids via
     get_member_user_ids() fresh at send time, and record_recipients()
     only ever creates rows for that snapshot (see both docstrings) --
     so a member added afterward must have no MessageRecipient row at
-    all for a message sent before they joined, and _read_status_for_
-    own_message()'s member_ids-intersected filtering must not require
-    them for "fully read" either."""
+    all for a message sent before they joined, and
+    handle_message_history_request()'s ported member_ids-intersected
+    filtering (D4.3; formerly ClientSession._read_status_for_own_
+    message()) must not require them for "fully read" either."""
     _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
     alice_payload = _register_user("timing_alice_")
     bob_payload = _register_user("timing_bob_")
@@ -847,8 +916,12 @@ def test_member_added_after_send_is_excluded_from_that_messages_recipients_and_r
             saved.id, uuid.UUID(bob_payload["user_id"]), MessageDeliveryStatus.READ
         )
 
-        alice_view = _make_session_for(alice_payload["user_id"], alice_name)
-        history = alice_view.load_conversation_history(conversation_id, is_group=True)
+        alice_view = _make_connected_session(alice_payload)
+        try:
+            _open_group_chat(alice_view, conversation_id)
+            history = alice_view.load_conversation_history(conversation_id, is_group=True)
+        finally:
+            alice_view.disconnect()
         assert history[-1]["read_status"] is True
     finally:
         alice_sock.close()

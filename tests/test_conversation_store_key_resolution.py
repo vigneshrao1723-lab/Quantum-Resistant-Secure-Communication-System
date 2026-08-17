@@ -1,24 +1,29 @@
 """
-Tests for Phase 5 (Secure Group Key Distribution)'s core mechanism:
-ConversationStore.ensure_direct_conversation_id() and
-ClientSession.set_current_chat() consuming it, against the real
-database.
+Tests for ClientSession.set_current_chat()'s conversation-id
+resolution, against the real database.
 
 Proves the end-to-end claim: for a direct conversation, KeyManager
 ends up addressed by the real conversation_id, resolved without
 ClientSession ever touching the database itself, and cached so a
 second resolution is free.
 
-D3.3 -- Conversation Operations Migration: set_current_chat() no
-longer calls ConversationStore.ensure_direct_conversation_id() (a
-direct database round trip) for a direct conversation with no cached
-id yet -- it now asks the server via a direct_conversation_request
-(D1's send_request()), which requires a real, connected, authenticated
-ClientSession rather than the bare one this file used before. Only
-test_set_current_chat_resolves_conversation_id_for_a_new_direct_summary()
-below needed that upgrade; ensure_direct_conversation_id() itself is
-unchanged (still the direct-DB path load_conversation_history() uses),
-so the other tests in this file are untouched.
+D3.3 -- Conversation Operations Migration: set_current_chat() resolves
+a direct conversation with no cached id yet by asking the server via a
+direct_conversation_request (D1's send_request()), which requires a
+real, connected, authenticated ClientSession.
+
+D4.3 -- Message/History Operations Migration: this file originally
+also tested ConversationStore.ensure_direct_conversation_id() directly
+-- the client-side database round trip set_current_chat() itself
+stopped using back in D3.3, but which load_conversation_history()
+still relied on until D4.3 migrated it too. With that last caller
+gone, ensure_direct_conversation_id() was deleted outright (dead
+code, zero remaining callers) -- there is nothing left in
+ConversationStore that resolves or creates a direct conversation's
+identity; every path does so exclusively via the server. This file's
+own two tests for that now-deleted method were removed along with it;
+the set_current_chat() tests below are unaffected -- they were
+already exercising the D3.3 server-request path, not the deleted one.
 
 Run with:
     pytest tests/test_conversation_store_key_resolution.py -v
@@ -33,7 +38,6 @@ import pytest
 import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
-from client.conversation_store import ConversationStore
 from client.session import ClientSession
 from database.connection import SessionLocal
 from database.repositories.conversation_repository import ConversationRepository
@@ -155,51 +159,6 @@ def _make_connected_session(payload):
     return session
 
 
-def test_ensure_direct_conversation_id_creates_and_caches():
-    a = _register_user("a_")
-    b = _register_user("b_")
-
-    try:
-        store = ConversationStore()
-
-        conversation_id = store.ensure_direct_conversation_id(a["user_id"], b["username"])
-
-        assert conversation_id is not None
-        uuid.UUID(conversation_id)  # must be a real UUID string
-
-        # Second call must be a cache hit returning the identical id,
-        # not a second row.
-        again = store.ensure_direct_conversation_id(a["user_id"], b["username"])
-        assert again == conversation_id
-    finally:
-        _delete_user(a["username"])
-        _delete_user(b["username"])
-
-
-def test_ensure_direct_conversation_id_updates_existing_summary():
-    a = _register_user("a_")
-    b = _register_user("b_")
-
-    try:
-        store = ConversationStore()
-
-        # A placeholder summary exists (e.g. "b" just came online), with
-        # no conversation_id yet -- exactly update_online_status()'s shape.
-        store._summaries[b["username"]] = ConversationSummary(
-            conversation_id=None,
-            username=b["username"],
-            is_online=True,
-            latest_message=None,
-        )
-
-        conversation_id = store.ensure_direct_conversation_id(a["user_id"], b["username"])
-
-        assert store._summaries[b["username"]].conversation_id == conversation_id
-    finally:
-        _delete_user(a["username"])
-        _delete_user(b["username"])
-
-
 def test_set_current_chat_resolves_conversation_id_for_a_new_direct_summary(
     running_server, monkeypatch
 ):
@@ -247,8 +206,9 @@ def test_set_current_chat_resolves_conversation_id_for_a_new_direct_summary(
         finally:
             db.close()
 
-        # Cached client-side too, exactly as ensure_direct_conversation_id()
-        # would have left it.
+        # Cached client-side too, via record_direct_conversation_id()
+        # (the DB-free half _resolve_direct_conversation_id() delegates
+        # its caching step to).
         cached_summary = session.conversation_store.get(b["username"])
         assert cached_summary is not None
         assert cached_summary.conversation_id == session.current_conversation_id

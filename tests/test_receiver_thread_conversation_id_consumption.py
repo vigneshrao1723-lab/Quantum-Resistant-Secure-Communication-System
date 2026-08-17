@@ -14,10 +14,15 @@ again, so a database call blocking that same thread was never safe to
 upgrade to it.
 
 Caching the resolved id into ConversationStore (so the sidebar stays
-in sync) is preserved via the new, DB-free
-ConversationStore.record_direct_conversation_id() -- the pure
-in-memory half of ensure_direct_conversation_id(), extracted so a
-caller that already has the id never needs the database-touching half.
+in sync) is preserved via the DB-free
+ConversationStore.record_direct_conversation_id() -- originally
+extracted so a caller that already has the id never needed the
+database-touching half of ensure_direct_conversation_id(). D4.3
+(Message/History Operations Migration) later deleted that
+database-touching half outright, once its own last remaining caller
+(load_conversation_history()) was migrated too -- record_direct_
+conversation_id() is now the ONLY way anything in ConversationStore
+ever learns a direct conversation's id.
 
 Run with:
     pytest tests/test_receiver_thread_conversation_id_consumption.py -v
@@ -27,7 +32,6 @@ import socket
 import threading
 import time
 import uuid
-from unittest import mock
 
 import pytest
 
@@ -210,13 +214,11 @@ def alice_and_bob(running_server, monkeypatch):
 
 # ----------------------------------------------------------------------
 # A + B + C + D combined: real receiver thread, fresh pair (receiver's
-# ConversationStore has never heard of the sender), database calls
-# from ConversationStore poisoned to raise. If handle_session_key() or
-# handle_chat() fell back to ensure_direct_conversation_id() for
-# either the key exchange or the message itself, this test fails --
-# either via the poisoned call raising inside the receiver thread's
-# own try/except (client/receiver.py), which prevents the expected
-# message from ever arriving, or via the direct assertion at the end.
+# ConversationStore has never heard of the sender). D4.3 deleted
+# ensure_direct_conversation_id() outright, so there is no database
+# fallback left for handle_session_key()/handle_chat() to have ever
+# fallen back to -- the assertions below fully prove the server-
+# supplied field was consumed instead.
 # ----------------------------------------------------------------------
 
 
@@ -238,24 +240,24 @@ def test_receiver_thread_uses_server_fields_and_never_touches_database(alice_and
     assert existing_summary is not None
     assert existing_summary.conversation_id is None
 
-    with mock.patch.object(
-        ConversationStore,
-        "ensure_direct_conversation_id",
-        side_effect=AssertionError(
-            "ensure_direct_conversation_id() must never be called from "
-            "the receiver thread (D3.2)"
-        ),
-    ):
-        # A fresh pair's first message exercises BOTH handlers on
-        # Bob's receiver thread: handle_session_key() (no cached key
-        # yet -- Alice's establish_session_key() sends one first) and
-        # then handle_chat() for the message itself.
-        alice.send_chat_message("hello bob, first contact")
+    # ensure_direct_conversation_id() (the DB fallback this test used
+    # to also prove the receiver thread never calls) was deleted
+    # outright in D4.3, once its last caller (load_conversation_
+    # history()) was migrated too -- there is no database-touching
+    # method left anywhere in ConversationStore to fall back to; the
+    # assertions below already fully prove the server-supplied field
+    # was consumed instead.
+    #
+    # A fresh pair's first message exercises BOTH handlers on Bob's
+    # receiver thread: handle_session_key() (no cached key yet --
+    # Alice's establish_session_key() sends one first) and then
+    # handle_chat() for the message itself.
+    alice.send_chat_message("hello bob, first contact")
 
-        assert _wait_for(
-            lambda: _last_received_text(bob, alice.username)
-            == "hello bob, first contact"
-        )
+    assert _wait_for(
+        lambda: _last_received_text(bob, alice.username)
+        == "hello bob, first contact"
+    )
 
     # The server-supplied id was genuinely consumed -- cross-checked
     # against the real, independently resolved conversation for this
@@ -278,19 +280,16 @@ def test_handle_session_key_alone_uses_server_field_without_database(alice_and_b
 
     assert bob.key_manager.get_key(expected_conversation_id) is None
 
-    with mock.patch.object(
-        ConversationStore,
-        "ensure_direct_conversation_id",
-        side_effect=AssertionError(
-            "ensure_direct_conversation_id() must never be called from "
-            "the receiver thread (D3.2)"
-        ),
-    ):
-        alice.establish_session_key()
+    # See test_receiver_thread_uses_server_fields_and_never_touches_
+    # database()'s comment: ensure_direct_conversation_id() no longer
+    # exists (deleted in D4.3), so there is nothing left to fall back
+    # to -- the assertion below already fully proves the server-
+    # supplied field was consumed.
+    alice.establish_session_key()
 
-        assert _wait_for(
-            lambda: bob.key_manager.get_key(expected_conversation_id) is not None
-        )
+    assert _wait_for(
+        lambda: bob.key_manager.get_key(expected_conversation_id) is not None
+    )
 
     bob_summary = bob.conversation_store.get(alice.username)
     assert bob_summary is not None
@@ -308,11 +307,13 @@ def test_record_direct_conversation_id_creates_a_new_summary():
     emitted = []
     store.conversations_changed.connect(lambda: emitted.append(True))
 
-    with mock.patch(
-        "client.conversation_store.SessionLocal",
-        side_effect=AssertionError("must never construct a database session"),
-    ):
-        store.record_direct_conversation_id("bob", "11111111-1111-1111-1111-111111111111")
+    # SessionLocal is no longer imported anywhere in
+    # client/conversation_store.py at all (D4.3 removed its last
+    # user, ensure_direct_conversation_id()) -- there is no database
+    # session record_direct_conversation_id() could construct even if
+    # it tried; patching a name the module no longer imports would
+    # itself raise AttributeError rather than proving anything.
+    store.record_direct_conversation_id("bob", "11111111-1111-1111-1111-111111111111")
 
     summary = store.get("bob")
     assert summary is not None
@@ -331,13 +332,12 @@ def test_record_direct_conversation_id_updates_existing_summary_in_place():
         latest_message="preserved-marker",
     )
 
-    with mock.patch(
-        "client.conversation_store.SessionLocal",
-        side_effect=AssertionError("must never construct a database session"),
-    ):
-        store.record_direct_conversation_id(
-            "carol", "22222222-2222-2222-2222-222222222222"
-        )
+    # See test_record_direct_conversation_id_creates_a_new_summary()'s
+    # comment -- SessionLocal is no longer importable from
+    # client/conversation_store.py to even patch.
+    store.record_direct_conversation_id(
+        "carol", "22222222-2222-2222-2222-222222222222"
+    )
 
     updated = store.get("carol")
     assert updated.conversation_id == "22222222-2222-2222-2222-222222222222"
@@ -367,12 +367,9 @@ def test_handle_chat_missing_direct_conversation_id_does_not_crash_or_query_db(c
         # server response.
     }
 
-    with mock.patch.object(
-        ConversationStore,
-        "ensure_direct_conversation_id",
-        side_effect=AssertionError("must never fall back to the database"),
-    ):
-        session.handle_chat(packet)  # must not raise
+    # ensure_direct_conversation_id() was deleted outright in D4.3 --
+    # nothing left to fall back to.
+    session.handle_chat(packet)  # must not raise
 
     assert "No direct_conversation_id supplied by the server" in caplog.text
 
@@ -391,12 +388,9 @@ def test_handle_session_key_missing_conversation_id_does_not_crash_or_query_db(c
         # Deliberately no "conversation_id".
     }
 
-    with mock.patch.object(
-        ConversationStore,
-        "ensure_direct_conversation_id",
-        side_effect=AssertionError("must never fall back to the database"),
-    ):
-        session.handle_session_key(packet)  # must not raise
+    # ensure_direct_conversation_id() was deleted outright in D4.3 --
+    # nothing left to fall back to.
+    session.handle_session_key(packet)  # must not raise
 
     assert "No conversation_id supplied by the server" in caplog.text
     # Returned before ever touching KeyManager -- nothing stored under
@@ -424,11 +418,8 @@ def test_handle_session_key_empty_string_conversation_id_is_treated_as_missing(c
         "conversation_id": "",
     }
 
-    with mock.patch.object(
-        ConversationStore,
-        "ensure_direct_conversation_id",
-        side_effect=AssertionError("must never fall back to the database"),
-    ):
-        session.handle_session_key(packet)  # must not raise
+    # ensure_direct_conversation_id() was deleted outright in D4.3 --
+    # nothing left to fall back to.
+    session.handle_session_key(packet)  # must not raise
 
     assert "No conversation_id supplied by the server" in caplog.text

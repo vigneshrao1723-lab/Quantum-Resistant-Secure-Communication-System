@@ -15,6 +15,7 @@ from database.models.conversation import Conversation
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.user_repository import UserRepository
+from domain.message_delivery_status import MessageDeliveryStatus
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import BLOB_STORAGE_PAYLOAD_TYPES, PayloadType
 from security.jwt_handler import TokenExpiredError, TokenValidationError
@@ -28,6 +29,7 @@ from storage import encrypted_blob_store
 from utils.network import receive_message
 from utils.protocol import (
     create_auth_result_packet,
+    create_blob_download_result_packet,
     create_conversation_list_result_packet,
     create_delivery_failure_packet,
     create_direct_conversation_result_packet,
@@ -40,6 +42,7 @@ from utils.protocol import (
     create_leave_packet,
     create_login_result_packet,
     create_logout_result_packet,
+    create_message_history_result_packet,
     create_read_receipt_notification_packet,
     create_register_result_packet,
     create_user_lookup_result_packet,
@@ -165,10 +168,11 @@ def _resolve_direct_conversation_id(sender_id, receiver_id):
     before either packet is ever sent to its recipient, so the
     resolved id can be attached to the outgoing packet -- the
     receiving client no longer has to resolve or create it itself via
-    a direct database call (see client/conversation_store.py::
-    ensure_direct_conversation_id(), not yet migrated by this slice,
-    but no longer reached from handle_chat()/handle_session_key() once
-    they consume the field this populates).
+    a direct database call (client/conversation_store.py::
+    ensure_direct_conversation_id() -- unmigrated by this slice, since
+    it was no longer reached from handle_chat()/handle_session_key()
+    once they consume the field this populates -- was itself deleted
+    in D4.3, once its one remaining caller was migrated too).
 
     Reuses ConversationRepository.get_or_create_direct_conversation()
     completely unchanged, including its pg_advisory_xact_lock()-based
@@ -1495,6 +1499,277 @@ def handle_conversation_list_request(state, client_socket, user, packet):
         )
 
 
+def _read_status_for_own_message(message_repo, message, is_group, member_ids):
+    """
+    Server-side port of ClientSession._read_status_for_own_message()
+    (D4.3 -- Message/History Operations Migration, third slice) --
+    identical logic, ported line-for-line, now computed here since the
+    client no longer has direct database access to compute it itself.
+    Only ever called for is_own rows (see handle_message_history_request()
+    below) -- never for a message this user received, which this
+    codebase's own security model already keeps this user from seeing
+    anyone else's read state for anyway.
+    """
+
+    recipient_rows = message_repo.get_recipients_for_message(message.id)
+
+    if not recipient_rows:
+        return None
+
+    if is_group:
+        relevant_rows = [
+            row for row in recipient_rows if row.recipient_id in member_ids
+        ]
+    else:
+        relevant_rows = recipient_rows
+
+    if not relevant_rows:
+        return False
+
+    return all(row.status == MessageDeliveryStatus.READ for row in relevant_rows)
+
+
+def handle_message_history_request(state, client_socket, user, packet):
+    """
+    Return a conversation's full stored message history on behalf of
+    the authenticated connection (D4.3 -- Message/History Operations
+    Migration, third slice), replacing ClientSession.
+    load_conversation_history()'s previous direct, client-side
+    MessageRepository/ConversationRepository/UserRepository reads --
+    the last remaining client-side database access for message
+    content itself.
+
+    Security: the caller's identity is always user.id -- the
+    authenticated identity from the JWT validated at
+    authenticate_connection() time -- never anything read from the
+    packet. Before returning anything, the authenticated caller must
+    be an active member of conversation_id (get_member_user_ids() --
+    the identical check D4.1's handle_epoch_reservation_request() and
+    every group-authorization check in this file already use). A
+    direct conversation's ConversationMember rows exist for both
+    parties exactly like a group's, so this same check covers both
+    conversation types with no is_group branch needed for the
+    authorization decision itself -- is_group only shapes which
+    repository query runs and how read_status is filtered, mirroring
+    ClientSession.load_conversation_history()'s own pre-migration
+    branching exactly; a wrong or lied-about is_group value cannot
+    expose another user's data, since the membership check above is
+    independent of it.
+
+    Option A -- lazy blob delivery: a FILE/IMAGE message's ciphertext
+    is never included here, only its blob_ref -- the client fetches
+    the actual content separately, on demand, via
+    blob_download_request. TEXT ciphertext IS included, exactly as it
+    always was when the client read it directly from the database --
+    it is never decrypted, inspected, or altered here; decryption
+    remains entirely client-side.
+
+    Reuses MessageRepository.get_conversation()/get_group_conversation(),
+    ConversationRepository.get_member_user_ids(), UserRepository.
+    get_by_id(), and MessageRepository.get_recipients_for_message()
+    completely unchanged.
+
+    A missing request_id is silently ignored, mirroring every other
+    D2/D3/D4 handler's identical guard. No pagination -- the complete
+    history is returned in one response, matching this codebase's
+    existing behavior exactly (see
+    create_message_history_request_packet()'s docstring).
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    conversation_id_raw = packet.get("conversation_id")
+    is_group = bool(packet.get("is_group"))
+
+    try:
+        conversation_uuid = uuid.UUID(conversation_id_raw)
+    except (TypeError, ValueError, AttributeError):
+        conversation_uuid = None
+
+    messages_payload = None
+    error = None
+
+    if conversation_uuid is None:
+        error = "Invalid or missing conversation_id."
+    else:
+        db = SessionLocal()
+
+        try:
+            conversation_repo = ConversationRepository(db)
+            message_repo = MessageRepository(db)
+            user_repo = UserRepository(db)
+
+            member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+            if user.id not in member_ids:
+
+                state.logger.warning(
+                    f"Rejected message_history_request: {user.username} is "
+                    f"not a member of conversation {conversation_id_raw}"
+                )
+
+                error = "Not a member of this conversation."
+
+            else:
+
+                if is_group:
+                    messages = message_repo.get_group_conversation(conversation_uuid)
+                else:
+                    other_ids = [
+                        member_id for member_id in member_ids if member_id != user.id
+                    ]
+                    partner_id = other_ids[0] if other_ids else None
+                    messages = (
+                        message_repo.get_conversation(user.id, partner_id)
+                        if partner_id is not None
+                        else []
+                    )
+
+                usernames_by_id = {}
+
+                for member_id in member_ids:
+                    member = user_repo.get_by_id(member_id)
+                    if member is not None:
+                        usernames_by_id[member_id] = member.username
+
+                messages_payload = []
+
+                for message in messages:
+
+                    is_own = message.sender_id == user.id
+
+                    read_status = (
+                        _read_status_for_own_message(
+                            message_repo, message, is_group, member_ids
+                        )
+                        if is_own
+                        else None
+                    )
+
+                    messages_payload.append({
+                        "message_id": str(message.id),
+                        "sender": usernames_by_id.get(message.sender_id, "Unknown"),
+                        "timestamp": message.timestamp.isoformat(),
+                        "is_own": is_own,
+                        "payload_type": message.payload_type,
+                        "epoch": message.epoch,
+                        "ciphertext": message.ciphertext,
+                        "blob_ref": message.blob_ref,
+                        "content_metadata": message.content_metadata or {},
+                        "read_status": read_status,
+                    })
+        finally:
+            db.close()
+
+    response = create_message_history_result_packet(
+        request_id=request_id,
+        messages=messages_payload,
+        error=error,
+    )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send message_history_result to {user.username} "
+            f"(request_id={request_id})"
+        )
+
+
+def handle_blob_download_request(state, client_socket, user, packet):
+    """
+    Return one historical FILE/IMAGE message's encrypted blob content
+    on behalf of the authenticated connection (D4.3 -- Message/History
+    Operations Migration, third slice; Option A -- lazy blob
+    delivery), following up a message_history_request/result that
+    reported only the message's blob_ref.
+
+    Security: message_id is resolved to its owning conversation_id via
+    MessageRepository.get_message() -- never trusted from the packet
+    beyond that lookup -- and the authenticated caller must be an
+    active member of that conversation (get_member_user_ids(), the
+    same check every other handler in this file uses). An unknown
+    message_id and a real-but-forbidden one report the identical
+    error, so neither is distinguishable from the other on the wire;
+    a message with no blob_ref (a genuine TEXT message, or a data
+    inconsistency) is reported distinctly, since that branch is only
+    reachable after authorization has already succeeded.
+
+    Reuses storage.encrypted_blob_store.load_blob() completely
+    unchanged -- the exact same call ClientSession.
+    _load_blob_history_content() used to make directly against local
+    storage; the server is the only component with a legitimate
+    reason to access FILE_STORAGE_ROOT, since only the server actually
+    runs where it lives. The returned ciphertext is never decrypted,
+    inspected, or altered here -- decryption remains entirely client-
+    side, exactly as before.
+
+    A missing request_id is silently ignored, mirroring every other
+    D2/D3/D4 handler's identical guard.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    message_id_raw = packet.get("message_id")
+
+    try:
+        message_uuid = uuid.UUID(message_id_raw)
+    except (TypeError, ValueError, AttributeError):
+        message_uuid = None
+
+    ciphertext = None
+    error = None
+
+    if message_uuid is None:
+        error = "Unknown message."
+    else:
+        db = SessionLocal()
+
+        try:
+            message = MessageRepository(db).get_message(message_uuid)
+
+            if message is None:
+                error = "Unknown message."
+            else:
+                member_ids = ConversationRepository(db).get_member_user_ids(
+                    message.conversation_id
+                )
+
+                if user.id not in member_ids:
+
+                    state.logger.warning(
+                        f"Rejected blob_download_request: {user.username} is "
+                        f"not a member of conversation {message.conversation_id}"
+                    )
+
+                    error = "Unknown message."
+
+                elif not message.blob_ref:
+                    error = "No attachment content for this message."
+                else:
+                    ciphertext = encrypted_blob_store.load_blob(
+                        message.blob_ref
+                    ).decode("utf-8")
+        finally:
+            db.close()
+
+    response = create_blob_download_result_packet(
+        request_id=request_id,
+        ciphertext=ciphertext,
+        error=error,
+    )
+
+    if not send_to_client(client_socket, response):
+        state.logger.warning(
+            f"Failed to send blob_download_result to {user.username} "
+            f"(request_id={request_id})"
+        )
+
+
 def authenticate_connection(state, client_socket, client_address):
     """
     Receive and validate the client's JWT access token.
@@ -2067,6 +2342,20 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "conversation_list_request":
 
                 handle_conversation_list_request(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Message History Request (D4.3)
+            # -----------------------------
+            elif packet.get("type") == "message_history_request":
+
+                handle_message_history_request(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Blob Download Request (D4.3)
+            # -----------------------------
+            elif packet.get("type") == "blob_download_request":
+
+                handle_blob_download_request(state, client_socket, user, packet)
 
     except Exception as e:
 

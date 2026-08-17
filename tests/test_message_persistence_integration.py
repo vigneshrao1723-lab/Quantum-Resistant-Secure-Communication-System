@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import select
 
+import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
@@ -41,6 +42,7 @@ from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
+from domain.conversation_summary import ConversationSummary
 from security.tls import build_server_context
 from server.client_handler import handle_client
 from server.server_state import ServerState
@@ -263,15 +265,35 @@ def _wait_for_conversation_length(user_a_id, user_b_id, expected_length, attempt
     return _get_conversation(user_a_id, user_b_id)
 
 
-def _make_session_for(user_id, username):
-    """A bare ClientSession standing in for a logged-in user, for
-    calling load_conversation_history() directly without going
-    through the GUI or a real socket connection (which that method
-    never touches)."""
+def _make_connected_session(payload):
+    """Real ClientSession: connect() -> login() -> send_public_key()
+    -> start_receiver() -- required because load_conversation_history()
+    now uses send_request() (D4.3), which can only be resolved by a
+    running receiver thread reading real socket data. Replaces the
+    former bare _make_session_for() helper, which stood in for a
+    logged-in user without ever needing a real connection -- no longer
+    possible once history loading requires a server round trip."""
     session = ClientSession()
-    session.user_id = user_id
-    session.username = username
+    session.user_id = payload["user_id"]
+    session.access_token = _login_and_get_token(payload)
+    session.connect()
+    session.login(payload["username"])
+    session.send_public_key()
+    session.start_receiver()
     return session
+
+
+def _open_direct_chat(session, partner_username):
+    """Mirrors ChatWindow.open_conversation() enough to resolve/create
+    the real conversation_id via set_current_chat() (D3.3's server-
+    side get-or-create) -- the precondition load_conversation_history()
+    now relies on, replacing the former direct
+    ConversationStore.ensure_direct_conversation_id() call these tests
+    used to make (deleted in D4.3)."""
+    summary = ConversationSummary(
+        conversation_id=None, username=partner_username, is_online=True, latest_message=None,
+    )
+    session.set_current_chat(summary)
 
 
 @pytest.fixture()
@@ -287,6 +309,8 @@ def sender_and_recipient(running_server):
     yield {
         "sender": (sender_sock, sender_name, sender_payload["user_id"]),
         "recipient": (recipient_sock, recipient_name, recipient_payload["user_id"]),
+        "sender_payload": sender_payload,
+        "recipient_payload": recipient_payload,
     }
 
     sender_sock.close()
@@ -611,7 +635,12 @@ def test_get_conversation_returns_chronological_order(sender_and_recipient):
     )
 
 
-def test_load_conversation_history_marks_incoming_and_outgoing(sender_and_recipient):
+def test_load_conversation_history_marks_incoming_and_outgoing(
+    sender_and_recipient, running_server, monkeypatch
+):
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
     recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
@@ -639,8 +668,12 @@ def test_load_conversation_history_marks_incoming_and_outgoing(sender_and_recipi
 
     _wait_for_conversation_length(sender_id, recipient_id, 2)
 
-    sender_view = _make_session_for(sender_id, sender_name)
-    history_for_sender = sender_view.load_conversation_history(recipient_name)
+    sender_view = _make_connected_session(sender_and_recipient["sender_payload"])
+    try:
+        _open_direct_chat(sender_view, recipient_name)
+        history_for_sender = sender_view.load_conversation_history(recipient_name)
+    finally:
+        sender_view.disconnect()
 
     assert len(history_for_sender) == 2
     assert history_for_sender[0]["is_own"] is True
@@ -648,8 +681,12 @@ def test_load_conversation_history_marks_incoming_and_outgoing(sender_and_recipi
     assert history_for_sender[1]["is_own"] is False
     assert history_for_sender[1]["sender"] == recipient_name
 
-    recipient_view = _make_session_for(recipient_id, recipient_name)
-    history_for_recipient = recipient_view.load_conversation_history(sender_name)
+    recipient_view = _make_connected_session(sender_and_recipient["recipient_payload"])
+    try:
+        _open_direct_chat(recipient_view, sender_name)
+        history_for_recipient = recipient_view.load_conversation_history(sender_name)
+    finally:
+        recipient_view.disconnect()
 
     assert history_for_recipient[0]["is_own"] is False
     assert history_for_recipient[0]["sender"] == sender_name
@@ -657,7 +694,12 @@ def test_load_conversation_history_marks_incoming_and_outgoing(sender_and_recipi
     assert history_for_recipient[1]["sender"] == recipient_name
 
 
-def test_load_conversation_history_preserves_stored_timestamp(sender_and_recipient):
+def test_load_conversation_history_preserves_stored_timestamp(
+    sender_and_recipient, running_server, monkeypatch
+):
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
     recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
@@ -675,16 +717,23 @@ def test_load_conversation_history_preserves_stored_timestamp(sender_and_recipie
     _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
     _wait_for_conversation_length(sender_id, recipient_id, 1)
 
-    recipient_view = _make_session_for(recipient_id, recipient_name)
-    history = recipient_view.load_conversation_history(sender_name)
+    recipient_view = _make_connected_session(sender_and_recipient["recipient_payload"])
+    try:
+        _open_direct_chat(recipient_view, sender_name)
+        history = recipient_view.load_conversation_history(sender_name)
+    finally:
+        recipient_view.disconnect()
 
     assert len(history) == 1
     assert history[0]["timestamp"] == sent_timestamp.replace(tzinfo=None)
 
 
 def test_load_conversation_history_returns_placeholder_without_session_key(
-    sender_and_recipient,
+    sender_and_recipient, running_server, monkeypatch
 ):
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
     recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
@@ -702,16 +751,23 @@ def test_load_conversation_history_returns_placeholder_without_session_key(
 
     # Fresh session standing in for a new app run: no session key has
     # ever been cached for this partner.
-    recipient_view = _make_session_for(recipient_id, recipient_name)
-    history = recipient_view.load_conversation_history(sender_name)
+    recipient_view = _make_connected_session(sender_and_recipient["recipient_payload"])
+    try:
+        _open_direct_chat(recipient_view, sender_name)
+        history = recipient_view.load_conversation_history(sender_name)
+    finally:
+        recipient_view.disconnect()
 
     assert len(history) == 1
     assert history[0]["text"] == "Message unavailable (encrypted in a previous session)"
 
 
 def test_load_conversation_history_decrypts_with_cached_session_key(
-    sender_and_recipient,
+    sender_and_recipient, running_server, monkeypatch
 ):
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
     recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
@@ -730,18 +786,21 @@ def test_load_conversation_history_decrypts_with_cached_session_key(
     _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
     _wait_for_conversation_length(sender_id, recipient_id, 1)
 
-    recipient_view = _make_session_for(recipient_id, recipient_name)
+    recipient_view = _make_connected_session(sender_and_recipient["recipient_payload"])
+    try:
+        # Phase 5 (Secure Group Key Distribution): KeyManager is
+        # addressed by conversation_id only -- resolve it via
+        # set_current_chat(), the same path the application itself
+        # uses, rather than seeding the key under the partner's
+        # username.
+        _open_direct_chat(recipient_view, sender_name)
+        recipient_view.key_manager.store_key(
+            recipient_view.current_conversation_id, session_key
+        )
 
-    # Phase 5 (Secure Group Key Distribution): KeyManager is addressed
-    # by conversation_id only -- resolve it via the same
-    # ConversationStore method the application itself uses, rather
-    # than seeding the key under the partner's username.
-    conversation_id = recipient_view.conversation_store.ensure_direct_conversation_id(
-        recipient_id, sender_name
-    )
-    recipient_view.key_manager.store_key(conversation_id, session_key)
-
-    history = recipient_view.load_conversation_history(sender_name)
+        history = recipient_view.load_conversation_history(sender_name)
+    finally:
+        recipient_view.disconnect()
 
     assert len(history) == 1
     assert history[0]["text"] == plaintext
@@ -948,12 +1007,14 @@ def test_message_to_real_offline_user_is_persisted_and_reports_delivery_failure(
 
 
 def test_offline_message_appears_and_decrypts_in_recipient_history_after_reconnect(
-    running_server,
+    running_server, monkeypatch,
 ):
     """Requirement B: once Bob is back, load_conversation_history()
-    -- the existing method, unmodified -- finds and correctly decrypts
-    the message that was sent while he was offline."""
+    -- the existing method, unmodified in this test's own scope --
+    finds and correctly decrypts the message that was sent while he
+    was offline."""
     _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
     sender_payload = _register_user("c1b_sender_")
     recipient_payload = _register_user("c1b_recipient_")
@@ -985,17 +1046,19 @@ def test_offline_message_appears_and_decrypts_in_recipient_history_after_reconne
         )
         assert saved is not None
 
-        # Bob "comes back" -- a fresh session standing in for a new
-        # login, exactly like every other history test in this file
-        # (_make_session_for()).
-        recipient_view = _make_session_for(recipient_payload["user_id"], recipient_name)
+        # Bob "comes back" -- a fresh, really-reconnected session
+        # standing in for a new login, exactly like every other
+        # history test in this file (_make_connected_session()).
+        recipient_view = _make_connected_session(recipient_payload)
+        try:
+            _open_direct_chat(recipient_view, sender_name)
+            recipient_view.key_manager.store_key(
+                recipient_view.current_conversation_id, session_key
+            )
 
-        conversation_id = recipient_view.conversation_store.ensure_direct_conversation_id(
-            recipient_payload["user_id"], sender_name
-        )
-        recipient_view.key_manager.store_key(conversation_id, session_key)
-
-        history = recipient_view.load_conversation_history(sender_name)
+            history = recipient_view.load_conversation_history(sender_name)
+        finally:
+            recipient_view.disconnect()
 
         assert len(history) == 1
         assert history[0]["text"] == plaintext

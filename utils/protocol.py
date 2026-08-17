@@ -677,6 +677,112 @@ def create_conversation_list_result_packet(request_id, conversations):
     }
 
 
+def create_message_history_request_packet(conversation_id, is_group):
+    """
+    Ask the server for a conversation's full stored message history
+    (D4.3 -- Message/History Operations Migration, third slice).
+    Replaces ClientSession.load_conversation_history()'s previous
+    direct, client-side MessageRepository/ConversationRepository/
+    UserRepository reads. Addressed explicitly by conversation_id
+    (never a username, unlike D3.3's direct_conversation_request) --
+    the caller is expected to already have resolved it, via
+    set_current_chat(), before opening a conversation's history.
+    ``is_group`` only shapes which repository query the server runs
+    and how read-status is filtered -- it carries no authorization
+    weight of its own; membership is checked independently of it. Who
+    the caller is comes from the authenticated connection server-side,
+    never from this packet. request_id is attached by ClientSession.
+    send_request() itself, never set here. No pagination -- the full
+    history is returned in one response, exactly matching this
+    codebase's existing behavior (no LIMIT/OFFSET exists anywhere in
+    the repository layer today).
+    """
+
+    return {
+        "type": "message_history_request",
+        "conversation_id": conversation_id,
+        "is_group": is_group
+    }
+
+
+def create_message_history_result_packet(request_id, messages=None, error=None):
+    """
+    Server -> client: the result of a message_history_request (D4.3).
+    ``messages`` is a list of plain dicts, one per stored message,
+    ordered exactly as MessageRepository.get_conversation()/
+    get_group_conversation() already order them: {message_id, sender,
+    timestamp, is_own, payload_type, epoch, ciphertext, blob_ref,
+    content_metadata, read_status}. ``ciphertext`` is only ever this
+    already-encrypted, opaque value -- decryption stays entirely
+    client-side; the server never decrypts historical ciphertext.
+    ``blob_ref`` is metadata only (Option A -- lazy blob delivery): a
+    FILE/IMAGE message's actual encrypted content is never embedded
+    here, only its reference -- the client fetches it separately via
+    blob_download_request, on demand, exactly mirroring where
+    ensure_direct_conversation_id()/_load_blob_history_content() used
+    to read it directly from local blob storage. request_id is echoed
+    from the request so ClientSession.send_request()'s pending
+    correlation resolves.
+    """
+
+    return {
+        "type": "message_history_result",
+        "request_id": request_id,
+        "messages": messages,
+        "error": error
+    }
+
+
+def create_blob_download_request_packet(message_id):
+    """
+    Ask the server for one historical FILE/IMAGE message's encrypted
+    blob content (D4.3 -- Message/History Operations Migration, third
+    slice; Option A -- lazy blob delivery), following up a
+    message_history_request/result that reported only the message's
+    blob_ref, never its content. Addressed by message_id, not blob_ref
+    -- blob_ref is an opaque storage-backend filename with no
+    queryable link to a conversation, so it cannot be authorized
+    directly; the server resolves message_id -> conversation_id ->
+    membership itself (see handle_blob_download_request()), never
+    trusting anything the client claims about which conversation a
+    message belongs to. request_id is attached by ClientSession.
+    send_request() itself, never set here.
+    """
+
+    return {
+        "type": "blob_download_request",
+        "message_id": message_id
+    }
+
+
+def create_blob_download_result_packet(request_id, ciphertext=None, error=None):
+    """
+    Server -> client: the result of a blob_download_request (D4.3).
+    ``ciphertext`` is the same base64 string
+    storage.encrypted_blob_store.load_blob() already produces --
+    opaque, already-encrypted, never decrypted or inspected server-
+    side; decryption remains entirely client-side, exactly as it was
+    when the client read this same blob directly off local storage.
+    ``error`` is set (and ciphertext left None) if message_id is
+    missing/malformed, the message doesn't exist, the caller isn't a
+    member of its conversation, or the message has no attachment --
+    the first three are deliberately indistinguishable from each
+    other on the wire (mirroring this codebase's existing "don't let
+    an error message reveal which guess was closer" convention); the
+    fourth is safe to report distinctly since it is only ever reached
+    after authorization has already succeeded. request_id is echoed
+    from the request so ClientSession.send_request()'s pending
+    correlation resolves.
+    """
+
+    return {
+        "type": "blob_download_result",
+        "request_id": request_id,
+        "ciphertext": ciphertext,
+        "error": error
+    }
+
+
 def create_delivery_failure_packet(
     receiver,
     reason="User is offline."

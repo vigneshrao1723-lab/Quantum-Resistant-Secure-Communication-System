@@ -35,6 +35,7 @@ from client.session import ClientSession
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
+from domain.conversation_summary import ConversationSummary
 from security.tls import build_server_context
 from server.client_handler import handle_client
 from server.server_state import ServerState
@@ -345,11 +346,14 @@ def test_found_user_can_be_opened_as_a_conversation(
     running_server, registered_pair, monkeypatch
 ):
     """End-to-end proof that a valid lookup leads to an openable
-    conversation, via the same ConversationStore path clicking an
-    online user already uses. ensure_direct_conversation_id() is
-    unmigrated (still a direct DB call) -- deliberately, per D2's
-    scope -- so this exercises the boundary between the migrated and
-    not-yet-migrated pieces working together correctly."""
+    conversation, via the exact same set_current_chat() path clicking
+    an online user already uses (D3.3 -- Conversation Operations
+    Migration; D2's find_user_by_id() and D3.3's conversation-id
+    resolution are two independently migrated pieces, this proves
+    they still work correctly together). Superseded
+    ensure_direct_conversation_id() (a direct DB call, current at the
+    time this test was first written) -- deleted outright in D4.3
+    once its own last caller was migrated too."""
     _state, port = running_server
     searcher_payload, target_payload = registered_pair
     session = _real_connected_session(port, searcher_payload, monkeypatch)
@@ -358,12 +362,17 @@ def test_found_user_can_be_opened_as_a_conversation(
         result = session.find_user_by_id(target_payload["user_id"])
         assert result is not None
 
-        conversation_id = session.conversation_store.ensure_direct_conversation_id(
-            session.user_id, result["username"]
+        summary = ConversationSummary(
+            conversation_id=None,
+            username=result["username"],
+            is_online=False,
+            latest_message=None,
         )
+        session.set_current_chat(summary)
 
-        assert conversation_id is not None
-        assert uuid.UUID(conversation_id)  # a real, parseable conversation id
+        assert session.current_conversation_id is not None
+        # a real, parseable conversation id
+        assert uuid.UUID(session.current_conversation_id)
     finally:
         session.disconnect()
 

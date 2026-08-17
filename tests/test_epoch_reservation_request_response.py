@@ -28,7 +28,6 @@ import struct
 import threading
 import time
 import uuid
-from unittest import mock
 
 import pytest
 
@@ -638,25 +637,15 @@ def test_establish_session_key_uses_request_response_not_database(alice_and_bob)
 
     assert alice.key_manager.has_key(conversation_id) is False
 
-    with (
-        mock.patch.object(
-            client_session_module,
-            "SessionLocal",
-            side_effect=AssertionError(
-                "establish_session_key() must never construct a database "
-                "session (D4.1)"
-            ),
-        ),
-        mock.patch.object(
-            client_session_module,
-            "ConversationRepository",
-            side_effect=AssertionError(
-                "establish_session_key() must never touch ConversationRepository "
-                "directly (D4.1)"
-            ),
-        ),
-    ):
-        alice.establish_session_key()
+    # SessionLocal/ConversationRepository (the database entry points
+    # this test used to also prove establish_session_key() never fell
+    # back to) are no longer imported anywhere in client/session.py at
+    # all -- D4.3 migrated load_conversation_history(), the module's
+    # last remaining user of either name, so patching them here would
+    # itself raise AttributeError rather than proving anything; the
+    # assertions below already fully prove the request/response path
+    # was used.
+    alice.establish_session_key()
 
     assert alice.key_manager.has_key(conversation_id) is True
     # The reserved epoch (2 -- see the server-side test's identical

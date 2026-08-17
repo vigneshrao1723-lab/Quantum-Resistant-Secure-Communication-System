@@ -12,22 +12,23 @@ the methods below, which always end by emitting
 it never computes or caches conversation state of its own.
 
 Phase 5 (Secure Group Key Distribution) adds a second responsibility:
-this is also the authoritative source of conversation *identity* --
-including resolving/creating a direct conversation's real
-conversation_id, via ensure_direct_conversation_id() -- so that
-ClientSession never performs a database lookup or keeps a second
-cache of its own. See that method's docstring for the scope of this
-responsibility and where it should move if it grows.
+this is also the authoritative cache of conversation *identity*. It
+no longer resolves or creates anything itself -- as of D4.3 (Message/
+History Operations Migration), every direct conversation's real
+conversation_id is resolved server-side (ClientSession.
+_resolve_direct_conversation_id() for a genuine "create", the
+server's response to a message_history_request/chat/session_key
+packet for a "get") and simply cached here via
+record_direct_conversation_id(), a pure in-memory operation with no
+database access at all. A group conversation never needs this either
+-- its conversation_id is already known synchronously at creation
+(see add_or_update_group()).
 """
 
-import uuid
 from datetime import datetime
 
 from PySide6.QtCore import QObject, Signal
 
-from database.connection import SessionLocal
-from database.repositories.conversation_repository import ConversationRepository
-from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
 
 # Every MessagePreview.timestamp in this codebase is a naive UTC
@@ -167,97 +168,30 @@ class ConversationStore(QObject):
 
             self.conversations_changed.emit()
 
-    def ensure_direct_conversation_id(self, own_user_id, username):
-        """
-        Resolve the real conversation_id for a direct conversation
-        with ``username``, creating it if it doesn't exist yet, and
-        cache it on the stored summary so every later call is a plain
-        dictionary lookup, not a database round trip. Caching itself
-        is delegated to record_direct_conversation_id() below.
-
-        This is intentionally the ONE place in the client that ever
-        resolves or creates a direct conversation's identity via the
-        database -- ConversationRepository owns persistence, this
-        method is the sole caller of it for this purpose. Its only
-        remaining caller is ClientSession.load_conversation_history()
-        -- always a "get" there (only reached once messages already
-        exist, meaning the conversation was necessarily already
-        created), left as direct database access until that method's
-        own migration. Every other former caller now avoids the
-        database here entirely: ClientSession's receiver-thread packet
-        handlers (D3.2: handle_chat()/handle_session_key()) use
-        record_direct_conversation_id() directly with a server-
-        supplied id, and ClientSession.set_current_chat() (D3.3: the
-        one former caller here that was a genuine "create") now asks
-        the server via a direct_conversation_request instead (see
-        ClientSession._resolve_direct_conversation_id()). A group
-        conversation never needs either method -- its conversation_id
-        is already known synchronously at creation (see
-        add_or_update_group()).
-
-        Design note for future growth: if conversation lifecycle
-        responsibilities expand significantly (group administration,
-        member management, archive, pin, delete, ...), this
-        responsibility should be extracted into a dedicated
-        ConversationResolver (or equivalent) service *without*
-        changing ConversationStore's public interface -- this method
-        would simply delegate to it. Not done now because a single
-        method does not yet justify a new abstraction.
-        """
-
-        existing = self._summaries.get(username)
-
-        if existing is not None and existing.conversation_id is not None:
-            return existing.conversation_id
-
-        db = SessionLocal()
-
-        try:
-            user_repo = UserRepository(db)
-            conversation_repo = ConversationRepository(db)
-
-            partner = user_repo.get_by_username(username)
-
-            if partner is None:
-                raise ValueError(f"Unknown user: {username}")
-
-            conversation = conversation_repo.get_or_create_direct_conversation(
-                uuid.UUID(own_user_id), partner.id
-            )
-
-            conversation_repo.commit()
-
-            conversation_id = str(conversation.id)
-        finally:
-            db.close()
-
-        self.record_direct_conversation_id(username, conversation_id)
-
-        return conversation_id
-
     def record_direct_conversation_id(self, username, conversation_id):
         """
-        Cache an already-resolved direct conversation id -- no database
-        access (D3.2 -- Conversation Operations Migration: the DB-free
-        half of ensure_direct_conversation_id() above, extracted so a
-        caller that already has the id -- a server-supplied packet
-        field, see ClientSession.handle_chat()/handle_session_key() --
-        never needs the DB-touching half at all, and in particular
-        never needs it from the receiver thread, where a database call
-        is not just wasteful but the deadlock risk this migration
-        exists to remove). ensure_direct_conversation_id() itself calls
-        this for its own caching step -- this is the same behavior it
-        always had, just named and shared rather than duplicated.
+        Cache an already-resolved direct conversation id -- no
+        database access at all (D3.2 -- Conversation Operations
+        Migration; the last database-touching caller, ClientSession.
+        load_conversation_history(), was migrated in D4.3, so this is
+        now the ONLY way anything in this class ever learns a direct
+        conversation's id). Callers always already have the id from
+        elsewhere -- a server-supplied packet field (ClientSession.
+        handle_chat()/handle_session_key()) or a server request/
+        response result (ClientSession._resolve_direct_conversation_id()
+        for a genuine "create") -- so this never needs to touch the
+        database itself, and in particular never needs to from the
+        receiver thread, where a database call is not just wasteful
+        but the deadlock risk D3.2 exists to remove.
 
         Creates a fresh, online placeholder summary if none exists yet
         for ``username``, otherwise updates the existing one's
-        conversation_id in place -- exactly matching
-        ensure_direct_conversation_id()'s prior inline behavior; every
-        other field of an existing summary (latest_message, is_online,
-        group fields) is left untouched. Always emits
-        conversations_changed: both branches represent a real,
-        externally-observable change (a conversation either just
-        became known to this client, or just gained/confirmed its id).
+        conversation_id in place; every other field of an existing
+        summary (latest_message, is_online, group fields) is left
+        untouched. Always emits conversations_changed: both branches
+        represent a real, externally-observable change (a conversation
+        either just became known to this client, or just gained/
+        confirmed its id).
         """
 
         existing = self._summaries.get(username)

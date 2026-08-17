@@ -16,10 +16,15 @@ pattern as test_direct_conversation_relay_resolution.py -- to prove
 the server-side behavior independent of what the real client would
 ever actually send. The client-consumption tests use a real, fully
 connected ClientSession with a real receiver thread, mirroring
-test_receiver_thread_conversation_id_consumption.py's rigor: proving
-ConversationStore.ensure_direct_conversation_id() (the database-
-touching method) is never called from set_current_chat() anymore, not
-merely assuming it.
+test_receiver_thread_conversation_id_consumption.py's rigor. D4.3 --
+Message/History Operations Migration: ConversationStore.
+ensure_direct_conversation_id() (the database-touching method this
+suite originally also proved set_current_chat() never fell back to)
+was deleted outright once its own last caller
+(load_conversation_history()) was migrated too -- there is no
+database-touching method left anywhere in ConversationStore for
+set_current_chat() to fall back to, so that specific proof is now
+structurally guaranteed rather than something to keep re-asserting.
 
 Run with:
     pytest tests/test_direct_conversation_request_response.py -v
@@ -37,7 +42,6 @@ import pytest
 import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
-from client.conversation_store import ConversationStore
 from client.session import ClientSession
 from database.connection import SessionLocal
 from database.models.conversation import Conversation
@@ -610,22 +614,21 @@ def test_set_current_chat_uses_request_response_not_database(running_server, mon
     try:
         assert session.conversation_store.get(bob_payload["username"]) is None
 
-        with mock.patch.object(
-            ConversationStore,
-            "ensure_direct_conversation_id",
-            side_effect=AssertionError(
-                "ensure_direct_conversation_id() must never be called from "
-                "set_current_chat() (D3.3)"
-            ),
-        ):
-            summary = ConversationSummary(
-                conversation_id=None,
-                username=bob_payload["username"],
-                is_online=True,
-                latest_message=None,
-            )
+        # ensure_direct_conversation_id() (the direct-DB fallback this
+        # test used to also prove set_current_chat() never falls back
+        # to) was deleted outright in D4.3, once its last caller
+        # (load_conversation_history()) was migrated too -- there is
+        # no DB-touching method left anywhere in ConversationStore for
+        # set_current_chat() to have fallen back to; the assertions
+        # below already fully prove the server-request path was used.
+        summary = ConversationSummary(
+            conversation_id=None,
+            username=bob_payload["username"],
+            is_online=True,
+            latest_message=None,
+        )
 
-            session.set_current_chat(summary)
+        session.set_current_chat(summary)
 
         assert session.current_chat == bob_payload["username"]
         assert session.current_chat_is_group is False

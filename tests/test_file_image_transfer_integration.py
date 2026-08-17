@@ -12,9 +12,10 @@ and test_group_messaging_integration.py):
   - the blob on disk, once decrypted, is byte-for-byte identical to
     the original file content
   - ClientSession.load_conversation_history() (the real method, via a
-    bare session standing in for a logged-in user -- see
-    test_message_persistence_integration.py::_make_session_for()) can
-    later retrieve that same original content from blob storage
+    real, fully connected session -- see
+    test_message_persistence_integration.py::_make_connected_session())
+    can later retrieve that same original content, via D4.3's
+    message_history_request/blob_download_request round trip
   - ClientSession.send_attachment() rejects an oversized file before
     any network or crypto work
 
@@ -32,6 +33,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
@@ -40,6 +42,7 @@ from database.connection import SessionLocal
 from database.repositories.message_repository import MessageRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
+from domain.conversation_summary import ConversationSummary
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import PayloadType
 from payload.file_adapter import FilePayloadAdapter
@@ -228,16 +231,28 @@ def _connect_and_authenticate(port, user_payload):
     return sock, username
 
 
-def _make_session_for(user_id, username):
-    """A bare ClientSession standing in for a logged-in user, for
-    calling load_conversation_history() directly -- mirrors
-    test_message_persistence_integration.py::_make_session_for()
+def _make_connected_session(payload):
+    """Real ClientSession: connect() -> login() -> send_public_key()
+    -> start_receiver() -- required because load_conversation_history()
+    now uses send_request() (D4.3) -- mirrors
+    test_message_persistence_integration.py::_make_connected_session()
     exactly (duplicated per this codebase's established per-file
     convention rather than shared)."""
     session = ClientSession()
-    session.user_id = user_id
-    session.username = username
+    session.user_id = payload["user_id"]
+    session.access_token = _login_and_get_token(payload)
+    session.connect()
+    session.login(payload["username"])
+    session.send_public_key()
+    session.start_receiver()
     return session
+
+
+def _open_direct_chat(session, partner_username):
+    summary = ConversationSummary(
+        conversation_id=None, username=partner_username, is_online=True, latest_message=None,
+    )
+    session.set_current_chat(summary)
 
 
 def _get_message_by_conversation(conversation_id):
@@ -287,6 +302,8 @@ def sender_and_recipient(running_server):
     yield {
         "sender": (sender_sock, sender_name, sender_payload["user_id"]),
         "recipient": (recipient_sock, recipient_name, recipient_payload["user_id"]),
+        "sender_payload": sender_payload,
+        "recipient_payload": recipient_payload,
     }
 
     sender_sock.close()
@@ -551,7 +568,12 @@ def test_group_image_transfer_fans_out_and_persists(trio):
 # ----------------------------------------------------------------------
 
 
-def test_history_reload_retrieves_original_file_bytes(sender_and_recipient):
+def test_history_reload_retrieves_original_file_bytes(
+    sender_and_recipient, running_server, monkeypatch
+):
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
     recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
@@ -578,18 +600,24 @@ def test_history_reload_retrieves_original_file_bytes(sender_and_recipient):
     assert saved is not None
 
     try:
-        # Fresh session standing in for a new app run, exactly like
-        # test_message_persistence_integration.py's history tests --
-        # the session key must be seeded (a real client would have
-        # received it via the Kyber/RSA key-exchange path) before
-        # history can be decrypted.
-        recipient_view = _make_session_for(recipient_id, recipient_name)
-        conversation_id = recipient_view.conversation_store.ensure_direct_conversation_id(
-            recipient_id, sender_name
-        )
-        recipient_view.key_manager.store_key(conversation_id, session_key)
+        # Fresh, really-reconnected session standing in for a new app
+        # run, exactly like test_message_persistence_integration.py's
+        # history tests -- the session key must be seeded (a real
+        # client would have received it via the Kyber/RSA key-exchange
+        # path) before history can be decrypted. D4.3: the actual
+        # attachment bytes are fetched lazily, via a
+        # blob_download_request load_conversation_history() issues
+        # internally -- not read directly from local blob storage.
+        recipient_view = _make_connected_session(sender_and_recipient["recipient_payload"])
+        try:
+            _open_direct_chat(recipient_view, sender_name)
+            recipient_view.key_manager.store_key(
+                recipient_view.current_conversation_id, session_key
+            )
 
-        history = recipient_view.load_conversation_history(sender_name)
+            history = recipient_view.load_conversation_history(sender_name)
+        finally:
+            recipient_view.disconnect()
 
         assert len(history) == 1
         assert history[0]["payload_type"] == PayloadType.FILE
@@ -599,10 +627,15 @@ def test_history_reload_retrieves_original_file_bytes(sender_and_recipient):
         encrypted_blob_store.delete_blob(saved.blob_ref)
 
 
-def test_history_without_key_returns_none_content_for_attachment(sender_and_recipient):
+def test_history_without_key_returns_none_content_for_attachment(
+    sender_and_recipient, running_server, monkeypatch
+):
     """Mirrors test_message_persistence_integration.py's text
     placeholder test, for binary content: a client that never received
     this conversation's key gets None, not a crash or garbage bytes."""
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
     sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
     recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
 
@@ -626,8 +659,12 @@ def test_history_without_key_returns_none_content_for_attachment(sender_and_reci
     assert saved is not None
 
     try:
-        recipient_view = _make_session_for(recipient_id, recipient_name)
-        history = recipient_view.load_conversation_history(sender_name)
+        recipient_view = _make_connected_session(sender_and_recipient["recipient_payload"])
+        try:
+            _open_direct_chat(recipient_view, sender_name)
+            history = recipient_view.load_conversation_history(sender_name)
+        finally:
+            recipient_view.disconnect()
 
         assert len(history) == 1
         assert history[0]["payload_type"] == PayloadType.FILE

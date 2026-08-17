@@ -29,12 +29,7 @@ from config import (
 )
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
-from database.connection import SessionLocal
-from database.repositories.conversation_repository import ConversationRepository
-from database.repositories.message_repository import MessageRepository
-from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary, MessagePreview
-from domain.message_delivery_status import MessageDeliveryStatus
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import (
     BLOB_STORAGE_PAYLOAD_TYPES,
@@ -45,10 +40,10 @@ from logger_config import setup_logger
 from payload.file_adapter import FilePayloadAdapter
 from payload.text_adapter import TextPayloadAdapter
 from security.tls import build_client_context
-from storage import encrypted_blob_store
 from utils.network import receive_message, send_message
 from utils.protocol import (
     create_auth_packet,
+    create_blob_download_request_packet,
     create_conversation_list_request_packet,
     create_direct_conversation_request_packet,
     create_epoch_reservation_request_packet,
@@ -59,6 +54,7 @@ from utils.protocol import (
     create_group_leave_packet,
     create_login_request_packet,
     create_logout_request_packet,
+    create_message_history_request_packet,
     create_payload_packet,
     create_public_key_packet,
     create_read_receipt_packet,
@@ -1059,26 +1055,31 @@ class ClientSession(QObject):
         Decrypt a stored FILE/IMAGE message's content for history
         display (Phase 8 -- File & Image Transfer). Mirrors
         _decrypt_history_message()'s epoch-aware, never-raise contract,
-        but reads the ciphertext from local blob storage (via
-        Message.blob_ref) instead of Message.ciphertext -- the exact
-        mirror of where persist_message() decided to write it.
+        but reads the ciphertext from a blob rather than
+        Message.ciphertext -- the exact mirror of where
+        persist_message() decided to write it.
 
-        Reuses storage.encrypted_blob_store.load_blob() directly --
-        the same reuse-the-existing-client-DB-access-model this
-        client already relies on for every other bit of history (see
-        SessionLocal usage throughout this class): no new client<->
-        server retrieval packet is introduced, since the client
-        already reads the database (and, with this addition, the
-        blob directory) directly rather than through the server.
+        D4.3 -- Message/History Operations Migration (Option A -- lazy
+        blob delivery): ``message`` is now the server-supplied dict
+        from a message_history_result packet's per-message entry (see
+        load_conversation_history()), never a live Message ORM row.
+        Its ``blob_ref`` was already sent alongside the rest of the
+        history -- only the actual encrypted bytes are fetched here,
+        on demand, via a separate blob_download_request/send_request()
+        round trip. This is the last remaining place anywhere in this
+        class that used to read local storage directly; it now reads
+        it through the server instead, exactly like every other piece
+        of history.
 
         Returns the decrypted bytes, or None if this client never
-        received this epoch's key, the blob is missing, or decryption
-        fails -- the binary equivalent of _UNDECRYPTABLE_PLACEHOLDER
-        (callers render their own placeholder for None; a text
-        placeholder string cannot stand in for missing bytes here).
+        received this epoch's key, the blob is missing/inaccessible,
+        or decryption fails -- the binary equivalent of
+        _UNDECRYPTABLE_PLACEHOLDER (callers render their own
+        placeholder for None; a text placeholder string cannot stand
+        in for missing bytes here).
         """
 
-        if not message.blob_ref:
+        if not message.get("blob_ref"):
             return None
 
         session_key = self.key_manager.get_key(conversation_id, epoch=epoch)
@@ -1087,64 +1088,24 @@ class ClientSession(QObject):
             return None
 
         try:
-            ciphertext = encrypted_blob_store.load_blob(message.blob_ref).decode("utf-8")
-
-            envelope = PayloadEnvelope(
-                payload_type=message.payload_type,
-                ciphertext=ciphertext,
-                content_metadata=message.content_metadata or {},
+            response = self.send_request(
+                create_blob_download_request_packet(message_id=message["message_id"])
             )
 
-            return self._adapter_for(message.payload_type).decrypt(envelope, AESCipher(session_key))
+            if response.get("error"):
+                return None
+
+            payload_type = message.get("payload_type") or PayloadType.TEXT
+
+            envelope = PayloadEnvelope(
+                payload_type=payload_type,
+                ciphertext=response.get("ciphertext"),
+                content_metadata=message.get("content_metadata") or {},
+            )
+
+            return self._adapter_for(payload_type).decrypt(envelope, AESCipher(session_key))
         except Exception:
             return None
-
-    def _read_status_for_own_message(self, message_repo, message, is_group, member_ids):
-        """
-        Compute the read-receipt display state for one of THIS user's
-        own sent messages (C2 -- Read Receipts): True (double check --
-        fully read), False (single check -- sent/delivered, not yet
-        fully read), or None (no MessageRecipient rows at all -- a
-        legacy message persisted before C2 shipped, or before this
-        direct conversation started creating rows; show no receipt
-        state at all rather than fabricate one).
-
-        For a group, "fully read" means every CURRENTLY active member
-        (``member_ids``, already left-member-filtered by
-        get_member_user_ids()) who has a recipient row for this
-        specific message has read it -- a departed member's row is
-        simply excluded from consideration, so they can never block
-        the all-read state (see the row-filtering below). A member
-        added after this message was sent was never one of its
-        recipients in the first place (Issue 2's epoch rotation means
-        they couldn't decrypt it anyway), so they're correctly absent
-        from message_recipients for it and need no special-casing
-        here.
-
-        Only ever called for is_own rows -- never for a message this
-        user received, which this codebase's own security model
-        already keeps this user from seeing anyone else's read state
-        for anyway (MessageRepository.mark_conversation_read() is
-        scoped to the authenticated recipient; there is no query
-        surface here that could reveal a stranger's read state).
-        """
-
-        recipient_rows = message_repo.get_recipients_for_message(message.id)
-
-        if not recipient_rows:
-            return None
-
-        if is_group:
-            relevant_rows = [
-                row for row in recipient_rows if row.recipient_id in member_ids
-            ]
-        else:
-            relevant_rows = recipient_rows
-
-        if not relevant_rows:
-            return False
-
-        return all(row.status == MessageDeliveryStatus.READ for row in relevant_rows)
 
     def load_conversation_history(self, key, is_group=False):
         """
@@ -1153,137 +1114,98 @@ class ClientSession(QObject):
         group (``key`` = conversation_id, Phase 4 -- Secure Group
         Messaging Foundation).
 
-        One shared method, not a sibling per addressing mode: only
-        which repository query to run and how to resolve each row's
-        sender name differ; decrypting and building the returned dict
-        is identical code either way. Every existing caller is
-        unaffected -- ``is_group`` defaults to False.
-
         Returns a plain list of dicts, ordered chronologically exactly
         as stored:
             {"sender": str, "text": str, "timestamp": datetime,
              "is_own": bool, "message_id": str,
              "read_status": bool | None}
-        ``read_status`` (C2 -- Read Receipts) is only ever meaningful
-        for ``is_own`` rows -- see _read_status_for_own_message(); it
-        is always None for a received message (no receipt indicator
-        is ever shown for those, by design).
+
+        D4.3 -- Message/History Operations Migration (final slice):
+        resolved via a server request/response
+        (message_history_request/result, via D1's send_request())
+        rather than direct, local MessageRepository/
+        ConversationRepository/UserRepository reads -- the last
+        remaining client-side database access for message content
+        anywhere in this class. ``read_status`` (C2 -- Read Receipts)
+        now arrives pre-computed from the server, not derived
+        locally -- see server/client_handler.py::
+        handle_message_history_request()'s ported copy of what this
+        class's own _read_status_for_own_message() used to compute;
+        it is still only ever meaningful for ``is_own`` rows, always
+        None for a received message.
+
+        Relies on self.current_conversation_id already being resolved
+        -- true for the one real caller (gui/chat_window.py::
+        open_conversation() always calls set_current_chat() first,
+        which is what populates it, for a direct conversation via
+        D3.3's server-side get-or-create) -- rather than resolving a
+        direct partner's conversation_id itself, since the wire
+        protocol now addresses history explicitly by conversation_id,
+        never by username. ``key`` is kept as a parameter purely for
+        call-site stability (unchanged from before this migration);
+        it is no longer used internally, since sender-name resolution
+        also now happens entirely server-side. No conversation_id yet
+        (e.g. a direct partner never opened via set_current_chat())
+        returns an empty list without sending anything, mirroring the
+        prior "unknown partner" short-circuit.
+
+        No pagination -- the complete history is returned in one
+        response, matching this codebase's existing behavior exactly
+        (see create_message_history_request_packet()'s docstring).
         """
 
-        db = SessionLocal()
+        if self.current_conversation_id is None:
+            return []
 
-        try:
-            message_repo = MessageRepository(db)
+        response = self.send_request(
+            create_message_history_request_packet(
+                conversation_id=self.current_conversation_id,
+                is_group=is_group,
+            )
+        )
 
-            own_id = uuid.UUID(self.user_id)
+        messages = response.get("messages") or []
 
-            if is_group:
+        history = []
 
-                conversation_id = uuid.UUID(key)
+        for entry in messages:
 
-                messages = message_repo.get_group_conversation(conversation_id)
+            payload_type = entry.get("payload_type") or PayloadType.TEXT
+            epoch = entry.get("epoch") or 1
 
-                conversation_repo = ConversationRepository(db)
-                user_repo = UserRepository(db)
-
-                member_ids = conversation_repo.get_member_user_ids(conversation_id)
-
-                usernames_by_id = {}
-
-                for member_id in member_ids:
-                    member = user_repo.get_by_id(member_id)
-                    if member is not None:
-                        usernames_by_id[member_id] = member.username
-
-                # Already a real conversation_id -- the KeyManager
-                # identity (Phase 5) and the addressing key are the
-                # same value for a group.
-                decrypt_key = key
-
+            # Phase 8 -- File & Image Transfer: TEXT keeps using the
+            # existing inline-ciphertext path unchanged; a blob-stored
+            # payload_type (BLOB_STORAGE_PAYLOAD_TYPES) fetches its
+            # ciphertext lazily via _load_blob_history_content()
+            # instead -- entry["ciphertext"] is None for those rows
+            # (see handle_message_history_request()), so it must
+            # never be passed to _decrypt_history_message() for them.
+            if payload_type in BLOB_STORAGE_PAYLOAD_TYPES:
+                text = None
+                content = self._load_blob_history_content(
+                    self.current_conversation_id, entry, epoch
+                )
             else:
-
-                user_repo = UserRepository(db)
-
-                partner = user_repo.get_by_username(key)
-
-                if partner is None:
-                    return []
-
-                messages = message_repo.get_conversation(own_id, partner.id)
-
-                # Resolve the real conversation_id for the KeyManager
-                # lookup (Phase 5) -- via ConversationStore, the sole
-                # place this is ever resolved; a cache hit in the
-                # overwhelming common case, since opening this
-                # conversation already resolved it (set_current_chat()).
-                # Skipped entirely when there's no history to decrypt,
-                # so viewing an empty/new conversation never touches
-                # the database from here.
-                decrypt_key = (
-                    self.conversation_store.ensure_direct_conversation_id(
-                        self.user_id, key
-                    )
-                    if messages else None
+                text = self._decrypt_history_message(
+                    self.current_conversation_id,
+                    entry.get("ciphertext"),
+                    epoch=epoch,
                 )
+                content = None
 
-            history = []
+            history.append({
+                "sender": entry.get("sender"),
+                "text": text,
+                "timestamp": self._parse_incoming_timestamp(entry.get("timestamp")),
+                "is_own": entry.get("is_own", False),
+                "message_id": entry.get("message_id"),
+                "read_status": entry.get("read_status"),
+                "payload_type": payload_type,
+                "content": content,
+                "content_metadata": entry.get("content_metadata") or {},
+            })
 
-            for message in messages:
-
-                is_own = message.sender_id == own_id
-
-                if is_group:
-                    sender_name = (
-                        self.username if is_own
-                        else usernames_by_id.get(message.sender_id, "Unknown")
-                    )
-                else:
-                    sender_name = self.username if is_own else key
-
-                payload_type = message.payload_type or PayloadType.TEXT
-                epoch = message.epoch or 1
-
-                # Phase 8 -- File & Image Transfer: TEXT keeps using
-                # the existing inline-ciphertext path unchanged; a
-                # blob-stored payload_type (BLOB_STORAGE_PAYLOAD_TYPES)
-                # reads its ciphertext from local blob storage instead
-                # -- Message.ciphertext is NULL for those rows (see
-                # persist_message()), so message.ciphertext must never
-                # be passed to _decrypt_history_message() for them.
-                if payload_type in BLOB_STORAGE_PAYLOAD_TYPES:
-                    text = None
-                    content = self._load_blob_history_content(decrypt_key, message, epoch)
-                else:
-                    text = self._decrypt_history_message(
-                        decrypt_key,
-                        message.ciphertext,
-                        epoch=epoch,
-                    )
-                    content = None
-
-                read_status = (
-                    self._read_status_for_own_message(
-                        message_repo, message, is_group, member_ids if is_group else None
-                    )
-                    if is_own
-                    else None
-                )
-
-                history.append({
-                    "sender": sender_name,
-                    "text": text,
-                    "timestamp": message.timestamp,
-                    "is_own": is_own,
-                    "message_id": str(message.id),
-                    "read_status": read_status,
-                    "payload_type": payload_type,
-                    "content": content,
-                    "content_metadata": message.content_metadata or {},
-                })
-
-            return history
-        finally:
-            db.close()
+        return history
 
     def find_user_by_id(self, user_id_str):
         """
