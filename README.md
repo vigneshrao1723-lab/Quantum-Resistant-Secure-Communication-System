@@ -8,7 +8,7 @@ A multi-user, server-mediated secure communication system developed as a Final Y
 
 The system is a client-server chat application. Multiple clients connect to a central server over a TLS-secured TCP socket, authenticate with a username/password (JWT-based session), and exchange direct and group messages, files, and images. The server persists all conversation, message, and membership state in a PostgreSQL database and stores file/image ciphertext on disk as encrypted blobs.
 
-Message *content* is encrypted end-to-end at the payload level using AES-256-GCM with per-conversation session keys established via client-side Kyber (ML-KEM-768) or RSA key exchange — the server never holds the AES session keys and cannot decrypt message bodies or blob contents. However, the server is fully trusted with connection metadata (who is talking to whom, when, message sizes, filenames, and group membership), and it also mediates key distribution, so the precise security guarantees are narrower than "end-to-end encryption" in the general sense. See [Security Model](#security-model) below for the exact boundary.
+Message *content* is encrypted client-side at the payload level using AES-256-GCM, with per-conversation session keys established via client-side Kyber (ML-KEM-768) or RSA key exchange — the server never holds the AES session keys and cannot decrypt message bodies or blob contents. The server is, however, fully trusted with connection metadata (who is talking to whom, when, message sizes, filenames, and group membership), and it also mediates key distribution. See [Security Model](#security-model) below for the exact boundary of what the server can and cannot see.
 
 Development has proceeded through a sequence of server-migration slices (documented under [Current Implementation Status](#current-implementation-status)) that moved conversation resolution, key epoch management, conversation-list loading, message history, and blob retrieval from local client-side storage to authenticated server-side request/response operations. As of this document, that migration series (through slice D4.3) is complete, and the full automated test suite passes.
 
@@ -81,7 +81,7 @@ The following are implemented and covered by the automated test suite (`tests/`)
 - No message/blob deletion lifecycle — `encrypted_blob_store.delete_blob()` exists but has no production call site; stored blobs are not currently purged.
 - `JWT_SECRET_KEY` defaults to a development placeholder in `config_server.py` and must be overridden via environment variable for any non-development deployment.
 
-Given these properties, this system should be described as providing **client-side payload encryption with server-mediated key exchange**, not as a fully end-to-end-encrypted or zero-knowledge-server system. Transport security (TLS) is classical, not post-quantum.
+Given these properties, this system should be described as providing **client-side payload encryption with server-mediated key exchange**. Transport security (TLS) is classical, not post-quantum.
 
 ---
 
@@ -288,7 +288,7 @@ No further server-migration slice beyond D4.3 is currently defined in project do
 
 ## Project Status
 
-The D-series server-migration work (D3.1 through D4.3) is complete and merged to `master`. The full automated test suite (549 tests) passes with 0 failures. The system supports multi-user direct and group messaging, file/image transfer, read receipts, and reconnection/history recovery, all mediated by an authenticated, TLS-secured server backed by PostgreSQL, with client-side AES-256-GCM payload encryption and Kyber768 (ML-KEM-768) as the default post-quantum key-exchange algorithm.
+The D-series server-migration work (D3.1 through D4.3) is implemented and complete on the current local `master` branch (verified in sync with `origin/master`). The full automated test suite (549 tests) passes with 0 failures. The system supports multi-user direct and group messaging, file/image transfer, read receipts, and reconnection/history recovery, all mediated by an authenticated, TLS-secured server backed by PostgreSQL, with client-side AES-256-GCM payload encryption and Kyber768 (ML-KEM-768) as the default post-quantum key-exchange algorithm.
 
 ---
 
