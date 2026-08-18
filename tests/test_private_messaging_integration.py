@@ -20,7 +20,6 @@ Run with:
 import json
 import socket
 import struct
-import threading
 import uuid
 
 import pytest
@@ -30,10 +29,10 @@ from auth.schemas import LoginRequest, RegisterRequest
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
-from security.tls import build_server_context
-from server.client_handler import handle_client
-from server.server_state import ServerState
-from tests.tls_test_support import serve_tls_client, wrap_client_socket
+from tests.tls_test_support import (
+    start_test_server,
+    wrap_client_socket,
+)
 from utils.protocol import (
     create_auth_packet,
     create_chat_packet,
@@ -105,69 +104,18 @@ def running_server():
     builder (security.tls.build_server_context()) and wrap_socket()
     call server/server.py's real accept loop uses -- before
     handle_client() ever sees it.
+
+    Yields a ServerHarness (``.state``, ``.port``, and the two
+    shutdown phases) rather than a bare (state, port) tuple, so a
+    dependent fixture can sequence its own socket teardown against the
+    server's -- see tests/tls_test_support.py's ServerHarness for why
+    that ordering matters.
     """
-    state = ServerState()
+    harness = start_test_server()
 
-    # Test-harness hardening: one SSLContext per fixture instance,
-    # built once and reused for every connection this fixture's
-    # accept loop handles -- mirrors build_server_context()'s own
-    # documented contract ("built once... and reused for every
-    # accepted connection -- never rebuilt per client"), which
-    # server/server.py already follows. Previously each connection's
-    # serve_tls_client() call rebuilt a fresh SSLContext (and re-read
-    # the cert/key from disk) internally; under a full-suite run that
-    # meant hundreds of concurrent, independent SSLContext
-    # constructions across many threads -- a load pattern production
-    # never exercises -- consistent with the intermittent Windows SSL
-    # alert failures observed under heavy concurrent runs.
-    tls_context = build_server_context()
+    yield harness
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen()
-    port = server_socket.getsockname()[1]
-
-    stop = threading.Event()
-    # Test-harness hardening: previously only accept_thread was
-    # joined at teardown -- an in-flight per-connection handler
-    # thread (blocked in recv()/the TLS handshake) could keep running
-    # into the next test's setup, racing that test's own socket
-    # teardown and surfacing as a raw OS-level error (observed:
-    # WinError 10038, "operation attempted on something that is not
-    # a socket") rather than a clean, isolated failure. Tracked here
-    # so every one can be joined below.
-    handler_threads = []
-
-    def accept_loop():
-        server_socket.settimeout(0.2)
-        while not stop.is_set():
-            try:
-                client_socket, addr = server_socket.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            handler_thread = threading.Thread(
-                target=serve_tls_client,
-                args=(handle_client, state, client_socket, addr, state.logger),
-                kwargs={"context": tls_context},
-                daemon=True,
-            )
-            handler_thread.start()
-            handler_threads.append(handler_thread)
-
-    accept_thread = threading.Thread(target=accept_loop, daemon=True)
-    accept_thread.start()
-
-    yield state, port
-
-    stop.set()
-    server_socket.close()
-    accept_thread.join(timeout=2)
-
-    for handler_thread in handler_threads:
-        handler_thread.join(timeout=2)
+    harness.shutdown()
 
 
 def _register_user(suffix_hint=""):
@@ -242,7 +190,7 @@ def _connect_and_authenticate(port, user_payload):
 def three_users(running_server):
     """Three authenticated, connected clients: sender, recipient, and
     an uninvolved bystander who must never see the private message."""
-    _state, port = running_server
+    port = running_server.port
 
     sender_payload = _register_user("sender_")
     recipient_payload = _register_user("recipient_")
@@ -258,9 +206,24 @@ def three_users(running_server):
         "bystander": (bystander_sock, bystander_name),
     }
 
+    # Teardown order matters here -- see ServerHarness in
+    # tests/tls_test_support.py. This fixture
+    # owns the client sockets and tears down BEFORE running_server, so
+    # it must drive the whole sequence rather than closing sockets
+    # underneath a server that is still accepting and handling.
+    #
+    #   1. stop accepting  -- listening socket closed, accept thread joined
+    #   2. close clients   -- handler threads' peers disappear
+    #   3. join handlers   -- every server-side SSL teardown completed
+    #   4. clean up users  -- no handler can still be touching them
+    running_server.stop_accepting()
+
     sender_sock.close()
     recipient_sock.close()
     bystander_sock.close()
+
+    running_server.join_handlers()
+
     _delete_user(sender_payload["username"])
     _delete_user(recipient_payload["username"])
     _delete_user(bystander_payload["username"])
@@ -312,7 +275,7 @@ def test_bystander_does_not_receive_private_message(three_users):
 
 
 def test_offline_recipient_returns_delivery_failure(running_server):
-    _state, port = running_server
+    port = running_server.port
 
     sender_payload = _register_user("offsend_")
     sender_sock, sender_name = _connect_and_authenticate(port, sender_payload)
@@ -335,14 +298,20 @@ def test_offline_recipient_returns_delivery_failure(running_server):
         assert response["receiver"] == "no-such-connected-user"
         assert response["reason"]
     finally:
+        # Same ordering as the three_users fixture -- see
+        # ServerHarness. Stop the server before closing the client so
+        # the two ends of the TLS connection are never torn down
+        # concurrently.
+        running_server.stop_accepting()
         sender_sock.close()
+        running_server.join_handlers()
         _delete_user(sender_payload["username"])
 
 
 def test_offline_recipient_message_is_not_silently_discarded(running_server):
     """The sender must be told delivery failed -- not receive nothing
     and have to guess whether the message went through."""
-    _state, port = running_server
+    port = running_server.port
 
     sender_payload = _register_user("nosw_")
     sender_sock, sender_name = _connect_and_authenticate(port, sender_payload)
@@ -366,5 +335,8 @@ def test_offline_recipient_message_is_not_silently_discarded(running_server):
         assert response is not None
         assert response.get("type") == "delivery_failure"
     finally:
+        # Same ordering as above -- see ServerHarness.
+        running_server.stop_accepting()
         sender_sock.close()
+        running_server.join_handlers()
         _delete_user(sender_payload["username"])

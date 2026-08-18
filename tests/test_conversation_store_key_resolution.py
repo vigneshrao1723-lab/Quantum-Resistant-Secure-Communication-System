@@ -29,8 +29,6 @@ Run with:
     pytest tests/test_conversation_store_key_resolution.py -v
 """
 
-import socket
-import threading
 import uuid
 
 import pytest
@@ -44,10 +42,7 @@ from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
-from security.tls import build_server_context
-from server.client_handler import handle_client
-from server.server_state import ServerState
-from tests.tls_test_support import serve_tls_client
+from tests.tls_test_support import start_test_server
 
 
 def _register_user(suffix_hint=""):
@@ -85,48 +80,11 @@ def _delete_user(username):
 
 @pytest.fixture()
 def running_server():
-    state = ServerState()
+    harness = start_test_server()
 
-    tls_context = build_server_context()
+    yield harness
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen()
-    port = server_socket.getsockname()[1]
-
-    stop = threading.Event()
-    handler_threads = []
-
-    def accept_loop():
-        server_socket.settimeout(0.2)
-        while not stop.is_set():
-            try:
-                client_socket, addr = server_socket.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            handler_thread = threading.Thread(
-                target=serve_tls_client,
-                args=(handle_client, state, client_socket, addr, state.logger),
-                kwargs={"context": tls_context},
-                daemon=True,
-            )
-            handler_thread.start()
-            handler_threads.append(handler_thread)
-
-    accept_thread = threading.Thread(target=accept_loop, daemon=True)
-    accept_thread.start()
-
-    yield state, port
-
-    stop.set()
-    server_socket.close()
-    accept_thread.join(timeout=2)
-
-    for handler_thread in handler_threads:
-        handler_thread.join(timeout=2)
+    harness.shutdown()
 
 
 def _login_and_get_token(payload):

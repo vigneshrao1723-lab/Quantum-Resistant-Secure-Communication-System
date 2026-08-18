@@ -47,9 +47,8 @@ from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from scripts.generate_dev_certs import generate_dev_ca, generate_server_cert
-from security.tls import build_server_context
 from server.server import _serve_client
-from server.server_state import ServerState
+from tests.tls_test_support import start_test_server
 
 
 def _register_user(suffix_hint=""):
@@ -108,40 +107,16 @@ def real_tls_server():
     bound to an ephemeral port instead of config.PORT so it can run
     inside the test suite. This is the real server.py wrapping logic.
     """
-    state = ServerState()
-    tls_context = build_server_context()
+    # Overrides the default connection handler: this suite
+    # exercises server.server's own _serve_client().
+    def _serve(state, context, client_socket, address):
+        _serve_client(state, context, client_socket, address)
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen()
-    port = server_socket.getsockname()[1]
+    harness = start_test_server(_serve)
 
-    stop = threading.Event()
+    yield harness
 
-    def accept_loop():
-        server_socket.settimeout(0.2)
-        while not stop.is_set():
-            try:
-                client_socket, addr = server_socket.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            threading.Thread(
-                target=_serve_client,
-                args=(state, tls_context, client_socket, addr),
-                daemon=True,
-            ).start()
-
-    accept_thread = threading.Thread(target=accept_loop, daemon=True)
-    accept_thread.start()
-
-    yield state, port
-
-    stop.set()
-    server_socket.close()
-    accept_thread.join(timeout=2)
+    harness.shutdown()
 
 
 @pytest.fixture()

@@ -19,7 +19,6 @@ import base64
 import json
 import socket
 import struct
-import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -34,7 +33,7 @@ from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from server.client_handler import handle_client
-from server.server_state import ServerState
+from tests.tls_test_support import start_test_server
 from utils.protocol import create_auth_packet, create_public_key_packet
 
 
@@ -70,38 +69,23 @@ def _recv(sock, timeout=3):
 
 @pytest.fixture()
 def running_server():
-    """Runs the real handle_client accept loop against an ephemeral port."""
-    state = ServerState()
+    """Runs the real handle_client accept loop against an ephemeral port.
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen()
-    port = server_socket.getsockname()[1]
+    Deliberately NOT TLS-wrapped: this suite's clients connect with
+    plain socket.create_connection(), so the accepted socket is handed
+    to handle_client() directly. That is why it overrides
+    start_test_server()'s default connection handler rather than using
+    the TLS one every other socket suite uses.
+    """
 
-    stop = threading.Event()
+    def _serve_plain(state, _context, client_socket, address):
+        handle_client(state, client_socket, address)
 
-    def accept_loop():
-        server_socket.settimeout(0.2)
-        while not stop.is_set():
-            try:
-                client_socket, addr = server_socket.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            threading.Thread(
-                target=handle_client, args=(state, client_socket, addr), daemon=True
-            ).start()
+    harness = start_test_server(_serve_plain)
 
-    accept_thread = threading.Thread(target=accept_loop, daemon=True)
-    accept_thread.start()
+    yield harness
 
-    yield state, port
-
-    stop.set()
-    server_socket.close()
-    accept_thread.join(timeout=2)
+    harness.shutdown()
 
 
 @pytest.fixture()

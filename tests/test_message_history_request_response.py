@@ -30,7 +30,6 @@ Run with:
 import json
 import socket
 import struct
-import threading
 import uuid
 from datetime import datetime, timezone
 from unittest import mock
@@ -51,11 +50,11 @@ from domain.conversation_summary import ConversationSummary
 from domain.message_delivery_status import MessageDeliveryStatus
 from domain.payload_type import PayloadType
 from payload.file_adapter import FilePayloadAdapter
-from security.tls import build_server_context
-from server.client_handler import handle_client
-from server.server_state import ServerState
 from storage import encrypted_blob_store
-from tests.tls_test_support import serve_tls_client, wrap_client_socket
+from tests.tls_test_support import (
+    start_test_server,
+    wrap_client_socket,
+)
 from utils.protocol import create_auth_packet, create_public_key_packet
 
 
@@ -102,48 +101,11 @@ def _recv_until(sock, predicate, attempts=40, per_attempt_timeout=0.3):
 
 @pytest.fixture()
 def running_server():
-    state = ServerState()
+    harness = start_test_server()
 
-    tls_context = build_server_context()
+    yield harness
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen()
-    port = server_socket.getsockname()[1]
-
-    stop = threading.Event()
-    handler_threads = []
-
-    def accept_loop():
-        server_socket.settimeout(0.2)
-        while not stop.is_set():
-            try:
-                client_socket, addr = server_socket.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            handler_thread = threading.Thread(
-                target=serve_tls_client,
-                args=(handle_client, state, client_socket, addr, state.logger),
-                kwargs={"context": tls_context},
-                daemon=True,
-            )
-            handler_thread.start()
-            handler_threads.append(handler_thread)
-
-    accept_thread = threading.Thread(target=accept_loop, daemon=True)
-    accept_thread.start()
-
-    yield state, port
-
-    stop.set()
-    server_socket.close()
-    accept_thread.join(timeout=2)
-
-    for handler_thread in handler_threads:
-        handler_thread.join(timeout=2)
+    harness.shutdown()
 
 
 def _utc_now():
