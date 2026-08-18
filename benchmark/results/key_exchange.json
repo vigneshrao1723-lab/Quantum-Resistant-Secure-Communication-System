@@ -1,0 +1,214 @@
+{
+  "environment": {
+    "timestamp_utc": "2026-08-18T11:27:17.750623+00:00",
+    "python": "3.12.0",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "machine": "AMD64",
+    "cryptography_version": "49.0.0",
+    "kyber_py_version": "1.2.0",
+    "pycryptodome_version": "3.23.0",
+    "rsa_backend": "native (cryptography / Rust+OpenSSL bindings)",
+    "kyber_backend": "pure Python (kyber-py)"
+  },
+  "configuration": {
+    "iterations": 200,
+    "warmup": 20,
+    "keygen_iterations": 25,
+    "keygen_warmup": 3
+  },
+  "primitive": {
+    "RSA": {
+      "key_generation": {
+        "iterations": 25,
+        "mean_ms": 33.212772000042605,
+        "stdev_ms": 14.786193350932065,
+        "median_ms": 31.8861000000652,
+        "min_ms": 9.80070000014166,
+        "max_ms": 72.68190000013419
+      },
+      "public_key_export": {
+        "iterations": 200,
+        "mean_ms": 0.0018555000247033604,
+        "stdev_ms": 0.0010802334205356494,
+        "median_ms": 0.0018000000636675395,
+        "min_ms": 0.0016999997569655534,
+        "max_ms": 0.01699999984339229
+      },
+      "public_key_import": {
+        "iterations": 200,
+        "mean_ms": 0.004060499989009259,
+        "stdev_ms": 0.000503145636414392,
+        "median_ms": 0.003999999989900971,
+        "min_ms": 0.0038999996831989847,
+        "max_ms": 0.011000000085914508
+      },
+      "key_exchange": {
+        "iterations": 200,
+        "mean_ms": 0.02727299999605748,
+        "stdev_ms": 0.014561236866291984,
+        "median_ms": 0.022349999881043914,
+        "min_ms": 0.020600000425474718,
+        "max_ms": 0.12999999989915523
+      },
+      "key_recovery": {
+        "iterations": 200,
+        "mean_ms": 0.513379500002884,
+        "stdev_ms": 0.10553709929541345,
+        "median_ms": 0.4728500000510394,
+        "min_ms": 0.43859999959749985,
+        "max_ms": 1.3051000000814383
+      },
+      "sizes_bytes": {
+        "public_key_raw": 256,
+        "public_key_wire_pem": 451,
+        "ciphertext_raw": 256,
+        "ciphertext_wire_base64": 344,
+        "shared_secret": 32
+      }
+    },
+    "KYBER": {
+      "key_generation": {
+        "iterations": 25,
+        "mean_ms": 2.425383999961923,
+        "stdev_ms": 0.12266160997653837,
+        "median_ms": 2.359800000249379,
+        "min_ms": 2.3176999998213432,
+        "max_ms": 2.7685999998539046
+      },
+      "public_key_export": {
+        "iterations": 200,
+        "mean_ms": 0.003353000010974938,
+        "stdev_ms": 0.0003076756976025194,
+        "median_ms": 0.0033000001167238224,
+        "min_ms": 0.003200000264769187,
+        "max_ms": 0.007200000254670158
+      },
+      "public_key_import": {
+        "iterations": 200,
+        "mean_ms": 0.0023470000201086805,
+        "stdev_ms": 6.4900395705763e-05,
+        "median_ms": 0.0023000002329354174,
+        "min_ms": 0.0021999999262334313,
+        "max_ms": 0.002600000243546674
+      },
+      "key_exchange": {
+        "iterations": 200,
+        "mean_ms": 3.392503999996279,
+        "stdev_ms": 0.20371318734803476,
+        "median_ms": 3.367599999819504,
+        "min_ms": 3.107300000010582,
+        "max_ms": 4.104399999960151
+      },
+      "key_recovery": {
+        "iterations": 200,
+        "mean_ms": 4.6155624999823885,
+        "stdev_ms": 0.22611518064756017,
+        "median_ms": 4.600100000061502,
+        "min_ms": 4.261999999926047,
+        "max_ms": 5.570700000134821
+      },
+      "sizes_bytes": {
+        "public_key_raw": 1184,
+        "public_key_wire_base64": 1580,
+        "ciphertext_raw": 1088,
+        "ciphertext_wire_base64": 1452,
+        "shared_secret": 32
+      }
+    }
+  },
+  "application": {
+    "RSA": {
+      "algorithm_in_use": "RSA",
+      "session_key_establish": {
+        "iterations": 200,
+        "mean_ms": 0.025393500020527426,
+        "stdev_ms": 0.015786108258727793,
+        "median_ms": 0.022400000034394907,
+        "min_ms": 0.02170000016121776,
+        "max_ms": 0.21010000000387663
+      },
+      "session_key_recover": {
+        "iterations": 200,
+        "mean_ms": 0.48010850002356165,
+        "stdev_ms": 0.07551070594643851,
+        "median_ms": 0.4469500001960114,
+        "min_ms": 0.4392000000734697,
+        "max_ms": 0.9755000000950531
+      },
+      "session_key_total_round_trip": {
+        "mean_ms": 0.5055020000440891,
+        "note": "establish + recover; excludes key generation (once per login)"
+      },
+      "group_key_wrap": {
+        "iterations": 200,
+        "mean_ms": 0.022492999976293504,
+        "stdev_ms": 0.0020584306515840922,
+        "median_ms": 0.02189999986512703,
+        "min_ms": 0.021500000002561137,
+        "max_ms": 0.04570000010062358
+      },
+      "group_key_unwrap": {
+        "iterations": 200,
+        "mean_ms": 0.47823599997855126,
+        "stdev_ms": 0.07112432602162659,
+        "median_ms": 0.44964999983676535,
+        "min_ms": 0.4388000002109038,
+        "max_ms": 0.9188999997604697
+      },
+      "sizes_bytes": {
+        "session_key_ciphertext_wire": 344,
+        "group_wrapped_key_wire": 344,
+        "group_encapsulation_wire": 0
+      }
+    },
+    "KYBER": {
+      "algorithm_in_use": "KYBER",
+      "session_key_establish": {
+        "iterations": 200,
+        "mean_ms": 3.3787180000012995,
+        "stdev_ms": 0.190616989162394,
+        "median_ms": 3.361999999924592,
+        "min_ms": 3.1129999997574487,
+        "max_ms": 4.018000000087341
+      },
+      "session_key_recover": {
+        "iterations": 200,
+        "mean_ms": 4.779404000003069,
+        "stdev_ms": 0.6709732648776325,
+        "median_ms": 4.5810500000698084,
+        "min_ms": 4.214900000079069,
+        "max_ms": 8.521199999904638
+      },
+      "session_key_total_round_trip": {
+        "mean_ms": 8.158122000004369,
+        "note": "establish + recover; excludes key generation (once per login)"
+      },
+      "group_key_wrap": {
+        "iterations": 200,
+        "mean_ms": 3.8679724999997234,
+        "stdev_ms": 0.6060001354871214,
+        "median_ms": 3.773700000010649,
+        "min_ms": 3.1872999998086016,
+        "max_ms": 7.657899999685469
+      },
+      "group_key_unwrap": {
+        "iterations": 200,
+        "mean_ms": 5.0531130000194935,
+        "stdev_ms": 0.3662194972139341,
+        "median_ms": 5.068400000027395,
+        "min_ms": 4.341400000157591,
+        "max_ms": 6.58160000011776
+      },
+      "sizes_bytes": {
+        "session_key_ciphertext_wire": 1452,
+        "group_wrapped_key_wire": 96,
+        "group_encapsulation_wire": 1452
+      }
+    }
+  },
+  "interpretation": {
+    "timing_caveat": "RSA is measured through native compiled bindings (cryptography/Rust/OpenSSL); ML-KEM through a pure-Python library (kyber-py). Timing differences reflect implementation, not algorithm.",
+    "size_validity": "Key and ciphertext sizes are fixed by FIPS 203 (ML-KEM-768) and RSA-2048/OAEP, so they hold for any conforming implementation."
+  }
+}
