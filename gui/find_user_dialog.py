@@ -44,11 +44,18 @@ class FindUserDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("User ID"))
+        layout.addWidget(QLabel("Phone Number"))
+
+        hint = QLabel(
+            "Find someone by the phone number they registered with. "
+            "They can find you by yours, shown in the status bar."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         self.id_input = QLineEdit()
 
-        self.id_input.setPlaceholderText("Enter the user's unique ID")
+        self.id_input.setPlaceholderText("e.g. +91 98765 43210")
 
         self.id_input.returnPressed.connect(
             self.handle_search
@@ -102,9 +109,9 @@ class FindUserDialog(QDialog):
 
     def handle_search(self):
 
-        user_id = self.id_input.text().strip()
+        phone_number = self.id_input.text().strip()
 
-        if not user_id:
+        if not phone_number:
             return
 
         self._found = None
@@ -112,13 +119,15 @@ class FindUserDialog(QDialog):
         self.open_button.setEnabled(False)
 
         try:
-            result = self.session.find_user_by_id(user_id)
+            result = self.session.find_user_by_phone_number(phone_number)
         except PermissionError as error:
             self.result_label.setText(str(error))
             return
 
         if result is None:
-            self.result_label.setText("User not found.")
+            self.result_label.setText(
+                "No user is registered with that phone number."
+            )
             return
 
         if result["username"] == self.session.get_username():

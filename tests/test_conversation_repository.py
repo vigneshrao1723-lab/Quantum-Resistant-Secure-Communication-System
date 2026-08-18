@@ -8,6 +8,7 @@ Run with:
     pytest tests/test_conversation_repository.py -v
 """
 
+import uuid
 from datetime import datetime, timezone
 
 from database.models.conversation import Conversation
@@ -28,6 +29,7 @@ def _make_user(repo, unique_suffix, tag):
         email=f"convrepo_{tag}_{unique_suffix}@example.com",
         display_name="Conversation Repo Test User",
         password_hash="irrelevant-hash-for-repo-tests",
+        phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
     )
     repo.commit()
     return user

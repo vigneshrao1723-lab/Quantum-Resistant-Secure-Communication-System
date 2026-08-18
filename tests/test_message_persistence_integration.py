@@ -114,6 +114,7 @@ def _register_user(suffix_hint=""):
             "email": f"mptest_{suffix_hint}{suffix}@example.com",
             "password": "Str0ng!Passw0rd",
             "confirm_password": "Str0ng!Passw0rd",
+            "phone_number": f"+91{uuid.uuid4().int % 10**12:012d}",
         }
         result = auth_service.register_user(RegisterRequest(**payload))
         assert result.success, result.errors

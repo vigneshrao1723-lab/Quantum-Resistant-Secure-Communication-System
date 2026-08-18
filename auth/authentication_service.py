@@ -23,6 +23,10 @@ from database.repositories.user_repository import UserRepository
 from logger_config import setup_logger
 from security.jwt_handler import JWTHandler, TokenExpiredError, TokenValidationError
 from security.password_handler import PasswordHandler
+from security.phone_number import (
+    InvalidPhoneNumberError,
+    normalize_phone_number,
+)
 
 # Audit trail for authentication events (registration, login, logout,
 # token refresh). Never log raw passwords or raw tokens here -- only
@@ -83,6 +87,25 @@ class AuthenticationService:
         if self.user_repo.get_by_email(registration_data.email):
             errors["email"] = "Email already exists."
 
+        # BUG 7 -- phone number is mandatory and unique, because it is
+        # the identifier other users search by. Normalising BEFORE the
+        # duplicate check is what makes the check correct: without it
+        # "+91 98765 43210" and "+919876543210" would both pass and
+        # create two accounts for one real number, and the UNIQUE
+        # constraint would not catch it either, since the stored
+        # strings differ.
+        normalized_phone_number = None
+
+        try:
+            normalized_phone_number = normalize_phone_number(
+                registration_data.phone_number
+            )
+        except InvalidPhoneNumberError as error:
+            errors["phone_number"] = str(error)
+        else:
+            if self.user_repo.get_by_phone_number(normalized_phone_number):
+                errors["phone_number"] = "Phone number already exists."
+
         if errors:
             self._log_auth_event(
                 "registration_failed",
@@ -104,6 +127,7 @@ class AuthenticationService:
                 email=registration_data.email,
                 display_name=registration_data.full_name,
                 password_hash=password_hash,
+                phone_number=normalized_phone_number,
             )
             self.user_repo.commit()
         except IntegrityError:
@@ -118,8 +142,10 @@ class AuthenticationService:
             )
             return RegistrationResult(
                 success=False,
-                message="Username or email is already in use.",
-                errors={"username": "Username or email already exists."},
+                message="Username, email, or phone number is already in use.",
+                errors={
+                    "username": "Username, email, or phone number already exists."
+                },
             )
         except SQLAlchemyError:
             self.user_repo.rollback()
@@ -246,6 +272,7 @@ class AuthenticationService:
             message="Authentication successful.",
             user_id=str(user.id),
             username=user.username,
+            phone_number=user.phone_number,
             role=user.role,
             session_id=session.session_id,
             token_pair=TokenPair(

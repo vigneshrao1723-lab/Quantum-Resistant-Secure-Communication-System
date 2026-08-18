@@ -3,7 +3,7 @@ GUI tests for Issue 3 (real-application testing bug report): User
 Must Be Searched By Unique ID.
 
 Follows the established offscreen-QApplication pattern (see
-tests/test_chat_window_connection_status.py). ClientSession.find_user_by_id()
+tests/test_chat_window_connection_status.py). ClientSession.find_user_by_phone_number()
 itself is unit-tested against a real database in
 tests/test_user_id_search.py -- here it's monkeypatched so these tests
 stay fast and isolated to the dialog's own behavior.
@@ -28,9 +28,9 @@ def _make_session(find_result=None, find_side_effect=None, username="me"):
     session = MagicMock()
     session.get_username.return_value = username
     if find_side_effect is not None:
-        session.find_user_by_id.side_effect = find_side_effect
+        session.find_user_by_phone_number.side_effect = find_side_effect
     else:
-        session.find_user_by_id.return_value = find_result
+        session.find_user_by_phone_number.return_value = find_result
     return session
 
 
@@ -41,7 +41,7 @@ def test_search_with_empty_input_does_nothing():
     dialog.id_input.setText("")
     dialog.handle_search()
 
-    session.find_user_by_id.assert_not_called()
+    session.find_user_by_phone_number.assert_not_called()
     assert dialog.get_result() is None
 
 
@@ -51,7 +51,7 @@ def test_search_found_user_enables_open_button():
     )
     dialog = FindUserDialog(session)
 
-    dialog.id_input.setText("abc-123")
+    dialog.id_input.setText("+919876543210")
     dialog.handle_search()
 
     assert dialog.open_button.isEnabled() is True
@@ -63,11 +63,13 @@ def test_search_not_found_shows_clear_message_and_disables_open():
     session = _make_session(find_result=None)
     dialog = FindUserDialog(session)
 
-    dialog.id_input.setText("00000000-0000-0000-0000-000000000000")
+    dialog.id_input.setText("+919999000111")
     dialog.handle_search()
 
     assert dialog.open_button.isEnabled() is False
-    assert "not found" in dialog.result_label.text().lower()
+    # BUG 7: the wording now names the identifier the user typed.
+    message = dialog.result_label.text().lower()
+    assert "no user" in message and "phone number" in message
     assert dialog.get_result() is None
 
 
@@ -78,7 +80,7 @@ def test_search_own_id_is_rejected():
     )
     dialog = FindUserDialog(session)
 
-    dialog.id_input.setText("self-id")
+    dialog.id_input.setText("+919876500000")
     dialog.handle_search()
 
     assert dialog.open_button.isEnabled() is False
@@ -89,7 +91,7 @@ def test_unauthenticated_permission_error_shown_as_message_not_crash():
     session = _make_session(find_side_effect=PermissionError("You must be logged in."))
     dialog = FindUserDialog(session)
 
-    dialog.id_input.setText("abc-123")
+    dialog.id_input.setText("+919876543210")
     dialog.handle_search()
 
     assert dialog.open_button.isEnabled() is False

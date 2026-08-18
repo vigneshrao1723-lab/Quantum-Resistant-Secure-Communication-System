@@ -19,6 +19,10 @@ from domain.message_delivery_status import MessageDeliveryStatus
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import BLOB_STORAGE_PAYLOAD_TYPES, PayloadType
 from security.jwt_handler import TokenExpiredError, TokenValidationError
+from security.phone_number import (
+    InvalidPhoneNumberError,
+    normalize_phone_number,
+)
 from server.broadcaster import (
     broadcast,
     broadcast_user_list,
@@ -1093,15 +1097,60 @@ def handle_user_lookup(state, client_socket, user, packet):
     """
 
     request_id = packet.get("request_id")
-    user_id = packet.get("user_id")
+    # BUG 7 -- two identifier types, resolved explicitly rather than by
+    # assuming every string is a UUID.
+    #
+    #   identifier_type == "phone"  ->  identifier, normalised, then
+    #                                   matched against the canonical
+    #                                   users.phone_number column
+    #   otherwise                   ->  user_id, the original UUID
+    #                                   path, unchanged for internal
+    #                                   and backward-compatible callers
+    identifier_type = packet.get("identifier_type")
 
-    if not request_id or not user_id:
+    if identifier_type == "phone":
+        identifier = packet.get("identifier")
+    else:
+        identifier = packet.get("user_id")
+
+    if not request_id or not identifier:
         return
 
     db = SessionLocal()
 
     try:
-        found = UserRepository(db).get_by_id(uuid.UUID(user_id))
+        user_repo = UserRepository(db)
+
+        if identifier_type == "phone":
+
+            # Normalised server-side, never trusting the client to have
+            # done it: the column stores the canonical form, so an
+            # un-normalised term would silently miss a user who is
+            # really there.
+            try:
+                found = user_repo.get_by_phone_number(
+                    normalize_phone_number(identifier)
+                )
+            except InvalidPhoneNumberError:
+                found = None
+
+        else:
+
+            # uuid.UUID() raises for a malformed string. Before this
+            # guard the exception escaped this handler entirely, was
+            # caught by handle_client()'s outer `except Exception`, and
+            # its `finally` then broadcast a leave, removed the client
+            # from state.clients and closed the socket -- so one
+            # malformed lookup DISCONNECTED the searching user. The
+            # GUI happened to be shielded because find_user_by_id()
+            # validates client-side first, but nothing at the protocol
+            # level was. Caught here, matching the
+            # (TypeError, ValueError, AttributeError) convention every
+            # other uuid.UUID() call site in this file already uses.
+            try:
+                found = user_repo.get_by_id(uuid.UUID(identifier))
+            except (TypeError, ValueError, AttributeError):
+                found = None
     finally:
         db.close()
 
@@ -1279,6 +1328,7 @@ def handle_register_request(state, client_socket, packet):
                 full_name=packet.get("full_name"),
                 username=packet.get("username"),
                 email=packet.get("email"),
+                phone_number=packet.get("phone_number") or "",
                 password=packet.get("password"),
                 confirm_password=packet.get("confirm_password"),
             )
@@ -1353,6 +1403,7 @@ def handle_login_request(state, client_socket, packet):
         message=result.message,
         user_id=result.user_id,
         username=result.username,
+        phone_number=result.phone_number,
         role=result.role,
         session_id=result.session_id,
         access_token=token_pair.access_token if token_pair else None,

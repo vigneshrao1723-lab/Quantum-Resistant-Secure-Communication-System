@@ -244,6 +244,11 @@ class ChatWindow(QWidget):
             self.session.key_manager.algorithm
         )
 
+        # BUG 7 (7.5) -- show the user their own discovery identifier.
+        self.status.set_phone_number(
+            getattr(self.session, "phone_number", "")
+        )
+
         self.status.set_username(
             self.session.get_username()
         )

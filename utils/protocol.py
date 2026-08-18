@@ -364,6 +364,34 @@ def create_user_lookup_request_packet(user_id):
     }
 
 
+def create_user_lookup_by_phone_request_packet(phone_number):
+    """
+    Ask the server to find a user by their phone number (BUG 7 --
+    phone-based user discovery).
+
+    Additive: create_user_lookup_request_packet() above is unchanged
+    and still resolves by UUID, which internal callers and every
+    existing test continue to use. This variant carries an explicit
+    identifier_type so the server never has to guess what a string is
+    -- the previous design assumed every identifier was a UUID and
+    fed it straight to uuid.UUID().
+
+    The phone number is sent as the user typed it; the server
+    normalises it through security/phone_number.py before looking it
+    up, so the client cannot bypass canonicalisation and the two sides
+    can only ever agree on what a number means.
+
+    Answered by the same user_lookup_result packet, so the response
+    shape and its deliberately minimal field set are unchanged.
+    """
+
+    return {
+        "type": "user_lookup_request",
+        "identifier_type": "phone",
+        "identifier": phone_number
+    }
+
+
 def create_user_lookup_result_packet(
     request_id,
     user_id=None,
@@ -396,6 +424,7 @@ def create_register_request_packet(
     full_name,
     username,
     email,
+    phone_number,
     password,
     confirm_password
 ):
@@ -418,6 +447,9 @@ def create_register_request_packet(
         "full_name": full_name,
         "username": username,
         "email": email,
+        # BUG 7 -- mandatory discovery identifier; the server
+        # normalises and enforces uniqueness.
+        "phone_number": phone_number,
         "password": password,
         "confirm_password": confirm_password
     }
@@ -476,6 +508,7 @@ def create_login_result_packet(
     request_id,
     success,
     message,
+    phone_number=None,
     user_id=None,
     username=None,
     role=None,
@@ -507,6 +540,10 @@ def create_login_result_packet(
         "message": message,
         "user_id": user_id,
         "username": username,
+        # BUG 7 (7.5) -- the identifier other users search by. Returned
+        # so the client can display it back to its own owner; it is the
+        # authenticated user's own number, never another account's.
+        "phone_number": phone_number,
         "role": role,
         "session_id": session_id,
         "access_token": access_token,

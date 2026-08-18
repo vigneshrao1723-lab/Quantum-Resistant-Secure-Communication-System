@@ -68,4 +68,5 @@ def registration_payload(unique_suffix, strong_password):
         "email": f"user_{unique_suffix}@example.com",
         "password": strong_password,
         "confirm_password": strong_password,
+        "phone_number": f"+91{uuid.uuid4().int % 10**12:012d}",
     }

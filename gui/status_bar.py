@@ -57,6 +57,11 @@ class StatusBarWidget(QWidget):
             "font-size: 9pt; font-weight: 600;"
         )
 
+        # BUG 7 -- the user's own discovery identifier, shown so it
+        # can be shared. Populated by ChatWindow.initialize_ui().
+        self.phone_label = QLabel("")
+        self.phone_label.setObjectName("StatusPhone")
+
         self.user_label = QLabel(
             "User: -"
         )
@@ -71,6 +76,8 @@ class StatusBarWidget(QWidget):
         layout.addWidget(self.algorithm_label)
 
         layout.addSpacing(20)
+
+        layout.addWidget(self.phone_label)
 
         layout.addWidget(self.user_label)
 
@@ -126,6 +133,21 @@ class StatusBarWidget(QWidget):
             f"background-color: {COLOR_PANEL_ALT}; color: {color}; "
             "padding: 4px 12px; border-radius: 10px; "
             "font-size: 9pt; font-weight: 600;"
+        )
+
+    def set_phone_number(self, phone_number):
+        """
+        Show the signed-in user's own phone number (BUG 7).
+
+        This is the identifier other people search by, so its owner
+        has to be able to read it off their own screen to share it --
+        the previous identifier was the internal UUID, which the
+        application never displayed, leaving no way to be found.
+        Nothing else about the account is exposed here.
+        """
+
+        self.phone_label.setText(
+            f"☎ {phone_number}" if phone_number else ""
         )
 
     def set_username(self, username):

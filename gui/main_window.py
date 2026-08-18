@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
         full_name,
         username,
         email,
+        phone_number,
         password,
         confirm_password,
     ):
@@ -96,6 +97,7 @@ class MainWindow(QMainWindow):
                 full_name=full_name,
                 username=username,
                 email=email,
+                phone_number=phone_number,
                 password=password,
                 confirm_password=confirm_password,
             )
@@ -138,6 +140,7 @@ class MainWindow(QMainWindow):
             user_id=result.user_id,
             username=result.username,
             session_id=result.session_id,
+            phone_number=result.phone_number,
             access_token=result.token_pair.access_token if result.token_pair else None,
             refresh_token=result.token_pair.refresh_token if result.token_pair else None,
         )
@@ -149,10 +152,12 @@ class MainWindow(QMainWindow):
         session_id,
         access_token,
         refresh_token,
+        phone_number="",
     ):
 
         self.session.user_id = user_id
         self.session.username = username
+        self.session.phone_number = phone_number or ""
         self.session.session_id = session_id
         self.session.access_token = access_token
         self.session.refresh_token = refresh_token

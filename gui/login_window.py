@@ -7,18 +7,18 @@ connect to the secure chat server.
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
-
 from PySide6.QtWidgets import (
-    QWidget,
-    QLabel,
-    QVBoxLayout,
     QFrame,
+    QLabel,
     QLineEdit,
-    QPushButton,
     QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
-from gui.styles import COLOR_TEXT_MUTED, COLOR_OFFLINE
+from gui.styles import COLOR_OFFLINE, COLOR_TEXT_MUTED
+from security.phone_number import is_valid_phone_number
 
 
 class LoginWindow(QWidget):
@@ -27,7 +27,7 @@ class LoginWindow(QWidget):
     """
 
     login_requested = Signal(str, str)
-    register_requested = Signal(str, str, str, str, str)
+    register_requested = Signal(str, str, str, str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -138,6 +138,18 @@ class LoginWindow(QWidget):
         self.email_input.setPlaceholderText(
             "Enter your email"
         )
+        # BUG 7 -- the discovery identifier. Mandatory, because other
+        # users find this account by it; registration is rejected
+        # server-side without one.
+        self.phone_label = QLabel("PHONE NUMBER")
+        self.phone_label.setObjectName("FieldLabel")
+        self.phone_label.setAlignment(Qt.AlignLeft)
+
+        self.phone_input = QLineEdit()
+        self.phone_input.setPlaceholderText(
+            "e.g. +91 98765 43210  (others find you by this)"
+        )
+
         self.email_input.returnPressed.connect(
             self.handle_submit
         )
@@ -241,6 +253,8 @@ class LoginWindow(QWidget):
         card_layout.addWidget(self.full_name_input)
         card_layout.addWidget(self.email_label)
         card_layout.addWidget(self.email_input)
+        card_layout.addWidget(self.phone_label)
+        card_layout.addWidget(self.phone_input)
 
         card_layout.addWidget(username_label)
         card_layout.addWidget(self.username_input)
@@ -271,6 +285,8 @@ class LoginWindow(QWidget):
         self.full_name_input.setVisible(register)
         self.email_label.setVisible(register)
         self.email_input.setVisible(register)
+        self.phone_label.setVisible(register)
+        self.phone_input.setVisible(register)
         self.confirm_password_label.setVisible(register)
         self.confirm_password_input.setVisible(register)
 
@@ -350,9 +366,10 @@ class LoginWindow(QWidget):
         if self.is_register_mode:
             full_name = self.full_name_input.text().strip()
             email = self.email_input.text().strip()
+            phone_number = self.phone_input.text().strip()
             confirm_password = self.confirm_password_input.text()
 
-            if not full_name or not email or not confirm_password:
+            if not full_name or not email or not phone_number or not confirm_password:
                 QMessageBox.warning(
                     self,
                     "Registration Required",
@@ -361,10 +378,23 @@ class LoginWindow(QWidget):
                 self.set_connecting(False)
                 return
 
+            # Checked here only to fail fast with a clear message --
+            # the server validates and normalises independently, and
+            # is the actual boundary.
+            if not is_valid_phone_number(phone_number):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Phone Number",
+                    "Enter a valid phone number, for example +91 98765 43210."
+                )
+                self.set_connecting(False)
+                return
+
             self.register_requested.emit(
                 full_name,
                 username,
                 email,
+                phone_number,
                 password,
                 confirm_password,
             )

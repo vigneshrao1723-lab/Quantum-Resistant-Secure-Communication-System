@@ -36,6 +36,7 @@ class User(Base):
     __table_args__ = (
         UniqueConstraint("username", name="uq_users_username"),
         UniqueConstraint("email", name="uq_users_email"),
+        UniqueConstraint("phone_number", name="uq_users_phone_number"),
     )
 
     id = Column(
@@ -48,6 +49,23 @@ class User(Base):
     username = Column(String(32), nullable=False, index=True)
     email = Column(String(254), nullable=False, index=True)
     password_hash = Column(Text, nullable=False)
+
+    # The user-facing discovery identifier (BUG 7). users.id stays the
+    # internal primary key -- nothing about identity, foreign keys, or
+    # authentication moves onto this column; it exists so one person
+    # can find another without having to exchange a UUID, which the
+    # application never displayed and therefore nobody could share.
+    #
+    # Stored ALREADY NORMALISED (see security/phone_number.py): a
+    # leading "+" when the caller supplied one, digits only after
+    # that. Normalising before storage is what makes the UNIQUE
+    # constraint mean what it should -- "+91 98765 43210" and
+    # "+919876543210" are the same person's number and must collide,
+    # which they only do if both are canonicalised on the way in.
+    #
+    # 20 characters: E.164 allows at most 15 digits, so "+" plus 15 is
+    # 16; 20 leaves room without inviting free-form text.
+    phone_number = Column(String(20), nullable=False, index=True)
 
     display_name = Column(String(64), nullable=False)
     profile_picture = Column(String(256), nullable=True)

@@ -8,6 +8,7 @@ Run with:
     pytest tests/test_session_repository.py -v
 """
 
+import uuid
 from datetime import datetime
 
 from database.repositories.session_repository import SessionRepository
@@ -21,6 +22,7 @@ def _make_user(db_session, unique_suffix):
         email=f"sess_user_{unique_suffix}@example.com",
         display_name="Session Test User",
         password_hash="irrelevant-hash-for-repo-tests",
+        phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
     )
     repo.commit()
     return user

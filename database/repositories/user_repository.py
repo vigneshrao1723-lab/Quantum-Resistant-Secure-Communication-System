@@ -19,6 +19,17 @@ class UserRepository(BaseRepository):
         statement = select(User).where(User.username == username)
         return self.db.scalar(statement)
 
+    def get_by_phone_number(self, phone_number):
+        """Look up a user by their canonical phone number (BUG 7).
+
+        The caller must pass an already-normalised value -- the column
+        stores the canonical form, so an un-normalised search term
+        would silently miss. server/client_handler.py's lookup handler
+        normalises before calling this.
+        """
+        statement = select(User).where(User.phone_number == phone_number)
+        return self.db.scalar(statement)
+
     def get_by_email(self, email):
         statement = select(User).where(User.email == email)
         return self.db.scalar(statement)

@@ -121,6 +121,7 @@ def _committed_user(suffix_hint=""):
             "email": f"authll_{suffix_hint}{suffix}@example.com",
             "password": "Str0ng!Passw0rd",
             "confirm_password": "Str0ng!Passw0rd",
+            "phone_number": f"+91{uuid.uuid4().int % 10**12:012d}",
         }
         result = auth_service.register_user(RegisterRequest(**payload))
         assert result.success, result.errors
@@ -375,11 +376,21 @@ def test_login_result_never_contains_password_hash_or_extra_fields(running_serve
         response = _recv(sock)
 
         assert response["success"] is True
+        # phone_number is a DELIBERATE addition (BUG 7): the signed-in
+        # user's own discovery identifier, returned so the UI can show
+        # it back to them to share. The guard's purpose is unchanged --
+        # an exact field set, so nothing unexpected can start leaking.
         assert set(response.keys()) == {
             "type", "request_id", "success", "message", "user_id", "username",
+            "phone_number",
             "role", "session_id", "access_token", "refresh_token", "expires_in",
             "token_type", "errors",
         }
+
+        # It is this user's OWN number, and nothing sensitive rides along.
+        assert response["phone_number"] == user["phone_number"]
+        assert "password_hash" not in response
+        assert "email" not in response
     finally:
         sock.close()
         _delete_user(user["username"])

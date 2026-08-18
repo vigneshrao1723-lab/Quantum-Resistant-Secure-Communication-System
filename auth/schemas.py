@@ -12,6 +12,10 @@ class RegisterRequest:
     email: str
     password: str
     confirm_password: str
+    # BUG 7 -- the user-facing discovery identifier. Mandatory:
+    # discovery only works if every account has one. Normalised
+    # by security/phone_number.py before it is stored.
+    phone_number: str = ""
 
 
 @dataclass
@@ -47,6 +51,10 @@ class AuthenticationResult:
     message: str
     user_id: str | None = None
     username: str | None = None
+    # BUG 7 (7.5) -- the authenticated user's OWN discovery identifier,
+    # returned so the UI can show it back to them to share. Never
+    # another account's number.
+    phone_number: str | None = None
     role: str | None = None
     session_id: str | None = None
     token_pair: TokenPair | None = None

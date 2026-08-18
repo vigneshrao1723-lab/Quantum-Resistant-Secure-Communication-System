@@ -39,6 +39,7 @@ from domain.payload_type import (
 from logger_config import setup_logger
 from payload.file_adapter import FilePayloadAdapter
 from payload.text_adapter import TextPayloadAdapter
+from security.phone_number import is_valid_phone_number
 from security.tls import build_client_context
 from utils.network import receive_message, send_message
 from utils.protocol import (
@@ -60,6 +61,7 @@ from utils.protocol import (
     create_read_receipt_packet,
     create_register_request_packet,
     create_session_key_packet,
+    create_user_lookup_by_phone_request_packet,
     create_user_lookup_request_packet,
 )
 from utils.request_registry import PendingRequestRegistry, RequestTimeoutError
@@ -126,6 +128,11 @@ class ClientSession(QObject):
 
         self.user_id = None
         self.username = ""
+
+        # BUG 7 (7.5) -- the identifier others search by, so the user
+        # needs to be able to read it off their own screen and share
+        # it. Populated at login from the authenticated account.
+        self.phone_number = ""
         self.session_id = None
         self.access_token = None
         self.refresh_token = None
@@ -449,6 +456,9 @@ class ClientSession(QObject):
             success=bool(response.get("success")),
             message=response.get("message") or "Authentication failed.",
             user_id=response.get("user_id"),
+            # BUG 7 (7.5) -- the authenticated user's OWN identifier,
+            # so the UI can show it back to them to share.
+            phone_number=response.get("phone_number"),
             username=response.get("username"),
             role=response.get("role"),
             session_id=response.get("session_id"),
@@ -517,6 +527,7 @@ class ClientSession(QObject):
         full_name,
         username,
         email,
+        phone_number,
         password,
         confirm_password
     ):
@@ -565,6 +576,7 @@ class ClientSession(QObject):
                 full_name=full_name,
                 username=username,
                 email=email,
+                phone_number=phone_number,
                 password=password,
                 confirm_password=confirm_password,
             )
@@ -1262,6 +1274,53 @@ class ClientSession(QObject):
 
         response = self.send_request(
             create_user_lookup_request_packet(user_id=user_id_str)
+        )
+
+        if not response.get("user_id"):
+            return None
+
+        return {
+            "user_id": response["user_id"],
+            "username": response["username"],
+            "display_name": response["display_name"],
+        }
+
+    def find_user_by_phone_number(self, phone_number):
+        """
+        Look up a user by their phone number (BUG 7 -- phone-based
+        user discovery).
+
+        The phone number is what this application shows people as
+        "your ID", so it is the identifier the Find User dialog sends.
+        find_user_by_id() above is unchanged and still resolves by
+        UUID for internal callers.
+
+        Returns the same minimal dict find_user_by_id() returns --
+        {user_id, username, display_name}, deliberately never email,
+        password state, or internal flags -- or None when nothing
+        matches. A malformed number is short-circuited here, before a
+        request is sent, and reported identically to a well-formed
+        number that matches nobody, so a caller cannot distinguish the
+        two. The server normalises independently, so this local check
+        is a convenience, never the security boundary.
+
+        Discovery is a pure database lookup: an OFFLINE user is found
+        exactly like an online one. Presence and discovery are
+        unrelated.
+        """
+
+        if not self.access_token:
+            raise PermissionError(
+                "Not authenticated. Please log in first."
+            )
+
+        if not is_valid_phone_number(phone_number):
+            return None
+
+        response = self.send_request(
+            create_user_lookup_by_phone_request_packet(
+                phone_number=phone_number
+            )
         )
 
         if not response.get("user_id"):

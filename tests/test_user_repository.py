@@ -8,6 +8,7 @@ Run with:
     pytest tests/test_user_repository.py -v
 """
 
+import uuid
 from datetime import datetime
 
 from database.repositories.user_repository import UserRepository
@@ -21,6 +22,9 @@ def _make_user(repo, unique_suffix, **overrides):
         "password_hash": "irrelevant-hash-for-repo-tests",
     }
     kwargs.update(overrides)
+    kwargs.setdefault(
+        "phone_number", f"+91{uuid.uuid4().int % 10**12:012d}"
+    )
     user = repo.create(**kwargs)
     repo.commit()
     return user

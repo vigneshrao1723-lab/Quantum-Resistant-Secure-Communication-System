@@ -101,6 +101,7 @@ def _committed_user(suffix_hint=""):
             "email": f"reg_{suffix_hint}{suffix}@example.com",
             "password": "Str0ng!Passw0rd",
             "confirm_password": "Str0ng!Passw0rd",
+            "phone_number": f"+91{uuid.uuid4().int % 10**12:012d}",
         }
         result = auth_service.register_user(RegisterRequest(**payload))
         assert result.success, result.errors
@@ -157,6 +158,7 @@ def test_register_creates_a_real_account(running_server, monkeypatch):
             email=email,
             password="Str0ng!Passw0rd",
             confirm_password="Str0ng!Passw0rd",
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
 
         assert result.success is True
@@ -188,6 +190,7 @@ def test_register_duplicate_username_is_rejected(running_server, monkeypatch):
             email=f"different_{uuid.uuid4().hex[:10]}@example.com",
             password="Str0ng!Passw0rd",
             confirm_password="Str0ng!Passw0rd",
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
 
         assert result.success is False
@@ -211,6 +214,7 @@ def test_register_password_mismatch_is_rejected(running_server, monkeypatch):
             email=f"{username}@example.com",
             password="Str0ng!Passw0rd",
             confirm_password="SomethingElse!1",
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
 
         assert result.success is False
@@ -243,6 +247,7 @@ def test_register_does_not_add_the_connection_to_server_state(running_server, mo
             email=f"{username}@example.com",
             password="Str0ng!Passw0rd",
             confirm_password="Str0ng!Passw0rd",
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
 
         assert result.success is True
@@ -273,6 +278,7 @@ def test_register_then_login_on_the_same_session_object(running_server, monkeypa
             email=f"{username}@example.com",
             password=password,
             confirm_password=password,
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
         assert result.success is True
 
@@ -311,6 +317,7 @@ def test_register_request_requires_no_prior_authentication(running_server):
             email=f"{username}@example.com",
             password="Str0ng!Passw0rd",
             confirm_password="Str0ng!Passw0rd",
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
         packet["request_id"] = str(uuid.uuid4())
         _send(sock, packet)
@@ -379,6 +386,7 @@ def test_register_request_missing_request_id_is_silently_ignored(running_server)
             email=f"{username}@example.com",
             password="Str0ng!Passw0rd",
             confirm_password="Str0ng!Passw0rd",
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
         # Deliberately no request_id -- mirrors
         # handle_user_lookup()'s identical guard.
@@ -414,6 +422,7 @@ def test_register_request_weak_password_is_rejected_end_to_end(running_server):
             email=f"{username}@example.com",
             password="weak",
             confirm_password="weak",
+            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
         packet["request_id"] = str(uuid.uuid4())
         _send(sock, packet)
