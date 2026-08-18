@@ -25,6 +25,7 @@ import pytest
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from database.connection import SessionLocal
+from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from tests.tls_test_support import (
@@ -221,3 +222,91 @@ def test_group_of_five_all_share_the_same_conversation_id(make_group_of):
 
     conversation_ids = {r["conversation_id"] for r in results.values()}
     assert len(conversation_ids) == 1
+
+
+def test_only_explicitly_selected_users_become_members(make_group_of):
+    """
+    BUG 3 (server-side half): membership is exactly the creator plus
+    the usernames actually requested -- an online user who was NOT
+    selected must not be pulled in.
+
+    The client-side defect was a dialog that mis-collected the
+    selection (see tests/test_group_member_selection_clicks.py). This
+    asserts the other end of the contract, directly against the
+    ConversationMember rows, so a future change that widened
+    membership server-side could not pass unnoticed.
+
+    Four users are connected; only two are named in the request. The
+    fourth is deliberately left online and unselected -- being
+    connected must not be enough to join a group.
+    """
+
+    creator, selected, bystander, other_bystander = make_group_of(4)
+
+    _send(
+        creator["sock"],
+        create_group_create_packet(
+            sender=creator["username"],
+            name="Selected Only",
+            member_usernames=[selected["username"]],
+        ),
+    )
+
+    result = _recv_until(
+        creator["sock"], lambda p: p.get("type") == "group_create_result"
+    )
+    assert result is not None
+
+    conversation_id = uuid.UUID(result["conversation_id"])
+
+    db = SessionLocal()
+    try:
+        member_ids = {
+            str(member_id)
+            for member_id in ConversationRepository(db).get_member_user_ids(
+                conversation_id
+            )
+        }
+    finally:
+        db.close()
+
+    assert member_ids == {creator["user_id"], selected["user_id"]}, (
+        "membership must be exactly the creator plus the requested user"
+    )
+
+    for excluded in (bystander, other_bystander):
+        assert excluded["user_id"] not in member_ids, (
+            f"{excluded['username']} was online but never selected, and "
+            f"must not be a member"
+        )
+
+    # The creator is added from the authenticated session, exactly once,
+    # even though the client never names itself in the request.
+    assert len(member_ids) == 2
+
+
+def test_unselected_online_user_never_receives_the_group(make_group_of):
+    """The confirmation is delivered only to actual members, so an
+    unselected online user's client never learns the group exists --
+    which is what made it look like everyone had been added."""
+
+    creator, selected, bystander = make_group_of(3)
+
+    _send(
+        creator["sock"],
+        create_group_create_packet(
+            sender=creator["username"],
+            name="No Bystanders",
+            member_usernames=[selected["username"]],
+        ),
+    )
+
+    assert _recv_until(
+        selected["sock"], lambda p: p.get("type") == "group_create_result"
+    ) is not None, "the selected member must receive the group"
+
+    assert _recv_until(
+        bystander["sock"],
+        lambda p: p.get("type") == "group_create_result",
+        attempts=8,
+    ) is None, "an unselected online user must not receive the group"

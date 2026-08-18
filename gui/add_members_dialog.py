@@ -59,7 +59,13 @@ class AddMembersDialog(QDialog):
 
             item = QListWidgetItem(username)
 
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            # Cleared, not set -- see gui/create_group_dialog.py's
+            # identical line for the full rationale: with the flag set,
+            # Qt toggles the indicator itself and then emits
+            # itemClicked, so _toggle_item_check_state() cancelled the
+            # click. Clearing it makes that handler the single toggle
+            # path for a click anywhere on the row.
+            item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
 
             item.setCheckState(Qt.Unchecked)
 

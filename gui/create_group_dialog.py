@@ -70,7 +70,23 @@ class CreateGroupDialog(QDialog):
 
             item = QListWidgetItem(username)
 
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            # ItemIsUserCheckable is deliberately CLEARED, not set.
+            #
+            # With it set, Qt toggles the checkbox itself whenever the
+            # small indicator glyph is clicked and THEN emits
+            # itemClicked -- so _toggle_item_check_state() below
+            # toggled a second time and cancelled the click. Measured
+            # with real mouse events: clicking the indicator selected
+            # nothing at all, while clicking the row text worked, so a
+            # user ticking boxes ended up with an empty or partial
+            # member list.
+            #
+            # Clearing the flag leaves _toggle_item_check_state() as
+            # the single toggle path for a click anywhere on the row,
+            # indicator included. The checkbox still renders, because
+            # that is driven by setCheckState() below, not by this
+            # flag.
+            item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
 
             item.setCheckState(Qt.Unchecked)
 
