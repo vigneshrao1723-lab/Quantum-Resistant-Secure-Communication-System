@@ -1744,6 +1744,23 @@ class ClientSession(QObject):
     # ----------------------------------------------------------
 
     def handle_public_key(self, packet):
+        """
+        Cache another client's public key, as relayed by the server.
+
+        D6.5 -- Public-Key Input Validation: the key is validated by
+        KeyManager.add_public_key() -> KyberKEM/RSAEncryption.
+        import_public_key() before it is stored, so malformed key
+        material is rejected here rather than cached and left to fail
+        later during key wrapping. A rejection is logged and the packet
+        dropped: nothing is stored, and the "secure session established"
+        style confirmation below is deliberately not emitted, since no
+        usable key was actually obtained.
+
+        Only ValueError/TypeError are caught -- the two data errors
+        import_public_key() documents for untrusted input. Anything
+        else propagates to the receiver loop as before, so a genuine
+        bug is never disguised as a bad peer key.
+        """
 
         username = packet["username"]
 
@@ -1751,10 +1768,19 @@ class ClientSession(QObject):
 
         public_key = packet["public_key"]
 
-        self.key_manager.add_public_key(
-            username,
-            public_key
-        )
+        try:
+            self.key_manager.add_public_key(
+                username,
+                public_key
+            )
+        except (ValueError, TypeError) as error:
+
+            self.logger.warning(
+                f"Rejected malformed {algorithm} public key from "
+                f"{username}: {error}"
+            )
+
+            return
 
         self.logger.info(
             f"Stored {algorithm} public key for {username}"
@@ -1914,6 +1940,38 @@ class ClientSession(QObject):
         recipient with no cached public key (never online this
         session) does not receive it; retroactive delivery to a
         late-joining or previously-offline member is out of scope.
+
+        Every recipient is handled independently (D6 -- Group Key
+        Distribution Robustness): one member's unusable key material
+        must never stop the members after them in ``recipients`` from
+        receiving the key. Previously an unusable key raised straight
+        out of this loop, so a single bad key silently truncated
+        distribution -- leaving the remaining members permanently
+        unable to decrypt this epoch, with the rotation still reported
+        as complete.
+
+        Only ValueError/TypeError are caught, and only around the
+        wrapping call itself: those are the failures that mean "this
+        peer's key material is unusable", never a bug in this code.
+        Anything else (AttributeError, KeyError, ...) is a programming
+        error and is deliberately left to propagate.
+
+        Still required after D6.5 -- Public-Key Input Validation, which
+        made import_public_key() reject non-Base64 and wrong-length key
+        material at handle_public_key() time. Length validation cannot
+        be completeness validation: a key of exactly the right length
+        whose contents are not a well-formed ML-KEM encapsulation key
+        still passes import and is only rejected later, here, by
+        ML-KEM's own modulus check ("t_hat does not encode correctly",
+        raised as ValueError). D6.5 shrinks the set of keys that can
+        reach this point; it does not empty it. The two layers are
+        complementary: reject early where the format is knowable,
+        contain the failure per-recipient where it is not.
+
+        The send itself is intentionally NOT wrapped: a send_message()
+        failure is a connection-level problem, not a per-recipient
+        one, and continuing the loop over a dead socket would be
+        pointless -- that behavior is unchanged from before.
         """
 
         for member in recipients:
@@ -1927,9 +1985,18 @@ class ClientSession(QObject):
 
                 continue
 
-            encapsulation, wrapped_key = self.key_manager.wrap_key_for_member(
-                member, group_key
-            )
+            try:
+                encapsulation, wrapped_key = self.key_manager.wrap_key_for_member(
+                    member, group_key
+                )
+            except (ValueError, TypeError) as error:
+
+                self.logger.warning(
+                    f"Unusable public key for {member}; cannot distribute "
+                    f"group key for {conversation_id} epoch {epoch}: {error}"
+                )
+
+                continue
 
             packet = create_group_key_distribution_packet(
                 sender=self.username,

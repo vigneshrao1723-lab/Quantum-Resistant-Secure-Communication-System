@@ -166,6 +166,18 @@ def create_group_key_distribution_packet(
     ever relays this packet's opaque fields -- it never sees the
     group key itself.
 
+    Authorization (D6 -- Key Distribution Authorization): the relay is
+    no longer unconditional. The server requires the authenticated
+    sender to be an active member of `conversation_id`, and requires
+    `recipient` to be an active member of that same conversation,
+    before forwarding anything -- see server/client_handler.py::
+    handle_group_key_distribution(). `sender` is present for logging/
+    symmetry only and is NOT trusted: the server overwrites it with
+    the authenticated username before relay, exactly as it already
+    does for a "chat" and a direct "session_key" packet. Rejections
+    are silent (server-side log only). The packet's field shape is
+    unchanged.
+
     `epoch` (Phase 7 -- Group Membership Management): which epoch this
     wrapped key belongs to. Defaults to 1 -- the one existing call
     site (initial group creation) passes it explicitly, since epoch 1

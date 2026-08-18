@@ -400,13 +400,32 @@ def test_legitimate_group_member_can_send(trio):
         message = messages[0]
         assert str(message.sender_id) == creator["user_id"]
 
-        recipients = (
-            db.query(MessageRecipient)
-            .filter(MessageRecipient.message_id == message.id)
-            .all()
-        )
-        recipient_ids = {str(r.recipient_id) for r in recipients}
-        assert recipient_ids == {member_b["user_id"], member_c["user_id"]}
+        # The recipient rows need their own wait, exactly like the
+        # message row above. persist_group_message() commits the
+        # content row and the MessageRecipient rows in two SEPARATE
+        # transactions -- a documented, accepted design -- so seeing
+        # the message is no guarantee the recipient rows have landed
+        # yet. Asserting immediately after the message poll made this
+        # test read inside that window and fail intermittently.
+        #
+        # Polling for the exact expected set (not merely "any rows")
+        # keeps the assertion just as strong: a wrong or partial set
+        # never satisfies the loop and still fails below.
+        expected_recipient_ids = {member_b["user_id"], member_c["user_id"]}
+        recipient_ids = set()
+
+        for _ in range(100):
+            recipients = (
+                db.query(MessageRecipient)
+                .filter(MessageRecipient.message_id == message.id)
+                .all()
+            )
+            recipient_ids = {str(r.recipient_id) for r in recipients}
+            if recipient_ids == expected_recipient_ids:
+                break
+            time.sleep(0.05)
+
+        assert recipient_ids == expected_recipient_ids
     finally:
         db.close()
 

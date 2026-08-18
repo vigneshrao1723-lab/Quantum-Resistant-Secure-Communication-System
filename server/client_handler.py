@@ -682,6 +682,197 @@ def handle_group_key_rotation_complete(state, client_socket, user, packet):
     _dispatch_pending_rotation_if_needed(state, conversation_id)
 
 
+def handle_group_key_distribution(state, client_socket, user, packet):
+    """
+    Relay one member's wrapped copy of a group key to another member
+    (D6 -- Key Distribution Authorization; extracted unchanged from the
+    inline "group_key_distribution" branch handle_client() used to
+    carry, then hardened).
+
+    The server still never sees the group key itself: encapsulation/
+    wrapped_key stay opaque and are forwarded byte-for-byte, exactly as
+    before. Key generation, wrapping, and unwrapping remain entirely
+    client-side (crypto/key_manager.py::wrap_key_for_member()/
+    unwrap_received_key()) -- this handler only decides whether a relay
+    is allowed, never what is relayed.
+
+    Authorization (D6.2 -- sender): the authenticated identity for this
+    socket (``user``, established via JWT at authenticate_connection()
+    time) must be an active member of conversation_id, using the same
+    ConversationRepository.get_member_user_ids() check
+    handle_group_leave()/handle_group_chat_delivery()/
+    handle_group_key_rotation_complete()/handle_epoch_reservation_request()
+    already use. This closes a genuinely new authorization boundary:
+    the previous inline relay performed no membership check at all, so
+    any authenticated user could inject key material into any
+    conversation. That mattered because distribute_public_keys()
+    broadcasts every connected client's public key to every other
+    connected client regardless of shared membership, so a non-member
+    could produce a validly-wrapped key for any online victim, and
+    KeyManager.store_key()'s "highest epoch wins" rule would then make
+    the injected key that victim's CURRENT key for the conversation --
+    poisoning the group's key state and breaking decryption for the
+    real members.
+
+    packet["sender"] is overwritten with the authenticated username
+    before forwarding -- the identical hardening handle_client()
+    already applies to "chat" and direct "session_key" packets, and for
+    the same reason: a client-supplied sender field is never
+    trustworthy. Today's receiving client does not read that field (see
+    ClientSession.handle_group_key_distribution(), which keys off
+    ``recipient`` alone), so this is consistency/defence-in-depth
+    rather than a fix for a live exploit -- but it means no future
+    reader of this packet can inherit a spoofable identity.
+
+    Authorization (D6.3 -- recipient): the matched recipient must
+    itself be an active member of the same conversation. Verified
+    against the connected socket's own server-assigned user_id (the
+    identity bound at authentication, never a client-supplied field) --
+    the same membership set and the same comparison shape
+    _select_connected_active_member() already uses, so there is no
+    second, duplicate notion of "is a member" anywhere in this file.
+    A member cannot use this relay to hand a group key to an outsider.
+    (A malicious member could of course leak a key they already hold
+    out-of-band; this check is not claimed to prevent that -- it
+    enforces the server's own authorization model consistently and
+    stops accidental or forged misrouting.)
+
+    Rejections are silent, server-log-only -- no error packet is
+    returned to the sender, matching every other group-authorization
+    check in this file. A missing/malformed conversation_id, a missing
+    recipient, a non-member sender, and a non-member recipient are
+    therefore indistinguishable on the wire, mirroring the existing
+    "don't let an error reveal which guess was closer" convention (see
+    handle_epoch_reservation_request()).
+
+    A recipient who is not currently connected is a silent no-op, with
+    nothing forwarded -- unchanged from the original inline behavior.
+    """
+
+    conversation_id = packet.get("conversation_id")
+    recipient = packet.get("recipient")
+
+    if not conversation_id or not recipient:
+
+        state.logger.warning(
+            f"Rejected group_key_distribution from {user.username}: "
+            f"missing conversation_id or recipient"
+        )
+
+        return
+
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except (TypeError, ValueError, AttributeError):
+
+        state.logger.warning(
+            f"Rejected group_key_distribution from {user.username}: "
+            f"invalid conversation_id"
+        )
+
+        return
+
+    # Epoch must be a plain positive integer. bool is excluded
+    # explicitly because bool subclasses int, so True would otherwise
+    # sail through as epoch 1.
+    epoch = packet.get("epoch")
+
+    if epoch is None:
+        epoch = 1
+
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+
+        state.logger.warning(
+            f"Rejected group_key_distribution from {user.username}: "
+            f"invalid epoch"
+        )
+
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+        current_epoch, _confirmed_epoch = conversation_repo.get_epoch_state(
+            conversation_uuid
+        )
+    finally:
+        db.close()
+
+    if user.id not in member_ids:
+
+        state.logger.warning(
+            f"Rejected group_key_distribution: {user.username} is not a "
+            f"member of {conversation_id}"
+        )
+
+        return
+
+    # The epoch may not exceed what the server itself has reserved for
+    # this conversation.
+    #
+    # Without this, membership alone was enough to poison a peer
+    # permanently. KeyManager.store_key() tracks the current epoch with
+    # max(), so a member could distribute a key of their own choosing
+    # stamped with an absurdly high epoch (999999): the victim would
+    # immediately encrypt every outgoing group message under it, and --
+    # because every subsequent legitimate rotation carries a LOWER
+    # number -- would never recover, even after the attacker left the
+    # group. Only a client restart cleared it.
+    #
+    # Every legitimate distribution is bounded by current_key_epoch:
+    # group creation uses epoch 1 (the column default), a rotation uses
+    # the epoch reserve_next_epoch() already bumped current_key_epoch
+    # to, and reconnect redelivery re-sends current_key_epoch itself.
+    if current_epoch is None or epoch > current_epoch:
+
+        state.logger.warning(
+            f"Rejected group_key_distribution from {user.username}: "
+            f"epoch {epoch} exceeds the reserved epoch for "
+            f"{conversation_id}"
+        )
+
+        return
+
+    # Never trust a client-supplied sender field -- see docstring.
+    packet["sender"] = user.username
+
+    member_id_strings = {str(member_id) for member_id in member_ids}
+
+    for sock, client in list(state.clients.items()):
+
+        if client["username"] != recipient:
+            continue
+
+        if client.get("user_id") not in member_id_strings:
+
+            state.logger.warning(
+                f"Rejected group_key_distribution: recipient {recipient} "
+                f"is not a member of {conversation_id}"
+            )
+
+            return
+
+        if send_to_client(sock, packet):
+
+            state.logger.info(
+                f"Forwarded group key for "
+                f"{conversation_id} "
+                f"from {user.username} to {recipient}"
+            )
+
+        else:
+
+            state.logger.warning(
+                f"Failed to forward group key for "
+                f"{conversation_id} "
+                f"from {user.username} to {recipient}"
+            )
+
+        return
+
+
 def handle_group_add_members(state, client_socket, user, packet):
     """
     Add one or more users to an existing group conversation
@@ -2256,29 +2447,7 @@ def handle_client(state, client_socket, client_address):
             # -----------------------------
             elif packet.get("type") == "group_key_distribution":
 
-                recipient = packet.get("recipient")
-
-                for sock, client in list(state.clients.items()):
-
-                    if client["username"] == recipient:
-
-                        if send_to_client(sock, packet):
-
-                            state.logger.info(
-                                f"Forwarded group key for "
-                                f"{packet.get('conversation_id')} "
-                                f"from {username} to {recipient}"
-                            )
-
-                        else:
-
-                            state.logger.warning(
-                                f"Failed to forward group key for "
-                                f"{packet.get('conversation_id')} "
-                                f"from {username} to {recipient}"
-                            )
-
-                        break
+                handle_group_key_distribution(state, client_socket, user, packet)
 
             # -----------------------------
             # Group Leave Packet (Phase 7)
