@@ -1401,6 +1401,29 @@ class ClientSession(QObject):
 
         self.conversation_store.set_initial(summaries)
 
+        # BUG 8 -- presence must survive the initial load.
+        #
+        # set_initial() replaces the whole store, and ``summaries``
+        # above is built purely from the server's conversation list:
+        # online_users only decides is_online for partners already
+        # conversed with, so a peer never messaged before is not in it
+        # at all. handle_user_list() runs on the receiver thread and
+        # may therefore have recorded presence moments BEFORE this
+        # method replaced the store, in which case those entries were
+        # silently discarded and the sidebar stayed stale until the
+        # next broadcast -- which only happens when somebody else
+        # connects or disconnects. That is what made presence
+        # asymmetric: the client that connected first was already past
+        # its own startup, so it kept every later broadcast, while a
+        # later joiner threw its copy away.
+        #
+        # Re-applying the presence this session already knows about
+        # closes that window, in the one place the store is wholesale
+        # replaced. It is idempotent, and safe whichever order the two
+        # threads happen to run in: update_online_status() only adds
+        # missing peers and flips is_online, it never drops rows.
+        self.conversation_store.update_online_status(self.online_users)
+
     @staticmethod
     def _parse_incoming_timestamp(raw_timestamp):
         """
