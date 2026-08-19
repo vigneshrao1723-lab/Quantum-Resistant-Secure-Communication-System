@@ -161,8 +161,24 @@ def alice_and_bob(running_server, monkeypatch):
     alice_payload = _register_user("alice_")
     bob_payload = _register_user("bob_")
 
-    alice = _make_connected_session(alice_payload)
-    bob = _make_connected_session(bob_payload)
+    # Every session a test creates is tracked here and disconnected in
+    # teardown, whether the test passes or fails. A test that builds a
+    # session locally and disconnects it on its last line leaks that
+    # connection the moment any earlier assertion fails: the server's
+    # handler thread stays alive holding a TLS socket, and
+    # ServerHarness.shutdown() then fails with "handler thread(s) did
+    # not terminate" -- which is exactly the leaked-thread condition
+    # the harness exists to catch, and which can contaminate later
+    # tests in the same run. Tests use fixture["connect"](payload).
+    tracked = []
+
+    def _connect(payload):
+        session = _make_connected_session(payload)
+        tracked.append(session)
+        return session
+
+    alice = _connect(alice_payload)
+    bob = _connect(bob_payload)
 
     assert _wait_for(lambda: alice.key_manager.get_public_key(bob.username) is not None)
     assert _wait_for(lambda: bob.key_manager.get_public_key(alice.username) is not None)
@@ -180,9 +196,10 @@ def alice_and_bob(running_server, monkeypatch):
         "bob_payload": bob_payload,
         "alice": alice,
         "bob": bob,
+        "connect": _connect,
     }
 
-    for session in (alice, bob):
+    for session in tracked:
         try:
             session.disconnect()
         except Exception:
@@ -213,50 +230,173 @@ def test_baseline_direct_messaging_works_before_restart(alice_and_bob):
     )
 
 
-def test_key_recovers_after_alice_restarts(alice_and_bob):
-    """The core A1 regression test: Alice restarts (fresh
-    ClientSession/KeyManager, same account), reconnects, and the
-    conversation must recover automatically -- both directions."""
+def test_restart_recovers_the_historical_key_when_the_partner_is_connected(
+    alice_and_bob,
+):
+    """TEST A -- a restart with the partner still connected RECOVERS
+    the historical epoch rather than minting a new one (BUG 4 Fix B).
+
+    This replaces an earlier assertion that a restarted client must
+    hold no key and must reserve a NEW epoch on its next send. That
+    described the world before direct key recovery existed, and it is
+    no longer what the architecture does or should do:
+
+      * Rotation in this project is triggered by GROUP MEMBERSHIP
+        change and nothing else -- reserve_next_epoch() is called from
+        handle_group_leave() and handle_group_add_members(). A direct
+        conversation has no membership changes, so it has no rotation
+        trigger at all.
+      * establish_session_key()'s epoch reservation exists for
+        COLLISION AVOIDANCE ("no collision is possible", see its
+        docstring), not for secrecy -- and it is skipped entirely by
+        the long-standing `if self.key_manager.has_key(...): return`
+        rule, which is what makes a key long-lived for as long as a
+        client holds it.
+      * README's "Reconnection and history recovery" states that a
+        client reconnecting *including after a restart* recovers state
+        from the server rather than relying on local cache.
+
+    Nothing is weakened here: the no-collision invariant the original
+    test protected is asserted in full by the two tests below, and
+    this one adds coverage that did not exist -- that the recovered
+    key is byte-identical to the original and that pre-restart history
+    stays readable.
+    """
+
     fixture = alice_and_bob
-    port = fixture["port"]
     bob = fixture["bob"]
+    old_alice = fixture["alice"]
     conversation_id = fixture["conversation_id"]
 
-    old_alice = fixture["alice"]
-
-    # Establish the pre-restart baseline both directions, so the fix
-    # is proven against real prior state, not an empty conversation.
     old_alice.send_chat_message("message before the restart")
     assert _wait_for(
-        lambda: _last_received_text(bob, old_alice.username) == "message before the restart"
+        lambda: _last_received_text(bob, old_alice.username)
+        == "message before the restart"
     )
 
     pre_restart_epoch = old_alice.key_manager.current_epoch(conversation_id)
     assert pre_restart_epoch is not None
+    pre_restart_key = old_alice.key_manager.get_key(
+        conversation_id, epoch=pre_restart_epoch
+    )
+    assert pre_restart_key is not None
 
-    # --- Alice restarts ---
+    # --- Alice restarts; Bob stays connected holding the key ---
     old_alice.disconnect()
 
-    new_alice = _make_connected_session(fixture["alice_payload"])
+    new_alice = fixture["connect"](fixture["alice_payload"])
 
     assert _wait_for(
         lambda: new_alice.key_manager.get_public_key(bob.username) is not None
     )
 
+    # Deterministic: wait for recovery rather than racing it.
+    assert _wait_for(
+        lambda: new_alice.key_manager.get_key(
+            conversation_id, epoch=pre_restart_epoch
+        )
+        is not None
+    ), "reconnect did not recover the historical direct key"
+
+    # The recovered key is the ORIGINAL, not a replacement.
+    assert (
+        new_alice.key_manager.get_key(conversation_id, epoch=pre_restart_epoch)
+        == pre_restart_key
+    )
+    assert new_alice.key_manager.current_epoch(conversation_id) == pre_restart_epoch
+
     _open_direct_chat(new_alice, bob.username)
     assert new_alice.current_conversation_id == conversation_id
 
-    # A brand-new KeyManager -- exactly the state a real restart
-    # leaves a client in, and exactly what caused the reported bug.
-    assert new_alice.key_manager.get_key(conversation_id) is None
+    # Pre-restart history is readable again -- the point of recovering.
+    history = new_alice.load_conversation_history(bob.username, is_group=False)
+    assert any(
+        row["text"] == "message before the restart" for row in history
+    ), "the pre-restart message did not decrypt after the restart"
 
-    # New Alice sends -- must establish a NEW key under a NEW epoch,
-    # not the old, already-claimed one.
+    # --- Alice sends again: she must REUSE the recovered key ---
     new_alice.send_chat_message("message after the restart")
 
     assert _wait_for(
-        lambda: _last_received_text(bob, new_alice.username) == "message after the restart"
-    ), "Bob never received/decrypted Alice's post-restart message -- key desync reproduced"
+        lambda: _last_received_text(bob, new_alice.username)
+        == "message after the restart"
+    ), "Bob never received/decrypted Alice's post-restart message"
+
+    assert new_alice.key_manager.current_epoch(conversation_id) == pre_restart_epoch, (
+        "a recovered key must be reused, not replaced by a fresh epoch"
+    )
+
+    # No unnecessary epoch was burned server-side either.
+    current, _confirmed = _get_epoch_state(conversation_id)
+    assert current == pre_restart_epoch
+
+    # Bob still holds exactly the one epoch, unchanged and unoverwritten.
+    assert (
+        bob.key_manager.get_key(conversation_id, epoch=pre_restart_epoch)
+        == pre_restart_key
+    )
+
+    # --- Two-way ---
+    bob.send_chat_message("welcome back, alice")
+
+    assert _wait_for(
+        lambda: _last_received_text(new_alice, bob.username) == "welcome back, alice"
+    ), "Alice never received/decrypted Bob's reply after her restart"
+
+
+def test_restart_reserves_a_new_epoch_when_no_recovery_is_possible(alice_and_bob):
+    """TEST B -- recovery unavailable.
+
+    Both sides restart, so nobody is left holding the historical key
+    and there is nothing to recover. This is the path that still needs
+    establish_session_key()'s epoch reservation, and it must reserve a
+    genuinely NEW epoch rather than reusing a number either side might
+    already have claimed.
+    """
+
+    fixture = alice_and_bob
+    old_alice = fixture["alice"]
+    old_bob = fixture["bob"]
+    conversation_id = fixture["conversation_id"]
+
+    old_alice.send_chat_message("message before both restart")
+    assert _wait_for(
+        lambda: _last_received_text(old_bob, old_alice.username)
+        == "message before both restart"
+    )
+
+    pre_restart_epoch = old_alice.key_manager.current_epoch(conversation_id)
+    assert pre_restart_epoch is not None
+
+    # --- Both restart: no client anywhere still holds the key ---
+    old_alice.disconnect()
+    old_bob.disconnect()
+    time.sleep(0.4)
+
+    new_bob = fixture["connect"](fixture["bob_payload"])
+    new_alice = fixture["connect"](fixture["alice_payload"])
+
+    assert _wait_for(
+        lambda: new_alice.key_manager.get_public_key(new_bob.username) is not None
+    )
+    assert _wait_for(
+        lambda: new_bob.key_manager.get_public_key(new_alice.username) is not None
+    )
+
+    # Nothing can be recovered -- neither side has the key to give.
+    assert new_alice.key_manager.get_key(conversation_id) is None
+    assert new_bob.key_manager.get_key(conversation_id) is None
+
+    _open_direct_chat(new_alice, new_bob.username)
+    _open_direct_chat(new_bob, new_alice.username)
+    assert new_alice.current_conversation_id == conversation_id
+
+    new_alice.send_chat_message("message after both restarted")
+
+    assert _wait_for(
+        lambda: _last_received_text(new_bob, new_alice.username)
+        == "message after both restarted"
+    ), "Bob never received/decrypted the post-restart message -- key desync"
 
     post_restart_epoch = new_alice.key_manager.current_epoch(conversation_id)
     assert post_restart_epoch is not None
@@ -264,22 +404,97 @@ def test_key_recovers_after_alice_restarts(alice_and_bob):
         "the post-restart key must use a NEW epoch, not collide with the old one"
     )
 
-    # Bob must now hold BOTH epochs -- the old one (so his own
-    # pre-restart history stays readable) and the new one -- never an
-    # overwrite.
-    assert bob.key_manager.get_key(conversation_id, epoch=pre_restart_epoch) is not None
+    assert new_bob.key_manager.get_key(conversation_id, epoch=post_restart_epoch) is not None
+
+    new_bob.send_chat_message("hello again alice")
+    assert _wait_for(
+        lambda: _last_received_text(new_alice, new_bob.username)
+        == "hello again alice"
+    ), "two-way messaging did not recover after both sides restarted"
+
+
+def test_restart_without_recovery_never_collides_with_the_partners_epoch(
+    alice_and_bob,
+):
+    """TEST B, continued -- the original A1 no-collision invariant,
+    preserved exactly.
+
+    Alice restarts while Bob is briefly disconnected, so no partner is
+    online to recover from; Bob then returns with his KeyManager
+    intact. Alice therefore has no key and must reserve a NEW epoch --
+    and Bob, who still holds the OLD one, must end up holding BOTH.
+    That is precisely the desynchronization the A1 fix exists to
+    prevent: before it, Alice's new key landed on epoch 1, Bob refused
+    to overwrite his cached epoch 1, and the two diverged forever.
+    """
+
+    fixture = alice_and_bob
+    old_alice = fixture["alice"]
+    bob = fixture["bob"]
+    conversation_id = fixture["conversation_id"]
+
+    old_alice.send_chat_message("before alice restarts alone")
+    assert _wait_for(
+        lambda: _last_received_text(bob, old_alice.username)
+        == "before alice restarts alone"
+    )
+
+    pre_restart_epoch = old_alice.key_manager.current_epoch(conversation_id)
+    pre_restart_key = bob.key_manager.get_key(
+        conversation_id, epoch=pre_restart_epoch
+    )
+    assert pre_restart_key is not None
+
+    # Bob drops off the socket but keeps his KeyManager (a connection
+    # blip, not an application restart), and Alice restarts while he
+    # is away -- so there is no connected partner to recover from.
+    bob.disconnect()
+    time.sleep(0.4)
+    old_alice.disconnect()
+
+    new_alice = fixture["connect"](fixture["alice_payload"])
+    time.sleep(0.6)
+
+    assert new_alice.key_manager.get_key(conversation_id) is None, (
+        "nothing should have been recoverable with no partner connected"
+    )
+
+    # Bob comes back, still holding the old epoch.
+    bob.connect()
+    bob.login(fixture["bob_payload"]["username"])
+    bob.send_public_key()
+    bob.start_receiver()
+
+    assert _wait_for(
+        lambda: new_alice.key_manager.get_public_key(bob.username) is not None
+    )
+
+    _open_direct_chat(new_alice, bob.username)
+    new_alice.send_chat_message("after alice restarted alone")
+
+    assert _wait_for(
+        lambda: _last_received_text(bob, new_alice.username)
+        == "after alice restarted alone"
+    ), "Bob never received/decrypted Alice's message -- key desync reproduced"
+
+    post_restart_epoch = new_alice.key_manager.current_epoch(conversation_id)
+    assert post_restart_epoch > pre_restart_epoch, (
+        "the post-restart key must use a NEW epoch, not collide with the old one"
+    )
+
+    # Bob holds BOTH -- the old one (so his own pre-restart history
+    # stays readable) and the new one. Never an overwrite.
+    assert (
+        bob.key_manager.get_key(conversation_id, epoch=pre_restart_epoch)
+        == pre_restart_key
+    )
     assert bob.key_manager.get_key(conversation_id, epoch=post_restart_epoch) is not None
     assert bob.key_manager.current_epoch(conversation_id) == post_restart_epoch
 
-    # Bob replies -- new Alice must decrypt it correctly, proving full
-    # two-way recovery, not just Alice-to-Bob.
-    bob.send_chat_message("welcome back, alice")
-
+    bob.send_chat_message("and hello back")
     assert _wait_for(
-        lambda: _last_received_text(new_alice, bob.username) == "welcome back, alice"
-    ), "Alice never received/decrypted Bob's reply after her restart"
-
-    new_alice.disconnect()
+        lambda: _last_received_text(new_alice, bob.username) == "and hello back"
+    ), "Alice never received/decrypted Bob's reply"
 
 
 def test_epoch_reservation_is_server_persisted_not_local(alice_and_bob):

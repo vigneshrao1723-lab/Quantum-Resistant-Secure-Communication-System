@@ -38,6 +38,8 @@ from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
 from crypto.aes import AESCipher
 from database.connection import SessionLocal
+from database.models.message_recipient import MessageRecipient
+from database.models.message import Message
 from database.repositories.message_repository import MessageRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
@@ -206,13 +208,92 @@ def _get_message_by_conversation(conversation_id):
         db.close()
 
 
+def _transfer_diagnostics(elapsed, attempts, user_a_id=None, user_b_id=None,
+                          conversation_id=None):
+    """Snapshot of the state observed when a transfer wait times out.
+
+    Diagnostics only. Beyond the message/recipient rows, this reports
+    the blob side specifically -- whether blob_ref was set and whether
+    the referenced blob actually exists and how large it is -- because
+    a file/image message is persisted in two places (the row and the
+    blob store) and "the row was not there yet" and "the blob was not
+    there yet" are different failures that a bare
+    "assert saved is not None" cannot tell apart.
+    """
+
+    import threading
+
+    lines = [f"elapsed={elapsed:.2f}s attempts={attempts}"]
+    db = SessionLocal()
+
+    try:
+        if conversation_id is not None:
+            lines.append(f"conversation_id={conversation_id}")
+            messages = MessageRepository(db).get_group_conversation(conversation_id)
+        else:
+            lines.append(f"user_a={user_a_id} user_b={user_b_id}")
+            messages = MessageRepository(db).get_conversation(user_a_id, user_b_id)
+
+        lines.append(f"messages found: {len(messages)}")
+
+        for message in messages[-3:]:
+            recipients = (
+                db.query(MessageRecipient)
+                .filter(MessageRecipient.message_id == message.id)
+                .all()
+            )
+            lines.append(
+                f"  message_id={message.id} "
+                f"conversation_id={message.conversation_id} "
+                f"payload_type={message.payload_type!r} "
+                f"ciphertext={'set' if message.ciphertext else None} "
+                f"blob_ref={message.blob_ref!r} "
+                f"content_metadata={message.content_metadata!r}"
+            )
+            lines.append(
+                f"    recipient rows={len(recipients)} statuses="
+                f"{[(str(r.recipient_id)[:8], r.status) for r in recipients]}"
+            )
+
+            if message.blob_ref:
+                try:
+                    blob = encrypted_blob_store.load_blob(message.blob_ref)
+                    lines.append(f"    blob present, {len(blob)} bytes")
+                except Exception as blob_error:  # noqa: BLE001
+                    lines.append(
+                        f"    blob MISSING/unreadable: "
+                        f"{type(blob_error).__name__}: {blob_error}"
+                    )
+
+        lines.append(f"messages in database (all users): {db.query(Message).count()}")
+    except Exception as error:  # noqa: BLE001 -- diagnostics must never mask
+        lines.append(f"diagnostic query failed: {type(error).__name__}: {error}")
+    finally:
+        db.close()
+
+    threads = threading.enumerate()
+    lines.append(f"live threads={len(threads)}: {[t.name for t in threads][:12]}")
+
+    return chr(10).join(lines)
+
+
 def _wait_for_group_message(conversation_id, attempts=100):
+    started = time.perf_counter()
+
     for _ in range(attempts):
         messages = _get_message_by_conversation(conversation_id)
         if messages:
             return messages[-1]
         time.sleep(0.05)
-    return None
+
+    # Diagnostics only -- every caller already asserts "is not None".
+    raise AssertionError(
+        f"group message was never persisted within {attempts * 0.05:.1f}s"
+        + chr(10)
+        + _transfer_diagnostics(
+            time.perf_counter() - started, attempts, conversation_id=conversation_id
+        )
+    )
 
 
 def _get_direct_conversation(user_a_id, user_b_id):
@@ -224,12 +305,25 @@ def _get_direct_conversation(user_a_id, user_b_id):
 
 
 def _wait_for_direct_message(user_a_id, user_b_id, attempts=100):
+    started = time.perf_counter()
+
     for _ in range(attempts):
         conversation = _get_direct_conversation(user_a_id, user_b_id)
         if conversation:
             return conversation[-1]
         time.sleep(0.05)
-    return None
+
+    # Diagnostics only -- every caller already asserts "is not None".
+    raise AssertionError(
+        f"direct message was never persisted within {attempts * 0.05:.1f}s"
+        + chr(10)
+        + _transfer_diagnostics(
+            time.perf_counter() - started,
+            attempts,
+            user_a_id=user_a_id,
+            user_b_id=user_b_id,
+        )
+    )
 
 
 @pytest.fixture()
@@ -340,7 +434,13 @@ def test_direct_file_transfer_delivers_and_persists(sender_and_recipient):
     )
 
     delivered = _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
-    assert delivered is not None
+    assert delivered is not None, (
+        "the file message was never relayed to the recipient socket"
+        + chr(10)
+        + _transfer_diagnostics(
+            0.0, 0, user_a_id=uuid.UUID(sender_id), user_b_id=uuid.UUID(recipient_id)
+        )
+    )
     assert delivered["payload_type"] == PayloadType.FILE
     assert delivered["content_metadata"] == content_metadata
 

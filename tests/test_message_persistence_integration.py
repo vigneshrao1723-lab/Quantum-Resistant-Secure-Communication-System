@@ -37,6 +37,7 @@ from crypto.aes import AESCipher
 from database.connection import SessionLocal
 from database.models.conversation_member import ConversationMember
 from database.models.message import Message
+from database.models.message_recipient import MessageRecipient
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.session_repository import SessionRepository
@@ -181,6 +182,74 @@ def _get_conversation(sender_user_id, receiver_user_id):
         db.close()
 
 
+def _persistence_diagnostics(sender_user_id, receiver_user_id, elapsed, attempts):
+    """Snapshot of the state observed when a persistence wait times out.
+
+    Diagnostics only. A bare "assert saved is not None" reports that the
+    row was absent but nothing about why: whether the message landed
+    under a different sender/receiver pair, whether its recipient row is
+    missing, whether the server threads that should have written it are
+    still alive, or whether it simply had not happened yet. Capturing
+    that at the moment of failure means the next occurrence names its
+    own cause instead of needing another full-suite reproduction.
+    """
+
+    import threading
+
+    lines = []
+    db = SessionLocal()
+
+    try:
+        sender_uuid = (
+            sender_user_id
+            if isinstance(sender_user_id, uuid.UUID)
+            else uuid.UUID(str(sender_user_id))
+        )
+        receiver_uuid = (
+            receiver_user_id
+            if isinstance(receiver_user_id, uuid.UUID)
+            else uuid.UUID(str(receiver_user_id))
+        )
+
+        lines.append(f"sender_id={sender_uuid} receiver_id={receiver_uuid}")
+        lines.append(f"elapsed={elapsed:.2f}s attempts={attempts}")
+
+        pair = MessageRepository(db).get_conversation(sender_uuid, receiver_uuid)
+        lines.append(f"messages for this pair: {len(pair)}")
+
+        for message in pair[-3:]:
+            recipients = (
+                db.query(MessageRecipient)
+                .filter(MessageRecipient.message_id == message.id)
+                .all()
+            )
+            lines.append(
+                f"  message_id={message.id} "
+                f"conversation_id={message.conversation_id} "
+                f"payload_type={message.payload_type!r} epoch={message.epoch!r} "
+                f"ciphertext={'set' if message.ciphertext else None} "
+                f"blob_ref={message.blob_ref!r}"
+            )
+            lines.append(
+                f"    recipient rows={len(recipients)} statuses="
+                f"{[(str(r.recipient_id)[:8], r.status) for r in recipients]}"
+            )
+
+        # In case it landed under an unexpected receiver_id.
+        from_sender = db.query(Message).filter(Message.sender_id == sender_uuid).count()
+        lines.append(f"messages from this sender (any receiver): {from_sender}")
+        lines.append(f"messages in database (all users): {db.query(Message).count()}")
+    except Exception as error:  # noqa: BLE001 -- diagnostics must never mask
+        lines.append(f"diagnostic query failed: {type(error).__name__}: {error}")
+    finally:
+        db.close()
+
+    threads = threading.enumerate()
+    lines.append(f"live threads={len(threads)}: {[t.name for t in threads][:12]}")
+
+    return chr(10).join(lines)
+
+
 def _wait_for_persisted_message(sender_user_id, receiver_user_id, attempts=100):
     """Persistence happens on the server thread right after
     send_to_client() -- poll briefly rather than assuming it's
@@ -191,12 +260,27 @@ def _wait_for_persisted_message(sender_user_id, receiver_user_id, attempts=100):
     than the pre-TLS budget -- a generous ceiling costs nothing on the
     common, fast path, since the loop still breaks the instant
     persistence lands."""
+    started = time.perf_counter()
+
     for _ in range(attempts):
         conversation = _get_conversation(sender_user_id, receiver_user_id)
         if conversation:
             return conversation[-1]
         time.sleep(0.05)
-    return None
+
+    # Diagnostics only: raise with the observed state rather than
+    # returning None. Every caller already asserts "is not None", so
+    # assertion strength is unchanged -- only the diagnosis is.
+    raise AssertionError(
+        f"message was never persisted within {attempts * 0.05:.1f}s"
+        + chr(10)
+        + _persistence_diagnostics(
+            sender_user_id,
+            receiver_user_id,
+            time.perf_counter() - started,
+            attempts,
+        )
+    )
 
 
 def _wait_for_conversation_length(user_a_id, user_b_id, expected_length, attempts=100):
@@ -277,7 +361,11 @@ def test_message_persisted_after_successful_delivery(sender_and_recipient):
     )
 
     delivered = _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
-    assert delivered is not None
+    assert delivered is not None, (
+        "the message was never relayed to the recipient socket"
+        + chr(10)
+        + _persistence_diagnostics(sender_id, recipient_id, 0.0, 0)
+    )
 
     saved = _wait_for_persisted_message(sender_id, recipient_id)
     assert saved is not None
