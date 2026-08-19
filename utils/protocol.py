@@ -253,6 +253,93 @@ def create_group_key_rotation_required_packet(conversation_id, epoch, members):
     }
 
 
+def create_direct_key_recovery_available_packet(conversations):
+    """
+    Server -> a reconnecting client: these are the DIRECT
+    conversations you can read, and the key epochs their stored
+    messages are encrypted under (BUG 4 -- Fix B).
+
+    ``conversations`` is a list of {"conversation_id": str, "epochs":
+    [int, ...]}. Coordination metadata only -- conversation ids and
+    epoch numbers, both of which the server already tracks; no key
+    material, and nothing the recipient is not already authorized to
+    read (the same conversation-membership rule that governs message
+    history).
+
+    This exists so the CLIENT can decide what it actually needs.
+    Whether a given epoch's key is already cached is knowledge only
+    the client has -- the server holds no keys and therefore cannot
+    tell a client that has just restarted from one that never left.
+    Announcing what is available and letting the client ask for the
+    subset it lacks is what keeps a reconnect from re-wrapping and
+    re-sending every historical key every time.
+    """
+
+    return {
+        "type": "direct_key_recovery_available",
+        "conversations": conversations
+    }
+
+
+def create_direct_key_recovery_request_packet(conversation_id, epochs):
+    """
+    Client -> server: I am missing these epochs for this direct
+    conversation; please ask a partner who has them to send them
+    (BUG 4 -- Fix B).
+
+    Carries no key material and no identity: the server derives the
+    requester exclusively from the authenticated connection (see
+    server/client_handler.py::handle_direct_key_recovery_request()),
+    so there is nothing here for a malicious client to forge in order
+    to obtain someone else's keys. The conversation and the epochs it
+    names are both verified server-side before anything is dispatched.
+    """
+
+    return {
+        "type": "direct_key_recovery_request",
+        "conversation_id": conversation_id,
+        "epochs": epochs
+    }
+
+
+def create_direct_key_redelivery_required_packet(conversation_id, epoch, recipient):
+    """
+    Server -> the currently-connected partner of a DIRECT conversation:
+    ``recipient`` has just reconnected and is holding queued messages
+    encrypted under ``epoch``; if you still have that exact epoch's
+    key, hand them a wrapped copy (BUG 4 -- Fix B, direct key
+    recovery). Carries no key material -- only coordination metadata
+    (conversation_id, an epoch number, one username), all of which the
+    server already legitimately knows.
+
+    Deliberately NOT create_group_key_rotation_required_packet() reused
+    under a new name, even though the two are shaped alike. That packet
+    instructs its receiver to GENERATE a key when it doesn't have the
+    epoch (see ClientSession.handle_group_key_rotation_required()'s
+    os.urandom(32) branch), which is exactly the wrong thing to do
+    here: a freshly generated key cannot decrypt ciphertext that
+    already exists, so inventing one would leave the recipient holding
+    a key that authenticates nothing while the real messages stay
+    unreadable -- and, because KeyManager tracks the current epoch with
+    max(), would additionally poison both sides' notion of the current
+    key. The handler for this packet redelivers an existing key or
+    does nothing at all.
+
+    ``epoch`` is the epoch the queued MESSAGES were encrypted under
+    (messages.epoch), never the conversation's current epoch -- a
+    direct conversation accumulates a new epoch every time either side
+    establishes a key with an empty KeyManager, so "current" is
+    routinely NOT the epoch an older queued message needs.
+    """
+
+    return {
+        "type": "direct_key_redelivery_required",
+        "conversation_id": conversation_id,
+        "epoch": epoch,
+        "recipient": recipient
+    }
+
+
 def create_group_key_rotation_complete_packet(conversation_id, epoch):
     """
     Client -> server: distribution of `epoch`'s group key has been
@@ -845,6 +932,38 @@ def create_delivery_failure_packet(
         "type": "delivery_failure",
         "receiver": receiver,
         "reason": reason
+    }
+
+
+def create_message_queued_packet(receiver, message_id=None, conversation_id=None):
+    """
+    Server -> sender: the recipient is a real, registered user who is
+    not connected right now, and their message has been safely
+    persisted as ciphertext for later delivery (BUG 4 -- Fix A).
+
+    This is a SUCCESS response, and the distinction from
+    create_delivery_failure_packet() is the whole point of it. The
+    server has stored offline direct messages since C1, but still
+    answered with delivery_failure -- so the sender's GUI raised an
+    error for a message that was, in fact, safely saved. "Not relayed
+    live at this instant" and "not delivered, do something about it"
+    are different facts and now have different packets.
+
+    delivery_failure keeps its original meaning exactly, for the cases
+    that really are failures: a recipient who does not exist at all,
+    and a persistence attempt that genuinely failed.
+
+    Deliberately NOT a claim of delivery. The recipient's
+    MessageRecipient row stays QUEUED (never DELIVERED) until the
+    message is actually relayed to them -- see
+    server/client_handler.py::_record_direct_recipient().
+    """
+
+    return {
+        "type": "message_queued",
+        "receiver": receiver,
+        "message_id": message_id,
+        "conversation_id": conversation_id
     }
 
 

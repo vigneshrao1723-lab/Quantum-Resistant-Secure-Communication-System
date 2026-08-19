@@ -401,7 +401,7 @@ def test_direct_offline_message_creates_queued_recipient(running_server):
 
     try:
         _send_direct_message(sender_sock, sender_name, recipient_name)
-        _recv_until(sender_sock, lambda p: p.get("type") == "delivery_failure")
+        _recv_until(sender_sock, lambda p: p.get("type") == "message_queued")
 
         saved = _wait_for_direct_message(
             sender_payload["user_id"], recipient_payload["user_id"]
@@ -430,7 +430,7 @@ def test_direct_message_not_read_merely_by_reconnecting(running_server):
 
     try:
         _send_direct_message(sender_sock, sender_name, recipient_name)
-        _recv_until(sender_sock, lambda p: p.get("type") == "delivery_failure")
+        _recv_until(sender_sock, lambda p: p.get("type") == "message_queued")
 
         saved = _wait_for_direct_message(
             sender_payload["user_id"], recipient_payload["user_id"]

@@ -877,14 +877,19 @@ def test_text_payload_still_stored_inline_not_as_blob(sender_and_recipient):
 # ----------------------------------------------------------------------
 
 
-def test_message_to_real_offline_user_is_persisted_and_reports_delivery_failure(
+def test_message_to_real_offline_user_is_persisted_and_reports_queued(
     running_server,
 ):
     """Requirement A: a real, registered recipient who is currently
-    disconnected still gets their message saved. delivery_failure is
-    still sent -- its meaning is unchanged (not live-delivered right
-    now) -- but unlike before this fix, the message itself is not
-    lost."""
+    disconnected still gets their message saved.
+
+    BUG 4 -- Fix A: the sender is now told message_queued rather than
+    delivery_failure. This test previously asserted the opposite, and
+    that assertion encoded the bug: the message was persisted
+    correctly and the sender was told it had failed. What is checked
+    here is strictly stronger than before -- the queued response must
+    arrive AND no delivery_failure may be sent at all, where the old
+    version only checked that some failure arrived."""
     _state, port = running_server
 
     sender_payload = _register_user("c1a_sender_")
@@ -915,12 +920,24 @@ def test_message_to_real_offline_user_is_persisted_and_reports_delivery_failure(
             ),
         )
 
-        failure = _recv_until(
-            sender_sock, lambda p: p.get("type") == "delivery_failure"
+        queued = _recv_until(
+            sender_sock, lambda p: p.get("type") == "message_queued"
         )
-        assert failure is not None
-        assert failure["receiver"] == recipient_name
-        assert failure["reason"]
+        assert queued is not None
+        assert queued["receiver"] == recipient_name
+        assert queued["message_id"]
+        assert queued["conversation_id"]
+
+        # The whole point of Fix A: no failure is reported for a
+        # message that was stored correctly. Checked by draining
+        # whatever else is already queued on this socket rather than
+        # by absence-of-a-blocking-read, so a delivery_failure sent
+        # alongside the queued response would still be caught.
+        assert _recv_until(
+            sender_sock,
+            lambda p: p.get("type") == "delivery_failure",
+            attempts=4,
+        ) is None
 
         saved = _wait_for_persisted_message(
             sender_payload["user_id"], recipient_payload["user_id"]
@@ -955,7 +972,18 @@ def test_offline_message_appears_and_decrypts_in_recipient_history_after_reconne
     """Requirement B: once Bob is back, load_conversation_history()
     -- the existing method, unmodified in this test's own scope --
     finds and correctly decrypts the message that was sent while he
-    was offline."""
+    was offline.
+
+    SCOPE WARNING (BUG 4): this test plants the session key directly
+    into the recipient's KeyManager via store_key() below. That makes
+    it a test of history retrieval and decryption GIVEN the key, and
+    it is deliberately kept that way -- but it is therefore NOT
+    evidence that a genuinely restarted client can recover the key,
+    because hand-planting is the one step the system had no mechanism
+    to perform. Real fresh-restart recovery is covered by
+    tests/test_offline_messaging.py, which drives the actual
+    redelivery mechanism with a fresh ClientSession and never touches
+    store_key()."""
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
@@ -982,7 +1010,7 @@ def test_offline_message_appears_and_decrypts_in_recipient_history_after_reconne
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ),
         )
-        _recv_until(sender_sock, lambda p: p.get("type") == "delivery_failure")
+        _recv_until(sender_sock, lambda p: p.get("type") == "message_queued")
 
         saved = _wait_for_persisted_message(
             sender_payload["user_id"], recipient_payload["user_id"]

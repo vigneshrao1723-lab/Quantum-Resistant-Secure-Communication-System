@@ -57,9 +57,26 @@ class Conversation(Base):
     # meaningful only for TYPE_GROUP. Direct conversations never set it.
     name = Column(String(128), nullable=True)
 
-    # Additive (Phase 7 -- Group Membership Management), meaningful
-    # only for TYPE_GROUP -- direct conversations stay at epoch 1
-    # forever, since nothing ever rotates them. Together these two
+    # Additive (Phase 7 -- Group Membership Management). Originally
+    # meaningful only for TYPE_GROUP, on the assumption that direct
+    # conversations stay at epoch 1 forever because nothing rotates
+    # them. That assumption no longer holds and has not for some time:
+    # the key-desynchronization fix made
+    # ClientSession.establish_session_key() RESERVE a fresh epoch
+    # every time a client needs a direct key it has no cached copy of
+    # (see that method's docstring for why reserving beats assuming
+    # epoch 1). A direct conversation therefore gains one epoch per
+    # key establishment by either side -- a long-lived pair that has
+    # restarted a few times is routinely at epoch 4 or 5, with older
+    # messages still stamped with the epoch that actually encrypted
+    # them.
+    #
+    # This matters wherever a key is recovered rather than created:
+    # the epoch a stored message needs is messages.epoch, never
+    # whichever epoch is current now (see
+    # MessageRepository.get_queued_direct_key_requirements() and
+    # server/client_handler.py::_recover_direct_keys_for_reconnecting_user()).
+    # Together these two
     # counters are the server's authoritative, race-free bookkeeping
     # for group-key rotation (see server/client_handler.py's leave/
     # rotation handlers); the server tracks *which epoch number* is

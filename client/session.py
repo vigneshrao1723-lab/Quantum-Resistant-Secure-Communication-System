@@ -47,6 +47,7 @@ from utils.protocol import (
     create_blob_download_request_packet,
     create_conversation_list_request_packet,
     create_direct_conversation_request_packet,
+    create_direct_key_recovery_request_packet,
     create_epoch_reservation_request_packet,
     create_group_add_members_packet,
     create_group_create_packet,
@@ -1548,6 +1549,15 @@ class ClientSession(QObject):
         elif packet_type == "delivery_failure":
             self.handle_delivery_failure(packet)
 
+        elif packet_type == "message_queued":
+            self.handle_message_queued(packet)
+
+        elif packet_type == "direct_key_recovery_available":
+            self.handle_direct_key_recovery_available(packet)
+
+        elif packet_type == "direct_key_redelivery_required":
+            self.handle_direct_key_redelivery_required(packet)
+
         elif (
             packet_type == "key_exchange"
             and packet.get("operation") == "public_key"
@@ -1821,6 +1831,175 @@ class ClientSession(QObject):
 
         self.error_occurred.emit(
             f"Could not deliver message to {receiver}: {reason}"
+        )
+
+    # ----------------------------------------------------------
+
+    def handle_message_queued(self, packet):
+        """
+        The recipient was offline, and the server has safely persisted
+        this message's ciphertext for them (BUG 4 -- Fix A).
+
+        A success path, so deliberately NOT error_occurred: this is
+        the packet that used to be delivery_failure, and emitting an
+        error here would reproduce the exact bug -- the GUI showing
+        "could not deliver" for a message that was stored correctly.
+        The message is already in this client's own conversation store
+        from send time, so there is nothing to add or correct locally;
+        the server's answer only decides whether the user is alarmed.
+        """
+
+        receiver = packet.get("receiver")
+
+        self.logger.info(
+            f"Message to {receiver} queued for delivery (recipient offline)"
+        )
+
+    # ----------------------------------------------------------
+
+    def handle_direct_key_recovery_available(self, packet):
+        """
+        The server has listed which direct conversations this client
+        can read and which key epochs their stored messages are
+        encrypted under (BUG 4 -- Fix B). Ask for the epochs this
+        client is actually missing -- and only those.
+
+        This filtering has to happen here, on the client, because the
+        client is the only party that knows what it holds: the server
+        stores no keys. A client whose KeyManager survived (a brief
+        disconnect rather than a restart) finds nothing missing and
+        sends nothing at all, so a routine reconnect costs one packet
+        in and none back out. A genuinely restarted client has an
+        empty key store and asks for everything it needs.
+
+        Requests one packet per conversation, carrying that
+        conversation's missing epochs together, rather than one per
+        epoch.
+
+        Deliberately send_message(), not send_request(): this runs on
+        the receiver thread, and send_request() waits for a response
+        that only the receiver thread can deliver -- calling it here
+        would deadlock. Nothing needs a reply anyway; the keys arrive
+        later as their own packets.
+        """
+
+        conversations = packet.get("conversations") or []
+
+        for entry in conversations:
+
+            conversation_id = entry.get("conversation_id")
+            epochs = entry.get("epochs") or []
+
+            if not conversation_id:
+                continue
+
+            missing = [
+                epoch
+                for epoch in epochs
+                if not self.key_manager.has_key(conversation_id, epoch=epoch)
+            ]
+
+            if not missing:
+                # Nothing lost for this conversation -- asking anyway
+                # would make the partner wrap keys this client already
+                # has.
+                continue
+
+            send_message(
+                self.client_socket,
+                create_direct_key_recovery_request_packet(
+                    conversation_id=conversation_id,
+                    epochs=missing,
+                ),
+            )
+
+            self.logger.info(
+                f"Requested recovery of {conversation_id} epochs {missing}"
+            )
+
+    # ----------------------------------------------------------
+
+    def handle_direct_key_redelivery_required(self, packet):
+        """
+        A direct partner has reconnected holding queued messages
+        encrypted under ``epoch``, and the server has asked this
+        client -- who may still hold that epoch's key -- to hand them
+        a wrapped copy (BUG 4 -- Fix B).
+
+        Redelivers an EXISTING key or does nothing at all. There is
+        deliberately no os.urandom() fallback of the kind
+        handle_group_key_rotation_required() has: that handler's job
+        is to establish a NEW epoch, where generating the key is the
+        whole point, whereas this one's job is to make already-
+        existing ciphertext readable. A newly generated key cannot
+        decrypt a message that was encrypted under the old one, so
+        inventing a key here would not recover anything -- it would
+        hand the partner a key that authenticates nothing, and, since
+        KeyManager tracks the current epoch with max(), would corrupt
+        both sides' notion of the current key on top of that. If this
+        client no longer has the epoch, the correct outcome is that
+        the messages stay queued until a client that does have it
+        reconnects.
+
+        Wraps with crypto/key_manager.py::wrap_key_for_member() -- the
+        same primitive group key distribution already uses, and the
+        right one here precisely because it transports a CHOSEN key
+        rather than deriving a fresh one the way
+        encapsulate_session_key() does.
+        """
+
+        conversation_id = packet.get("conversation_id")
+        epoch = packet.get("epoch") or 1
+        recipient = packet.get("recipient")
+
+        if not conversation_id or not recipient:
+            return
+
+        if not self.key_manager.has_key(conversation_id, epoch=epoch):
+
+            self.logger.info(
+                f"Cannot redeliver key for {conversation_id} epoch {epoch} "
+                f"to {recipient}: this client does not hold that epoch"
+            )
+
+            return
+
+        session_key = self.key_manager.get_key(conversation_id, epoch=epoch)
+
+        try:
+            encapsulation, wrapped_key = self.key_manager.wrap_key_for_member(
+                recipient, session_key
+            )
+        except (ValueError, TypeError) as error:
+
+            # Narrow, and the only expected failure: the partner's
+            # public key is missing or unusable (wrap_key_for_member()
+            # raises ValueError for exactly that). Their messages stay
+            # queued and recovery is retried on their next reconnect
+            # -- nothing is lost, so this must not take down the
+            # receiver thread.
+            self.logger.warning(
+                f"Could not wrap key for {recipient} "
+                f"({conversation_id} epoch {epoch}): {error}"
+            )
+
+            return
+
+        send_message(
+            self.client_socket,
+            create_group_key_distribution_packet(
+                sender=self.username,
+                conversation_id=conversation_id,
+                recipient=recipient,
+                encapsulation=encapsulation,
+                wrapped_key=wrapped_key,
+                epoch=epoch,
+            ),
+        )
+
+        self.logger.info(
+            f"Redelivered direct key for {conversation_id} epoch {epoch} "
+            f"to {recipient}"
         )
 
     # ----------------------------------------------------------

@@ -1,11 +1,27 @@
 """
 Message model for persisted private chat messages.
 
-Stores ciphertext only -- the server never has access to plaintext,
-consistent with the existing end-to-end encryption architecture (see
-crypto/aes.py, crypto/key_manager.py). A row is only ever written
-after a private message has been successfully routed to its
-recipient; failed deliveries are never persisted.
+Stores ciphertext only -- the server never has access to plaintext.
+Encryption and decryption happen entirely on the clients (see
+crypto/aes.py, crypto/key_manager.py); no key material is stored in
+this table, or anywhere else server-side.
+
+A row is written when a private message is accepted, whether or not
+the recipient was connected at the time (C1 -- Offline Direct-Message
+Persistence). A message addressed to a real, registered user who is
+simply offline is persisted exactly like a live-relayed one; the two
+differ only in delivery state, never in content or storage.
+
+Delivery state deliberately lives in a separate table
+(database/models/message_recipient.py), not in a column here: QUEUED
+means persisted but not yet relayed, DELIVERED means actually relayed
+to the recipient, and READ extends the same row further. Keeping it
+separate is what lets this table stay a pure record of content, and
+lets one message carry per-recipient state.
+
+Nothing is persisted when there is no real recipient to persist under
+-- receiver_id is a required foreign key -- so a message to a
+username that was never registered is still stored nowhere at all.
 """
 
 import uuid

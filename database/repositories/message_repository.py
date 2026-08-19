@@ -2,8 +2,10 @@
 Message repository.
 """
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
+from database.models.conversation import Conversation
+from database.models.conversation_member import ConversationMember
 from database.models.message import Message
 from database.models.message_recipient import MessageRecipient
 from database.repositories.base_repository import BaseRepository
@@ -93,6 +95,98 @@ class MessageRepository(BaseRepository):
             MessageRecipient.message_id == message_id
         )
         return self.db.scalars(statement).all()
+
+    def get_direct_conversation_epochs_for_user(self, user_id, conversation_id=None):
+        """
+        Return ``{conversation_id: [epochs]}`` -- every key epoch the
+        user's accessible DIRECT message history is encrypted under
+        (BUG 4 -- Fix B), epochs ascending.
+
+        Authorization is CONVERSATION MEMBERSHIP, deliberately, and
+        that choice is what makes this correct where the first
+        attempt was not. Driving recovery from MessageRecipient rows
+        (status == QUEUED) had two defects that membership fixes at
+        once:
+
+          * A queued message that has been read is no longer QUEUED,
+            so on the next restart its epoch was never recovered and
+            history the user had already read went permanently dark.
+          * A user's own SENT messages have no MessageRecipient row
+            of their own at all, so the sender could never recover
+            the epochs needed to read their own history.
+
+        Membership is also exactly the authorization model
+        handle_message_history_request() already enforces for reading
+        these same messages, so this grants no access to anything the
+        user could not already fetch. It needs no new rows, and
+        specifically no fabricated MessageRecipient entries.
+
+        Derived from messages.epoch -- the epoch each specific message
+        was actually encrypted under -- and never from the
+        conversation's current_key_epoch. Those are routinely
+        different: ClientSession.establish_session_key() reserves a
+        BRAND-NEW epoch every time a client needs a key it doesn't
+        have cached, so a direct conversation accumulates one epoch
+        per key establishment, and a conversation sitting at epoch 5
+        can easily hold messages at epochs 2 and 3. Substituting the
+        current epoch would hand the user a key that decrypts none of
+        their history.
+
+        NULL epoch reads as 1 -- the same NULL->1 normalization
+        Message.epoch documents and every other reader of that column
+        already applies. It is a true statement about rows written
+        before the column existed, not a convenient default.
+
+        A conversation with no messages yields no entry: the join to
+        messages is what puts a conversation in the result at all, so
+        an empty conversation can never trigger recovery.
+
+        ``conversation_id`` optionally narrows the query to one
+        conversation -- used server-side to validate that the epochs a
+        client asks to recover are really referenced by that
+        conversation's messages, rather than numbers it made up.
+
+        Restricted to TYPE_DIRECT: group conversations have their own
+        reconnect recovery
+        (_ensure_group_keys_current_for_reconnecting_user), and
+        running both over the same rows would duplicate dispatches
+        without changing the outcome.
+
+        Read-only. Returns coordination metadata only -- conversation
+        ids and epoch numbers, never key material, of which the server
+        holds none.
+        """
+
+        epoch = func.coalesce(Message.epoch, 1)
+
+        filters = [
+            ConversationMember.user_id == user_id,
+            ConversationMember.left_at.is_(None),
+            Conversation.type == Conversation.TYPE_DIRECT,
+            Message.conversation_id.is_not(None),
+        ]
+
+        if conversation_id is not None:
+            filters.append(Message.conversation_id == conversation_id)
+
+        statement = (
+            select(Message.conversation_id, epoch)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .join(
+                ConversationMember,
+                ConversationMember.conversation_id == Conversation.id,
+            )
+            .where(*filters)
+            .distinct()
+            .order_by(Message.conversation_id, epoch)
+        )
+
+        required = {}
+
+        for row_conversation_id, row_epoch in self.db.execute(statement).all():
+            required.setdefault(row_conversation_id, []).append(int(row_epoch))
+
+        return required
 
     def mark_conversation_read(self, conversation_id, recipient_id):
         """

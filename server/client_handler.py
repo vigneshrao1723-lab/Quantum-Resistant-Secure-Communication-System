@@ -37,6 +37,8 @@ from utils.protocol import (
     create_conversation_list_result_packet,
     create_delivery_failure_packet,
     create_direct_conversation_result_packet,
+    create_direct_key_recovery_available_packet,
+    create_direct_key_redelivery_required_packet,
     create_epoch_reservation_result_packet,
     create_group_create_result_packet,
     create_group_key_rotation_required_packet,
@@ -47,6 +49,7 @@ from utils.protocol import (
     create_login_result_packet,
     create_logout_result_packet,
     create_message_history_result_packet,
+    create_message_queued_packet,
     create_read_receipt_notification_packet,
     create_register_result_packet,
     create_user_lookup_result_packet,
@@ -1290,6 +1293,272 @@ def _ensure_group_keys_current_for_reconnecting_user(state, user):
         )
 
 
+def _recover_direct_keys_for_reconnecting_user(state, client_socket, user):
+    """
+    Reconnect recovery for DIRECT conversations, step 1 of 2 (BUG 4
+    -- Fix B): announce what is recoverable.
+
+    The direct-message counterpart of
+    _ensure_group_keys_current_for_reconnecting_user() above, and
+    deliberately built the same way -- the server asks a connected
+    peer to hand this user a wrapped copy of a key, and never holds,
+    sees, or generates key material itself. The transport reuses the
+    existing, already-authorized group_key_distribution relay
+    unchanged (see handle_group_key_distribution(), whose membership
+    and epoch-bound checks are expressed purely in terms of
+    conversation membership and so apply to a direct conversation
+    exactly as they do to a group one).
+
+    Why this is needed at all: a direct session key is established
+    live over the socket (ClientSession.establish_session_key()) and
+    kept only in the peers' RAM. If the recipient is offline when it
+    is sent, the relay finds nobody to forward it to and the key is
+    simply gone -- while the SENDER goes on encrypting under it and
+    the server goes on persisting that ciphertext. The recipient then
+    reconnects with an empty KeyManager and their stored messages
+    decrypt to nothing but the "encrypted in a previous session"
+    placeholder, permanently.
+
+    Why this ANNOUNCES rather than pushes. Only the client knows which
+    epochs it already holds -- the server holds no keys and cannot
+    tell a client that just restarted from one that never left. So
+    this sends the list of conversations and the epochs their messages
+    are encrypted under, and the client asks back for the subset it
+    actually lacks (handle_direct_key_recovery_request() below). A
+    client that lost nothing asks for nothing, which is what keeps a
+    routine reconnect from re-wrapping and re-sending every historical
+    key every time.
+
+    Scope, and the defect this shape fixes. The requirements come from
+    MessageRepository.get_direct_conversation_epochs_for_user(), which
+    selects on CONVERSATION MEMBERSHIP, not on delivery status. An
+    earlier version drove recovery from QUEUED MessageRecipient rows,
+    which failed twice over: a queued message that had been read was
+    no longer QUEUED, so the next restart left already-read history
+    permanently unreadable; and a user's own SENT messages have no
+    MessageRecipient row of their own, so a sender could never recover
+    the epochs needed to read their own side of a conversation.
+    Membership covers both, and grants nothing beyond what
+    handle_message_history_request() already lets this user read.
+
+    Epoch correctness remains the load-bearing detail: the epochs
+    named are exactly those messages.epoch records, never the
+    conversation's current epoch. A direct conversation gains a fresh
+    epoch on every key establishment by either side, so "current" is
+    routinely not what a stored message needs.
+
+    A conversation with no messages is never announced -- the query
+    reaches a conversation only through its messages.
+
+    If no partner is connected when the client asks, nothing happens:
+    no key is invented, nothing is marked delivered, and the client is
+    announced to again on its next reconnect. Symmetrically, when the
+    PARTNER reconnects this same function runs for them, at which
+    point this user (now the connected peer) can satisfy their
+    request.
+    """
+
+    db = SessionLocal()
+
+    try:
+        required = MessageRepository(db).get_direct_conversation_epochs_for_user(
+            user.id
+        )
+    finally:
+        db.close()
+
+    if not required:
+        # No direct history at all, or none with messages. Nothing to
+        # announce, and specifically no packet sent for an empty
+        # conversation.
+        return
+
+    conversations = [
+        {"conversation_id": str(conversation_id), "epochs": epochs}
+        for conversation_id, epochs in required.items()
+    ]
+
+    announced = send_to_client(
+        client_socket,
+        create_direct_key_recovery_available_packet(conversations),
+    )
+
+    if not announced:
+        state.logger.warning(
+            f"Failed to announce direct key recovery to {user.username}"
+        )
+
+        return
+
+    state.logger.info(
+        f"Announced direct key recovery to {user.username}: "
+        f"{[(c['conversation_id'], c['epochs']) for c in conversations]}"
+    )
+
+
+def handle_direct_key_recovery_request(state, client_socket, user, packet):
+    """
+    A client is missing some historical epochs for a direct
+    conversation and is asking for them (BUG 4 -- Fix B).
+
+    The server holds no keys, so all it can do -- and all it does
+    here -- is ask a connected partner who does hold them to send a
+    wrapped copy, exactly as the group reconnect recovery already
+    does. Key material never passes through this handler.
+
+    Authorization, in the order it is applied:
+
+      * The requester is the authenticated identity for this socket
+        (``user``), never anything the packet claims -- so a client
+        cannot request another user's keys by naming them.
+      * The requester must be an active member of the conversation:
+        enforced by asking the repository for THIS USER's accessible
+        direct conversations and refusing anything not in that set.
+        This is the same conversation-membership rule
+        handle_message_history_request() uses to decide who may read
+        these messages at all, so recovery can never reach a
+        conversation whose history the caller could not already fetch.
+      * Each requested epoch must actually be referenced by that
+        conversation's stored messages. A client cannot fish for
+        arbitrary epoch numbers, and cannot induce a partner to
+        distribute an epoch no message was ever encrypted under.
+      * The partner selected must itself be an active member
+        (_select_connected_active_member), and the relay that
+        ultimately carries the key re-checks both sender and recipient
+        membership independently (handle_group_key_distribution).
+
+    Rejections are silent and server-log-only, matching every other
+    authorization check in this file.
+    """
+
+    conversation_id = packet.get("conversation_id")
+    requested_epochs = packet.get("epochs")
+
+    if not conversation_id or not isinstance(requested_epochs, list):
+
+        state.logger.warning(
+            f"Rejected direct_key_recovery_request from {user.username}: "
+            f"missing conversation_id or epochs"
+        )
+
+        return
+
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except (TypeError, ValueError, AttributeError):
+
+        state.logger.warning(
+            f"Rejected direct_key_recovery_request from {user.username}: "
+            f"invalid conversation_id"
+        )
+
+        return
+
+    # bool is excluded explicitly because it subclasses int, so True
+    # would otherwise sail through as epoch 1.
+    epochs = {
+        candidate
+        for candidate in requested_epochs
+        if not isinstance(candidate, bool)
+        and isinstance(candidate, int)
+        and candidate >= 1
+    }
+
+    if not epochs:
+
+        state.logger.warning(
+            f"Rejected direct_key_recovery_request from {user.username}: "
+            f"no valid epochs"
+        )
+
+        return
+
+    db = SessionLocal()
+
+    try:
+        message_repo = MessageRepository(db)
+
+        # Membership AND "this epoch really exists in this
+        # conversation" in one query, scoped to this authenticated
+        # user: a conversation the user is not an active member of
+        # simply is not in the result.
+        available = message_repo.get_direct_conversation_epochs_for_user(
+            user.id, conversation_id=conversation_uuid
+        )
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+    finally:
+        db.close()
+
+    known_epochs = set(available.get(conversation_uuid, []))
+
+    if not known_epochs:
+
+        state.logger.warning(
+            f"Rejected direct_key_recovery_request from {user.username}: "
+            f"{conversation_id} is not an accessible direct conversation"
+        )
+
+        return
+
+    recoverable = sorted(epochs & known_epochs)
+
+    if not recoverable:
+
+        state.logger.warning(
+            f"Rejected direct_key_recovery_request from {user.username}: "
+            f"no requested epoch is referenced by {conversation_id}"
+        )
+
+        return
+
+    selected = _select_connected_active_member(
+        state, member_ids, exclude_user_id=user.id
+    )
+
+    if selected is None:
+
+        # The partner is offline too. Deliberately no retry, no
+        # queue, and above all no invented key: the client will be
+        # announced to again on its next reconnect, and the partner
+        # returning is what makes recovery possible.
+        state.logger.info(
+            f"No connected partner to redeliver {conversation_id} "
+            f"epochs {recoverable} to {user.username}"
+        )
+
+        return
+
+    sock, partner_username = selected
+
+    for epoch in recoverable:
+
+        redelivery_requested = send_to_client(
+            sock,
+            create_direct_key_redelivery_required_packet(
+                conversation_id=str(conversation_uuid),
+                epoch=epoch,
+                recipient=user.username,
+            ),
+        )
+
+        if not redelivery_requested:
+            # Same reasoning as the group path's identical guard: this
+            # runs again on the next reconnect, and is a harmless
+            # no-op if the key has arrived by then.
+            state.logger.warning(
+                f"Failed to request direct key redelivery for "
+                f"{conversation_id} epoch {epoch} to {user.username}"
+            )
+            continue
+
+        state.logger.info(
+            f"Requested direct key redelivery for {conversation_id} "
+            f"epoch {epoch} from {partner_username} to {user.username}"
+        )
+
+
 def handle_register_request(state, client_socket, packet):
     """
     Register a new user account on behalf of an as-yet-unauthenticated
@@ -2184,6 +2453,21 @@ def handle_client(state, client_socket, client_address):
             # -----------------------------
             _ensure_group_keys_current_for_reconnecting_user(state, user)
 
+            # -----------------------------
+            # Direct key redelivery on reconnect (BUG 4 -- Fix B)
+            #
+            # The direct-conversation counterpart of the two group
+            # recoveries above, and subject to the same ordering
+            # requirement for the same reason: it asks a connected
+            # partner to wrap a key FOR this user, which that partner
+            # can only do once distribute_public_keys() has given them
+            # this user's current public key. A fresh login means a
+            # fresh keypair, so a partner holding the previous
+            # session's public key would otherwise wrap for an
+            # identity this client can no longer decapsulate.
+            # -----------------------------
+            _recover_direct_keys_for_reconnecting_user(state, client_socket, user)
+
         # -----------------------------
         # Notify other clients
         # -----------------------------
@@ -2353,11 +2637,17 @@ def handle_client(state, client_socket, client_address):
                     # persisted (real-application bug fix, C1 --
                     # Offline Direct-Message Persistence) exactly like
                     # a group message already is regardless of which
-                    # members are connected (see persist_group_message()) --
-                    # only delivery_failure's live-relay-didn't-happen
-                    # meaning stays unchanged; it never claimed the
-                    # message was lost, only that it wasn't delivered
-                    # right now.
+                    # members are connected (see persist_group_message()).
+                    #
+                    # BUG 4 -- Fix A: the sender is answered
+                    # message_queued for this case, not
+                    # delivery_failure. delivery_failure now means what
+                    # its name says and nothing softer -- the message
+                    # was NOT stored (unknown recipient, or persistence
+                    # raised) -- while a real user who is merely
+                    # offline gets an explicit "accepted, not yet
+                    # delivered". The recipient row stays QUEUED either
+                    # way; only what the sender is told changed.
                     #
                     # A receiver that doesn't resolve to any real user
                     # at all (typo, never registered) is unaffected --
@@ -2370,6 +2660,15 @@ def handle_client(state, client_socket, client_address):
                         offline_user = UserRepository(db).get_by_username(receiver)
                     finally:
                         db.close()
+
+                    # BUG 4 -- Fix A: what the sender is told now
+                    # follows whether the message was PERSISTED, not
+                    # whether it happened to be relayed live. Set only
+                    # by the successful path below, so every failure
+                    # mode -- unknown recipient, or a persist that
+                    # raised -- still falls through to the unchanged
+                    # delivery_failure response.
+                    queued_message = None
 
                     if offline_user is not None:
 
@@ -2405,6 +2704,19 @@ def handle_client(state, client_socket, client_address):
                                 delivered=False,
                             )
 
+                            # Both the message row and its QUEUED
+                            # recipient row are committed by this
+                            # point, so -- and only so -- the sender
+                            # can be told the message is safely
+                            # stored. Deliberately after
+                            # _record_direct_recipient(), not between
+                            # it and persist_message(): a message
+                            # persisted without the delivery-state row
+                            # that later drives key recovery is not a
+                            # complete success and must not be
+                            # reported as one.
+                            queued_message = message
+
                         except Exception as error:  # noqa: BLE001
 
                             # Intentionally broad, not an oversight:
@@ -2430,18 +2742,53 @@ def handle_client(state, client_socket, client_address):
 
                             state.logger.error(str(error))
 
-                    # Loop completed without finding a matching
-                    # connected recipient -- report delivery failure
-                    # to the sender instead of silently dropping it.
-                    state.logger.info(
-                        f"Delivery failed: {username} -> {receiver} "
-                        f"(recipient not connected)"
-                    )
+                    # BUG 4 -- Fix A: a real registered user who is
+                    # simply not connected is NOT a delivery failure.
+                    # The ciphertext is stored and its recipient row
+                    # is QUEUED, so the honest answer to the sender is
+                    # "accepted, not yet delivered" -- previously this
+                    # branch answered delivery_failure unconditionally,
+                    # which made the sender's GUI show an error for a
+                    # message that had just been saved correctly.
+                    #
+                    # QUEUED is not upgraded to DELIVERED here: nothing
+                    # was relayed to anybody. Only the live-relay path
+                    # above records DELIVERED.
+                    if queued_message is not None:
 
-                    send_to_client(
-                        client_socket,
-                        create_delivery_failure_packet(receiver)
-                    )
+                        state.logger.info(
+                            f"Queued: {username} -> {receiver} "
+                            f"(recipient not connected, message persisted)"
+                        )
+
+                        send_to_client(
+                            client_socket,
+                            create_message_queued_packet(
+                                receiver=receiver,
+                                message_id=str(queued_message.id),
+                                conversation_id=(
+                                    str(queued_message.conversation_id)
+                                    if queued_message.conversation_id
+                                    else None
+                                ),
+                            )
+                        )
+
+                    else:
+
+                        # Genuine failure, with its original meaning
+                        # intact: either the recipient does not exist
+                        # at all, or persistence raised above. Nothing
+                        # is stored, so nothing must be claimed.
+                        state.logger.info(
+                            f"Delivery failed: {username} -> {receiver} "
+                            f"(recipient not connected)"
+                        )
+
+                        send_to_client(
+                            client_socket,
+                            create_delivery_failure_packet(receiver)
+                        )
 
             # -----------------------------
             # Session Key Exchange Packet
@@ -2499,6 +2846,13 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "group_key_distribution":
 
                 handle_group_key_distribution(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Direct Key Recovery Request (BUG 4 -- Fix B)
+            # -----------------------------
+            elif packet.get("type") == "direct_key_recovery_request":
+
+                handle_direct_key_recovery_request(state, client_socket, user, packet)
 
             # -----------------------------
             # Group Leave Packet (Phase 7)
