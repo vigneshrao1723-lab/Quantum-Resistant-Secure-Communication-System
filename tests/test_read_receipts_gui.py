@@ -112,18 +112,62 @@ def test_sent_message_with_message_id_is_tracked():
     assert "msg-1" in widget._sent_bubbles_by_message_id
 
 
-def test_sent_message_without_message_id_is_not_tracked():
-    """A message sent live this session (no database id yet -- see
-    gui/chat_window.py::send_message()) simply isn't reachable by a
-    later notification; it must not raise or register under a bogus
-    key."""
+def test_sent_message_without_message_id_is_still_tracked():
+    """BUG 2: a message sent live this session has no database id on
+    this client (the id is assigned server-side and never sent back),
+    and it used to be left unregistered -- which is exactly why a
+    sender watching the conversation saw no double tick when the other
+    party read it, and why the tick only appeared after a logout/login
+    re-rendered the message from history.
+
+    This test previously asserted the opposite. It was inverted only
+    after the behaviour was proven wrong end to end: the receipt does
+    reach the sender's ClientSession and the signal does fire, so the
+    sole reason nothing changed on screen was that no bubble had been
+    registered to flip.
+    """
+
     widget = MessageWidget()
     widget.add_sent_message("hi")
 
-    assert widget._sent_bubbles_by_message_id == {}
+    assert len(widget._sent_bubbles_by_message_id) == 1
+
+    widget.mark_all_sent_read()
+
+    bubble = next(iter(widget._sent_bubbles_by_message_id.values()))
+    assert "✓✓" in bubble.time_label.text()
 
 
-def test_received_message_is_never_tracked_even_with_a_message_id():
+def test_live_sent_bubbles_get_distinct_keys():
+    """Two live messages must both be reachable -- one must not
+    overwrite the other in the registry."""
+
+    widget = MessageWidget()
+    widget.add_sent_message("first")
+    widget.add_sent_message("second")
+
+    assert len(widget._sent_bubbles_by_message_id) == 2
+
+
+def test_real_message_ids_are_still_used_as_keys():
+    """The synthetic key is only a fallback: a known database id must
+    still key its bubble, so a future per-message receipt can address
+    exactly one bubble."""
+
+    widget = MessageWidget()
+    widget.add_sent_message("live one")
+    widget.add_sent_message("from history", message_id="msg-1", read_status=False)
+
+    assert "msg-1" in widget._sent_bubbles_by_message_id
+    assert len(widget._sent_bubbles_by_message_id) == 2
+
+
+def test_received_message_is_never_tracked():
+    """Only SENT bubbles are registered -- a received bubble never
+    shows a receipt glyph, so tracking it would only waste memory.
+    Unchanged by BUG 2, and deliberately re-asserted here: the fix
+    widened registration to every sent bubble, not to every bubble."""
+
     widget = MessageWidget()
     widget.add_received_message("bob", "hi")
 
@@ -156,11 +200,16 @@ def test_mark_all_sent_read_does_not_affect_received_bubbles():
 def test_clear_messages_resets_sent_bubble_tracking():
     widget = MessageWidget()
     widget.add_sent_message("hi", message_id="m1", read_status=False)
+    widget.add_sent_message("live one")
     assert widget._sent_bubbles_by_message_id != {}
 
     widget.clear_messages()
 
     assert widget._sent_bubbles_by_message_id == {}
+
+    # The synthetic-key counter resets too, so a reopened conversation
+    # starts from a clean slate rather than accumulating keys forever.
+    assert widget._live_bubble_sequence == 0
 
 
 # ----------------------------------------------------------------------

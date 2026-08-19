@@ -337,15 +337,15 @@ def test_group_message_persisted_once_with_placeholder_receiver_id(trio):
         assert str(message.sender_id) == creator["user_id"]
         assert str(message.conversation_id) == conversation_id
 
-        # persist_group_message() commits the message row and the
-        # MessageRecipient rows in two separate transactions (see its
-        # own docstring's documented, accepted limitation) -- the poll
-        # above only waits for the message row, so querying
-        # MessageRecipient immediately after can race that second,
-        # later commit. Poll for both recipients to actually appear
-        # before asserting their status, mirroring the message-row
-        # poll above instead of assuming a single query lands after
-        # both transactions have landed.
+        # Recipient rows are now created QUEUED *before* the fan-out
+        # and promoted to DELIVERED afterwards, for only the members
+        # the relay actually reached (BUG 2 -- the row must exist
+        # before a recipient can send a read receipt for it). So the
+        # rows appearing is no longer the end of the story: poll until
+        # both have actually reached DELIVERED, rather than until they
+        # merely exist. The assertions below are unchanged -- this
+        # waits for the correct state instead of sampling a state
+        # part-way through the transition.
         status_by_recipient = {}
         for _ in range(100):
             recipients = (
@@ -353,10 +353,13 @@ def test_group_message_persisted_once_with_placeholder_receiver_id(trio):
                 .filter(MessageRecipient.message_id == message.id)
                 .all()
             )
+            db.expire_all()
             status_by_recipient = {str(r.recipient_id): r.status for r in recipients}
             if (
-                member_b["user_id"] in status_by_recipient
-                and member_c["user_id"] in status_by_recipient
+                status_by_recipient.get(member_b["user_id"])
+                == MessageDeliveryStatus.DELIVERED
+                and status_by_recipient.get(member_c["user_id"])
+                == MessageDeliveryStatus.DELIVERED
             ):
                 break
             time.sleep(0.05)

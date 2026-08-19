@@ -423,20 +423,35 @@ class MessageWidget(QListWidget):
         super().__init__()
 
         # C2 -- Read Receipts: this client's own sent bubbles in the
-        # currently-open conversation, keyed by the database
-        # message_id, so a later read_receipt_notification can flip
-        # the right ones to "read" in place -- see
-        # mark_all_sent_read(). Cleared on every clear_messages() call
-        # (i.e. every conversation open/switch), since bubbles are
+        # currently-open conversation, so a later
+        # read_receipt_notification can flip them to "read" in place --
+        # see mark_all_sent_read(). Cleared on every clear_messages()
+        # call (i.e. every conversation open/switch), since bubbles are
         # always re-rendered fresh from history at that point anyway.
-        # A bubble added without a message_id (a message sent live
-        # this session, before it has a database id -- see
-        # gui/chat_window.py::send_message()) is simply never
-        # registered here; it isn't reachable by a live notification
-        # until the conversation is re-opened and history reloads with
-        # its real id and current status, a known, documented scope
-        # limit rather than an oversight.
+        #
+        # Keyed by the database message_id where one is known (a
+        # history-loaded row), and by a synthetic per-bubble key where
+        # one is not (a message sent live this session, which has no
+        # database id on this client -- the id is assigned server-side
+        # by persist_message() and never sent back). BUG 2: a live
+        # bubble used to be left out of this registry entirely, which
+        # is precisely why a sender watching the conversation saw
+        # nothing when the other party read it -- there was no
+        # reference to flip -- and why the tick only appeared after a
+        # logout/login, when history re-rendered the same message with
+        # its real id. Every sent bubble is now reachable, whatever the
+        # client happens to know about its id.
+        #
+        # Real ids are still used as keys wherever they exist, so a
+        # future per-message (rather than conversation-level) receipt
+        # can address exactly one bubble without changing this
+        # structure.
         self._sent_bubbles_by_message_id = {}
+
+        # Source of the synthetic keys above. A plain counter, never
+        # persisted and never sent anywhere -- it exists only to keep
+        # two live bubbles in the same conversation distinct.
+        self._live_bubble_sequence = 0
 
         self.build_ui()
 
@@ -487,11 +502,18 @@ class MessageWidget(QListWidget):
 
         self.scrollToBottom()
 
-        # C2 -- Read Receipts: only a sent bubble with a known
-        # message_id is ever registered -- a received bubble never
-        # shows a receipt indicator (set_read_status() is a no-op for
-        # it regardless), so tracking it here would only waste memory.
-        if message_id is not None and bubble.kind == "sent":
+        # C2 -- Read Receipts: every SENT bubble is registered, with or
+        # without a database id (BUG 2 -- see __init__'s note on this
+        # registry for why the id cannot be a precondition). A received
+        # bubble is still never registered: it never shows a receipt
+        # indicator (set_read_status() is a no-op for it regardless),
+        # so tracking it would only waste memory.
+        if bubble.kind == "sent":
+
+            if message_id is None:
+                self._live_bubble_sequence += 1
+                message_id = f"live-{self._live_bubble_sequence}"
+
             self._sent_bubbles_by_message_id[message_id] = bubble
 
     # ==========================================================
@@ -619,9 +641,11 @@ class MessageWidget(QListWidget):
         definition, just read every message they could see; for a
         group, the caller (gui/chat_window.py) only calls this once
         every currently-active recipient has been accounted for.
-        Never touches a bubble added without a message_id (a message
-        sent live this session -- see _add_bubble()'s docstring) since
-        those were never registered in the first place.
+        Covers every sent bubble in the conversation, including one
+        sent live this session that has no database id on this client
+        (BUG 2 -- such bubbles used to be skipped, so a sender watching
+        the conversation saw nothing until a logout/login re-rendered
+        them from history).
         """
 
         for bubble in self._sent_bubbles_by_message_id.values():
@@ -635,3 +659,5 @@ class MessageWidget(QListWidget):
         self.clear()
 
         self._sent_bubbles_by_message_id = {}
+
+        self._live_bubble_sequence = 0

@@ -231,12 +231,32 @@ def _get_recipient_row(message_id, recipient_id):
 
 
 def _wait_for_recipient_status(message_id, recipient_id, expected_status, attempts=100):
+    """Wait for a recipient row to reach ``expected_status``.
+
+    Raises on timeout rather than returning whatever the row happens to
+    say. Returning the stale row made every timeout surface at the
+    caller as a bare "expected read, got delivered" comparison, which
+    reads like a wrong status when the real event was that the
+    transition never happened at all -- it hid the cause instead of
+    naming it. The assertion strength at the call sites is unchanged;
+    only the diagnosis is.
+    """
+
     for _ in range(attempts):
         row = _get_recipient_row(message_id, recipient_id)
         if row is not None and row.status == expected_status:
             return row
         time.sleep(0.05)
-    return _get_recipient_row(message_id, recipient_id)
+
+    row = _get_recipient_row(message_id, recipient_id)
+
+    raise AssertionError(
+        f"recipient row for message {message_id} / user {recipient_id} never "
+        f"reached {expected_status} within {attempts * 0.05:.1f}s "
+        f"(row={row!r}, status={getattr(row, 'status', None)!r}). A read "
+        f"receipt processed before the MessageRecipient rows were committed "
+        f"is silently dropped -- see _wait_for_recipient_rows()."
+    )
 
 
 def _get_direct_conversation(user_a_id, user_b_id):
@@ -247,11 +267,54 @@ def _get_direct_conversation(user_a_id, user_b_id):
         db.close()
 
 
+def _wait_for_recipient_rows(message_id, attempts=100):
+    """Wait until a message's MessageRecipient rows actually exist.
+
+    The server relays a message to connected members BEFORE recording
+    who it relayed to -- deliberately, because DELIVERED means "the
+    relay succeeded", so the fan-out result is what feeds
+    persist_group_message()'s DELIVERED/QUEUED split. The message row
+    and the recipient rows are then committed in two separate
+    transactions (see persist_group_message()'s docstring).
+
+    So "the message row exists" does NOT imply "its recipient rows
+    exist". A test that sends a read receipt as soon as it sees the
+    message row can have that receipt processed while there is still
+    nothing to mark: mark_conversation_read() returns an empty list,
+    handle_read_receipt() returns early, and the receipt is silently
+    dropped -- after which the rows are written as DELIVERED and
+    nothing ever moves them to READ. That is a real, if very narrow,
+    production window, and it is what made these tests intermittently
+    fail (~12% across this file) rather than any flakiness.
+
+    Waiting here for the state a read receipt actually depends on is
+    what makes these tests deterministic -- not a longer timeout.
+    """
+
+    db = SessionLocal()
+    try:
+        for _ in range(attempts):
+            count = (
+                db.query(MessageRecipient)
+                .filter(MessageRecipient.message_id == message_id)
+                .count()
+            )
+            if count:
+                return count
+            db.expire_all()
+            time.sleep(0.05)
+        return 0
+    finally:
+        db.close()
+
+
 def _wait_for_direct_message(user_a_id, user_b_id, attempts=100):
     for _ in range(attempts):
         conversation = _get_direct_conversation(user_a_id, user_b_id)
         if conversation:
-            return conversation[-1]
+            message = conversation[-1]
+            _wait_for_recipient_rows(message.id)
+            return message
         time.sleep(0.05)
     return None
 
@@ -268,7 +331,9 @@ def _wait_for_group_message(conversation_id, attempts=100):
     for _ in range(attempts):
         messages = _get_group_conversation(conversation_id)
         if messages:
-            return messages[-1]
+            message = messages[-1]
+            _wait_for_recipient_rows(message.id)
+            return message
         time.sleep(0.05)
     return None
 

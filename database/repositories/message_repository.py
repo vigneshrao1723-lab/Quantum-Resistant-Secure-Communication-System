@@ -83,6 +83,52 @@ class MessageRepository(BaseRepository):
                 )
             )
 
+    def mark_delivered(self, message_id, recipient_ids):
+        """
+        Upgrade QUEUED -> DELIVERED for the given recipients of one
+        message, and only for them (BUG 2 -- read-receipt relay race).
+
+        Recipient rows are now written BEFORE the message is relayed,
+        so that the row a read receipt needs always exists by the time
+        the recipient could possibly send one. They are created QUEUED
+        -- "persisted, not yet live-delivered" -- and this promotes
+        exactly those recipients the relay actually reached.
+
+        READ is terminal with respect to delivery status, and the
+        ``status == QUEUED`` filter below is what enforces that: a row
+        the recipient has already read is simply not selected, so a
+        read receipt that lands in the gap between row creation and
+        this promotion can never be downgraded back to DELIVERED. That
+        ordering is real -- it is the whole reason the rows are written
+        early -- so this is a guard against a reachable state, not a
+        theoretical one.
+
+        Filtering on QUEUED also makes this idempotent: a row already
+        DELIVERED is not re-selected and its updated_at is not bumped.
+
+        Returns the recipient ids actually promoted (empty if there was
+        nothing to promote), so a caller can log what happened without
+        a second query.
+        """
+
+        recipient_ids = list(recipient_ids)
+
+        if not recipient_ids:
+            return []
+
+        statement = select(MessageRecipient).where(
+            MessageRecipient.message_id == message_id,
+            MessageRecipient.recipient_id.in_(recipient_ids),
+            MessageRecipient.status == MessageDeliveryStatus.QUEUED,
+        )
+
+        rows = self.db.scalars(statement).all()
+
+        for row in rows:
+            row.status = MessageDeliveryStatus.DELIVERED
+
+        return [row.recipient_id for row in rows]
+
     def get_recipients_for_message(self, message_id):
         """
         Return every MessageRecipient row for a message. No caller in

@@ -207,7 +207,7 @@ def _resolve_direct_conversation_id(sender_id, receiver_id):
 
 
 def persist_group_message(
-    sender_id, conversation_id, member_ids, connected_member_ids, algorithm, packet
+    sender_id, conversation_id, member_ids, algorithm, packet
 ):
     """
     Persist a group message (Phase 4 -- Secure Group Messaging
@@ -219,18 +219,32 @@ def persist_group_message(
     message_recipients are authoritative instead.
 
     Delivery state per member (excluding the sender) is recorded
-    separately via MessageRepository.record_recipients() -- QUEUED for
-    members who were not connected at send time, DELIVERED for those
-    who were (already known from the live fan-out above, for free).
+    separately via MessageRepository.record_recipients(), and every row
+    is created QUEUED -- "persisted, not yet live-delivered".
 
-    A known, accepted limitation for this foundation phase: the
-    content row and the recipient rows are committed in two separate
-    transactions (reusing persist_message()'s own self-contained
-    session rather than threading a shared one through it). If the
-    second transaction were to fail, the message itself would still
-    be correctly persisted and readable -- only its delivery-status
-    bookkeeping would be missing, not corrupted. Full atomicity is a
-    reasonable future hardening, not required for this foundation.
+    BUG 2 -- ordering. This now runs BEFORE the fan-out, not after, so
+    a recipient can never hold a message whose MessageRecipient row
+    does not exist yet. Previously the relay came first, which left a
+    window in which a recipient could legitimately read the message
+    while there was no row for a read receipt to update -- and
+    handle_read_receipt() discarded such receipts silently. Because
+    nothing has been relayed at this point, QUEUED is simply accurate;
+    handle_group_chat_delivery() promotes the members the relay
+    actually reached via _mark_recipients_delivered() afterwards.
+
+    Returns the persisted message so the caller can address that
+    promotion without a second lookup.
+
+    A known, accepted limitation retained from this foundation phase:
+    the content row and the recipient rows are committed in two
+    separate transactions (reusing persist_message()'s own
+    self-contained session rather than threading a shared one
+    through). If the second transaction were to fail, the message
+    itself would still be correctly persisted and readable -- only its
+    delivery-status bookkeeping would be missing, not corrupted. Full
+    atomicity remains a reasonable future hardening; the ordering fix
+    above does not depend on it, since both transactions now complete
+    before anything is relayed.
     """
 
     message = persist_message(
@@ -247,34 +261,38 @@ def persist_group_message(
         message_repo = MessageRepository(db)
 
         recipient_ids = [member_id for member_id in member_ids if member_id != sender_id]
-        delivered_ids = [
-            member_id for member_id in connected_member_ids if member_id != sender_id
-        ]
 
-        message_repo.record_recipients(message.id, recipient_ids, delivered_ids)
+        message_repo.record_recipients(message.id, recipient_ids, [])
 
         db.commit()
     finally:
         db.close()
 
+    return message
 
-def _record_direct_recipient(message, receiver_id, delivered):
+
+def _record_direct_recipient(message, receiver_id):
     """
-    Create a direct message's MessageRecipient row (C2 -- Read
-    Receipts): DELIVERED if the recipient was connected and live-
-    relayed to just now, QUEUED otherwise (the C1 offline-persistence
-    path) -- exactly mirroring persist_group_message()'s own
-    DELIVERED/QUEUED split, reusing record_recipients() unchanged
-    rather than a new method. A direct message always has exactly one
-    recipient, so this is always a one-element list -- the same
-    generic method group messages already use, not a parallel
-    mechanism for direct messages.
+    Create a direct message's MessageRecipient row as QUEUED (C2 --
+    Read Receipts; ordering per BUG 2).
 
-    Before C2, a direct message never got a MessageRecipient row at
-    all (see database/models/message_recipient.py's own prior
-    docstring); this is the one behavioral change to that existing
-    invariant, needed so read receipts have a row to transition to
-    READ later.
+    Always QUEUED, never DELIVERED. The row is now written BEFORE the
+    message is relayed, so at the moment it is created nothing has
+    been delivered yet -- QUEUED ("persisted, not yet live-delivered")
+    is simply the truth. A successful relay promotes it afterwards via
+    _mark_recipients_delivered().
+
+    That ordering is the fix for a real race: the server used to relay
+    first and record afterwards, which left a window where the
+    recipient held the message and could legitimately read it while
+    the row a read receipt must update did not exist yet. In that
+    window mark_conversation_read() matched nothing and
+    handle_read_receipt() discarded the receipt silently.
+
+    Reuses record_recipients() unchanged, with an empty delivered set.
+    A direct message always has exactly one recipient, so this is
+    always a one-element list -- the same generic method group
+    messages already use, not a parallel mechanism.
     """
 
     db = SessionLocal()
@@ -282,13 +300,40 @@ def _record_direct_recipient(message, receiver_id, delivered):
     try:
         message_repo = MessageRepository(db)
 
-        message_repo.record_recipients(
-            message.id,
-            [receiver_id],
-            [receiver_id] if delivered else [],
-        )
+        message_repo.record_recipients(message.id, [receiver_id], [])
 
         db.commit()
+    finally:
+        db.close()
+
+
+def _mark_recipients_delivered(message_id, recipient_ids):
+    """
+    Promote QUEUED -> DELIVERED for the recipients a relay actually
+    reached (BUG 2). Shared by the direct and group paths so there is
+    exactly one place this transition happens.
+
+    Never downgrades READ: MessageRepository.mark_delivered() selects
+    only QUEUED rows, so a recipient who read the message in the gap
+    between row creation and this call keeps READ. See that method for
+    why that gap is reachable rather than theoretical.
+    """
+
+    recipient_ids = list(recipient_ids)
+
+    if not recipient_ids:
+        return []
+
+    db = SessionLocal()
+
+    try:
+        message_repo = MessageRepository(db)
+
+        promoted = message_repo.mark_delivered(message_id, recipient_ids)
+
+        db.commit()
+
+        return promoted
     finally:
         db.close()
 
@@ -333,6 +378,26 @@ def handle_group_chat_delivery(state, client_socket, user, conversation_id, pack
 
         return
 
+    sender_client = state.get_client(client_socket)
+
+    # BUG 2 -- persist BEFORE relaying, so every member's
+    # MessageRecipient row exists (QUEUED) before any of them can hold
+    # the message and send a read receipt for it. Relaying first left a
+    # window in which a receipt had no row to update and was silently
+    # discarded.
+    #
+    # Deliberately not wrapped: a group message that cannot be
+    # persisted is not deliverable state this handler should paper
+    # over, and letting it propagate matches how this path already
+    # behaved when persistence failed.
+    message = persist_group_message(
+        sender_id=user.id,
+        conversation_id=uuid.UUID(conversation_id),
+        member_ids=member_ids,
+        algorithm=(sender_client or {}).get("algorithm"),
+        packet=packet,
+    )
+
     member_id_strings = {str(member_id) for member_id in member_ids}
     connected_member_ids = []
 
@@ -342,9 +407,8 @@ def handle_group_chat_delivery(state, client_socket, user, conversation_id, pack
             continue
 
         # Only actually-successful sends count as "connected" here --
-        # connected_member_ids feeds persist_group_message()'s
-        # DELIVERED/QUEUED split below, so a failed relay must not be
-        # recorded as delivered.
+        # connected_member_ids drives the QUEUED -> DELIVERED promotion
+        # below, so a failed relay must not be recorded as delivered.
         if (
             client.get("user_id") in member_id_strings
             and send_to_client(sock, packet)
@@ -356,15 +420,17 @@ def handle_group_chat_delivery(state, client_socket, user, conversation_id, pack
         f"[Encrypted Message] ({len(connected_member_ids)} connected recipients)"
     )
 
-    sender_client = state.get_client(client_socket)
-
-    persist_group_message(
-        sender_id=user.id,
-        conversation_id=uuid.UUID(conversation_id),
-        member_ids=member_ids,
-        connected_member_ids=connected_member_ids,
-        algorithm=(sender_client or {}).get("algorithm"),
-        packet=packet,
+    # Promote only the members actually reached, and only from QUEUED --
+    # a member who has already read the message keeps READ (see
+    # MessageRepository.mark_delivered()). The sender is never in
+    # connected_member_ids, so they are never promoted either.
+    _mark_recipients_delivered(
+        message.id,
+        [
+            member_id
+            for member_id in connected_member_ids
+            if member_id != user.id
+        ],
     )
 
 
@@ -2581,19 +2647,53 @@ def handle_client(state, client_socket, client_address):
                         )
                         packet["direct_conversation_id"] = direct_conversation_id
 
+                        sender_client = state.get_client(client_socket)
+
+                        receiver_uuid = uuid.UUID(client["user_id"])
+
+                        # BUG 2 -- persist the message AND its QUEUED
+                        # recipient row BEFORE relaying, so the row a
+                        # read receipt must update always exists by the
+                        # time the recipient could send one. Relaying
+                        # first left a window in which the recipient
+                        # held the message, read it, and had the
+                        # receipt silently discarded because
+                        # mark_conversation_read() matched nothing.
+                        #
+                        # Wrapped so a persistence failure cannot cost
+                        # the user their live delivery: the relay below
+                        # still runs either way, exactly as it did when
+                        # it came first. Only the read-receipt
+                        # bookkeeping is at risk, never the message.
+                        message = None
+
+                        try:
+                            message = persist_message(
+                                sender_id=user.id,
+                                receiver_id=client["user_id"],
+                                algorithm=(sender_client or {}).get("algorithm"),
+                                packet=packet,
+                                conversation_id=direct_conversation_id,
+                            )
+
+                            _record_direct_recipient(message, receiver_uuid)
+
+                        except Exception as error:  # noqa: BLE001
+
+                            # Intentionally broad and scoped to
+                            # persistence alone -- see the offline
+                            # branch's identical guard for why no
+                            # single specific except would cover
+                            # persist_message()'s failure modes. The
+                            # failure is always logged, never silently
+                            # swallowed.
+                            print(f"[ERROR] {error}")
+
+                            state.logger.error(str(error))
+
                         delivered = send_to_client(
                             sock,
                             packet
-                        )
-
-                        sender_client = state.get_client(client_socket)
-
-                        message = persist_message(
-                            sender_id=user.id,
-                            receiver_id=client["user_id"],
-                            algorithm=(sender_client or {}).get("algorithm"),
-                            packet=packet,
-                            conversation_id=direct_conversation_id,
                         )
 
                         # C2 -- Read Receipts: DELIVERED only if the
@@ -2604,12 +2704,20 @@ def handle_client(state, client_socket, client_address):
                         # already-existing status for "persisted but
                         # not yet confirmed delivered" (the same status
                         # the offline branch below uses).
+                        #
+                        # BUG 2: this promotion only ever moves
+                        # QUEUED -> DELIVERED. If the recipient read
+                        # the message in the gap between the row being
+                        # written above and this line, the row is
+                        # already READ and mark_delivered() leaves it
+                        # alone -- READ is terminal with respect to
+                        # delivery status.
                         try:
-                            _record_direct_recipient(
-                                message,
-                                uuid.UUID(client["user_id"]),
-                                delivered=delivered,
-                            )
+                            if delivered and message is not None:
+                                _mark_recipients_delivered(
+                                    message.id,
+                                    [receiver_uuid],
+                                )
                         except Exception as error:  # noqa: BLE001
 
                             # Intentionally broad and scoped to this
@@ -2701,7 +2809,6 @@ def handle_client(state, client_socket, client_address):
                             _record_direct_recipient(
                                 message,
                                 offline_user.id,
-                                delivered=False,
                             )
 
                             # Both the message row and its QUEUED
