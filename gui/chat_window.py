@@ -626,10 +626,14 @@ class ChatWindow(QWidget):
                         timestamp=timestamp_text,
                         message_id=message_id,
                         read_status=read_status,
+                        content_metadata=content_metadata,
                     )
                 else:
                     self.messages.add_received_image(
-                        entry["sender"], content, timestamp=timestamp_text
+                        entry["sender"],
+                        content,
+                        timestamp=timestamp_text,
+                        content_metadata=content_metadata,
                     )
 
             else:
@@ -705,7 +709,9 @@ class ChatWindow(QWidget):
             return
 
         if payload_type == PayloadType.IMAGE:
-            self.messages.add_sent_image(content)
+            self.messages.add_sent_image(
+                content, content_metadata=content_metadata
+            )
         else:
             self.messages.add_sent_file(content, content_metadata)
 
@@ -768,7 +774,9 @@ class ChatWindow(QWidget):
             return
 
         if payload_type == PayloadType.IMAGE:
-            self.messages.add_received_image(sender, content)
+            self.messages.add_received_image(
+                sender, content, content_metadata=content_metadata
+            )
         else:
             self.messages.add_received_file(sender, content, content_metadata)
 

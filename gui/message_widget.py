@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QAbstractItemView,
+    QDialog,
     QWidget,
     QLabel,
     QFileDialog,
@@ -200,10 +201,31 @@ class ImageMessageBubble(QWidget):
 
     MAX_THUMBNAIL_WIDTH = 320
 
-    def __init__(self, image_bytes, kind, sender=None, timestamp=None, read_status=None):
+    def __init__(
+        self,
+        image_bytes,
+        kind,
+        sender=None,
+        timestamp=None,
+        read_status=None,
+        content_metadata=None,
+    ):
         super().__init__()
 
         self.kind = kind
+
+        # BUG 5 -- the decrypted bytes are RETAINED, not discarded once
+        # a thumbnail has been built from them. Without them there was
+        # nothing to open at full size and nothing to save, which is
+        # exactly why a received image could not be viewed. Held in
+        # memory only: like FileMessageBubble, nothing is written to
+        # disk until the user explicitly saves.
+        self.image_bytes = image_bytes
+        self.content_metadata = content_metadata or {}
+
+        self._filename = self.content_metadata.get("filename") or "image.png"
+        self._full_pixmap = None
+        self._viewer = None
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(4, 2, 4, 2)
@@ -227,24 +249,62 @@ class ImageMessageBubble(QWidget):
             )
             bubble_layout.addWidget(name_label)
 
-        image_label = QLabel()
+        self.image_label = QLabel()
 
         pixmap = QPixmap()
-        loaded = pixmap.loadFromData(image_bytes)
+        loaded = bool(image_bytes) and pixmap.loadFromData(image_bytes)
 
         if loaded and not pixmap.isNull():
 
-            scaled = pixmap.scaledToWidth(
-                self.MAX_THUMBNAIL_WIDTH, Qt.SmoothTransformation
-            )
-            image_label.setPixmap(scaled)
+            self._full_pixmap = pixmap
+
+            # Scale DOWN only. Widening every image to exactly
+            # MAX_THUMBNAIL_WIDTH upscaled small images -- a 80px-wide
+            # screenshot was blown up to 320px and looked wrong, which
+            # is part of what "cannot be viewed properly" meant.
+            if pixmap.width() > self.MAX_THUMBNAIL_WIDTH:
+                shown = pixmap.scaledToWidth(
+                    self.MAX_THUMBNAIL_WIDTH, Qt.SmoothTransformation
+                )
+            else:
+                shown = pixmap
+
+            self.image_label.setPixmap(shown)
+            self.image_label.setCursor(Qt.PointingHandCursor)
+            self.image_label.setToolTip("Click to view full size")
 
         else:
 
-            image_label.setText("[Unable to display image]")
-            image_label.setStyleSheet("color: white;")
+            self.image_label.setText("[Unable to display image]")
+            self.image_label.setStyleSheet("color: white;")
 
-        bubble_layout.addWidget(image_label)
+        bubble_layout.addWidget(self.image_label)
+
+        # Actions, offered only when there is really an image to act
+        # on. An attachment whose key this client never received
+        # renders the placeholder above and must not offer to open or
+        # save bytes it does not have.
+        if self._full_pixmap is not None:
+
+            actions = QHBoxLayout()
+            actions.setContentsMargins(0, 0, 0, 0)
+            actions.setSpacing(6)
+
+            view_button = QPushButton("View")
+            view_button.setObjectName("SecondaryButton")
+            view_button.setCursor(Qt.PointingHandCursor)
+            view_button.clicked.connect(self.open_viewer)
+            actions.addWidget(view_button)
+
+            save_button = QPushButton("Save As...")
+            save_button.setObjectName("SecondaryButton")
+            save_button.setCursor(Qt.PointingHandCursor)
+            save_button.clicked.connect(self._handle_save_as)
+            actions.addWidget(save_button)
+
+            actions.addStretch()
+
+            bubble_layout.addLayout(actions)
 
         self._timestamp_text = timestamp or datetime.now().strftime("%H:%M")
 
@@ -274,6 +334,109 @@ class ImageMessageBubble(QWidget):
         else:
             outer.addWidget(bubble)
             outer.addStretch()
+
+    def thumbnail_width(self):
+        """Width of the thumbnail actually shown, or None when the
+        image could not be decoded."""
+
+        pixmap = self.image_label.pixmap()
+
+        if pixmap is None or pixmap.isNull():
+            return None
+
+        return pixmap.width()
+
+    def full_size(self):
+        """(width, height) of the image at full resolution, or None."""
+
+        if self._full_pixmap is None:
+            return None
+
+        return (self._full_pixmap.width(), self._full_pixmap.height())
+
+    def open_viewer(self):
+        """
+        Show the image at full resolution in an in-app window (BUG 5).
+
+        Deliberately an in-app viewer rather than handing the file to
+        the operating system: the common case is simply looking at a
+        picture, and doing that in-process means the decrypted image
+        never has to touch disk at all. Writing a plaintext copy stays
+        exactly where FileMessageBubble already put it -- behind an
+        explicit "Save As...", chosen by the user.
+
+        Returns the viewer window (or None if there is no decoded
+        image), so the caller -- and the tests -- can address it. The
+        reference is held on the bubble because a QDialog with no
+        owning reference is garbage-collected straight back off the
+        screen.
+        """
+
+        if self._full_pixmap is None:
+            return None
+
+        viewer = QDialog(self)
+        viewer.setWindowTitle(self._filename)
+        viewer.setModal(False)
+
+        layout = QVBoxLayout(viewer)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+
+        # Fit to the available screen if the image is larger than it,
+        # so a big photo opens usable rather than off-screen. Never
+        # upscales: a small image is shown at its true size.
+        pixmap = self._full_pixmap
+        screen = self.screen()
+
+        if screen is not None:
+
+            available = screen.availableGeometry()
+            limit = available.size() * 0.9
+
+            if (
+                pixmap.width() > limit.width()
+                or pixmap.height() > limit.height()
+            ):
+                pixmap = pixmap.scaled(
+                    limit, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+
+        label.setPixmap(pixmap)
+        layout.addWidget(label)
+
+        viewer.resize(pixmap.width(), pixmap.height())
+
+        self._viewer = viewer
+        viewer.show()
+
+        return viewer
+
+    def _handle_save_as(self):
+        """
+        Write the already-decrypted image bytes this bubble holds to a
+        user-chosen local path, defaulting to the filename the sender
+        used. A no-op if the dialog is cancelled.
+
+        Deliberately identical in shape to
+        FileMessageBubble._handle_save_as() -- an image is a file, and
+        saving one should not be a second, differently-behaved
+        mechanism.
+        """
+
+        if not self.image_bytes:
+            return
+
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Image",
+            self._filename
+        )
+
+        if path:
+            Path(path).write_bytes(self.image_bytes)
 
     def set_read_status(self, read_status):
         """
@@ -567,27 +730,50 @@ class MessageWidget(QListWidget):
             message_id=message_id,
         )
 
-    def add_received_image(self, sender, image_bytes, timestamp=None):
+    def add_received_image(
+        self, sender, image_bytes, timestamp=None, content_metadata=None
+    ):
         """
         Display a received image (Phase 8 -- File & Image Transfer).
+
+        ``content_metadata`` (BUG 5) carries the sender's original
+        filename and MIME type through to the bubble, so "Save As..."
+        can offer the real name instead of inventing one. Optional, so
+        every existing caller keeps working unchanged.
         """
 
         self._add_bubble(
             ImageMessageBubble(
-                image_bytes, kind="received", sender=sender, timestamp=timestamp
+                image_bytes,
+                kind="received",
+                sender=sender,
+                timestamp=timestamp,
+                content_metadata=content_metadata,
             )
         )
 
-    def add_sent_image(self, image_bytes, timestamp=None, message_id=None, read_status=None):
+    def add_sent_image(
+        self,
+        image_bytes,
+        timestamp=None,
+        message_id=None,
+        read_status=None,
+        content_metadata=None,
+    ):
         """
         Display a sent image (Phase 8 -- File & Image Transfer). See
         add_sent_message() for ``message_id``/``read_status`` (C2 --
-        Read Receipts).
+        Read Receipts) and add_received_image() for
+        ``content_metadata`` (BUG 5).
         """
 
         self._add_bubble(
             ImageMessageBubble(
-                image_bytes, kind="sent", timestamp=timestamp, read_status=read_status
+                image_bytes,
+                kind="sent",
+                timestamp=timestamp,
+                read_status=read_status,
+                content_metadata=content_metadata,
             ),
             message_id=message_id,
         )
