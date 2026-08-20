@@ -29,6 +29,11 @@ from config import (
 )
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
+from storage.secure_key_store import (
+    KeyStoreError,
+    KeyStoreLocked,
+    SecureKeyStore,
+)
 from domain.conversation_summary import ConversationSummary, MessagePreview
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import (
@@ -239,6 +244,12 @@ class ClientSession(QObject):
         # ---------------------------------
 
         self.key_manager = KeyManager()
+
+        # BUG 1 -- local encrypted key store, opened at login.
+        # None until unlocked (or if unlocking failed); key_store_error
+        # carries a user-presentable reason in that case.
+        self.key_store = None
+        self.key_store_error = None
 
         # ---------------------------------
         # Legacy Callbacks
@@ -453,6 +464,15 @@ class ClientSession(QObject):
                 token_type=response.get("token_type") or "Bearer",
             )
 
+        # BUG 1 -- unlock the local encrypted key store here, the one
+        # moment where BOTH the password and a verified user_id are
+        # available. The password is used only to derive the storage
+        # key and is never stored on the session, never logged, and
+        # never sent anywhere; only the derived key is retained, inside
+        # the store object.
+        if response.get("success") and response.get("user_id"):
+            self._unlock_key_store(response["user_id"], password)
+
         return AuthenticationResult(
             success=bool(response.get("success")),
             message=response.get("message") or "Authentication failed.",
@@ -466,6 +486,95 @@ class ClientSession(QObject):
             token_pair=token_pair,
             errors=response.get("errors"),
         )
+
+    def _unlock_key_store(self, user_id, password):
+        """
+        Open this user's local encrypted key store and restore any
+        conversation keys it holds (BUG 1).
+
+        Failure is never fatal to login. A missing store is simply a
+        fresh installation; a store that cannot be authenticated (wrong
+        password, corruption) is reported through key_store_error and
+        left untouched on disk -- never deleted, never overwritten, and
+        never replaced with fabricated keys. In both cases the session
+        continues with whatever keys it can still obtain through the
+        existing peer-recovery mechanism.
+        """
+
+        self.key_store = None
+        self.key_store_error = None
+
+        try:
+            store = SecureKeyStore(user_id)
+            restored = store.unlock(password)
+        except KeyStoreLocked as error:
+            self.key_store_error = str(error)
+            self.logger.warning(f"Local key store not unlocked: {error}")
+            return
+        except KeyStoreError as error:
+            self.key_store_error = str(error)
+            self.logger.warning(f"Local key store unavailable: {error}")
+            return
+
+        count = self.key_manager.import_conversation_keys(restored)
+
+        self.key_store = store
+
+        # Persist from here on, whenever a genuinely new epoch arrives.
+        self.key_manager.on_change = self._persist_conversation_keys
+
+        self.logger.info(
+            f"Local key store unlocked; restored {count} conversation "
+            f"key epoch(s)"
+        )
+
+    def _persist_conversation_keys(self):
+        """
+        Write the current conversation keys back to the local store
+        (BUG 1). Invoked by KeyManager whenever a new epoch is stored.
+
+        A write failure must never break messaging -- the key is
+        already usable in memory and the only cost is that this
+        session's history may not survive a restart -- so it is logged
+        rather than raised into the receiver thread.
+        """
+
+        if self.key_store is None:
+            return
+
+        try:
+            # Snapshot and write are atomic because this runs from
+            # inside KeyManager.store_key()'s lock (see
+            # KeyManager.on_change): no other thread can add an epoch
+            # between the export below and the write it feeds, since
+            # adding one requires that same lock.
+            #
+            # Deliberately NOT done by handing the store a provider to
+            # call under ITS lock -- that would make the store acquire
+            # KeyManager's lock from inside its own, closing a cycle in
+            # the lock-order graph.
+            self.key_store.save(self.key_manager.export_conversation_keys())
+        except (KeyStoreError, OSError) as error:
+            self.logger.warning(f"Could not persist conversation keys: {error}")
+
+    def _lock_key_store(self):
+        """
+        Drop the derived storage key and the in-memory conversation
+        keys on logout (BUG 1).
+
+        The FILE is deliberately kept: logging out and back in must not
+        cost the user their history. What is discarded is the decrypted
+        material in RAM, which has no reason to outlive the session.
+        """
+
+        self.key_manager.on_change = None
+
+        if self.key_store is not None:
+            self.key_store.lock()
+            self.key_store = None
+
+        self.key_manager.keys = {}
+        self.key_manager._current_epoch = {}
 
     def login(self, username):
         """
@@ -632,6 +741,11 @@ class ClientSession(QObject):
         """
 
         response = self.send_request(create_logout_request_packet())
+
+        # BUG 1 -- clear decrypted key material from memory on the way
+        # out. The encrypted file stays: logging out and back in must
+        # not cost the user their history.
+        self._lock_key_store()
 
         return bool(response.get("success"))
 

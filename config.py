@@ -141,6 +141,70 @@ MAX_ATTACHMENT_SIZE_BYTES = int(
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
 
 # Application Information
+# =====================================================
+# Local Encrypted Key Store (BUG 1 -- history after restart)
+#
+# Conversation AES keys are persisted locally, encrypted under a key
+# derived from the user's own password, so closing the application no
+# longer destroys the ability to read message history. See
+# storage/secure_key_store.py for the format and threat model.
+#
+# These Argon2 parameters are deliberately declared HERE rather than
+# reused from config_server's ARGON2_* -- the client must not import
+# any server-side module (D7, enforced by
+# tests/test_client_import_boundary.py). They happen to match the
+# server's current defaults; they are a separate knob that can diverge
+# without touching password hashing.
+# =====================================================
+
+def _default_key_store_dir():
+    """
+    Per-user application data, not the source tree.
+
+    Runtime user secrets have no business living inside a checkout:
+    they get copied with the project, swept up by archives, and are one
+    mistake away from a commit. Windows is the target development
+    environment, so LOCALAPPDATA is preferred (machine-local, not
+    roamed onto a network share); the POSIX branches follow the XDG
+    convention so the module stays usable on other platforms.
+    """
+
+    windows_base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+
+    if windows_base:
+        return Path(windows_base) / APP_DATA_DIR_NAME / "keystore"
+
+    xdg_base = os.environ.get("XDG_DATA_HOME")
+
+    if xdg_base:
+        return Path(xdg_base) / APP_DATA_DIR_NAME_POSIX / "keystore"
+
+    return (
+        Path.home() / ".local" / "share" / APP_DATA_DIR_NAME_POSIX / "keystore"
+    )
+
+
+APP_DATA_DIR_NAME = "QuantumResistantSecureComms"
+APP_DATA_DIR_NAME_POSIX = "quantum-resistant-secure-comms"
+
+# Overridable, and the tests always point it at a temporary directory.
+KEY_STORE_DIR = Path(
+    os.environ.get("KEY_STORE_DIR") or _default_key_store_dir()
+)
+
+KEY_STORE_ARGON2_TIME_COST = int(
+    os.environ.get("KEY_STORE_ARGON2_TIME_COST", "3")
+)
+
+KEY_STORE_ARGON2_MEMORY_COST = int(
+    os.environ.get("KEY_STORE_ARGON2_MEMORY_COST", "65536")
+)
+
+KEY_STORE_ARGON2_PARALLELISM = int(
+    os.environ.get("KEY_STORE_ARGON2_PARALLELISM", "4")
+)
+
+
 APP_NAME = "Quantum-Resistant Secure Communication System"
 VERSION = "1.0.0"
 

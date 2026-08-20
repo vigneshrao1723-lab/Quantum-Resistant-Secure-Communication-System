@@ -29,3 +29,8 @@ certs/
 # storage/encrypted_blob_store.py (FILE_STORAGE_ROOT). Generated
 # artifacts, not source -- same rationale as logs/ and certs/ above.
 storage_blobs/
+# Per-user encrypted conversation-key stores written at runtime by
+# storage/secure_key_store.py (KEY_STORE_DIR). Encrypted at rest, but
+# they are a user's private key material and a local runtime artifact
+# either way -- never source, and never committed.
+.keystore/

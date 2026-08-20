@@ -174,6 +174,19 @@ class MainWindow(QMainWindow):
             # be running before show_chat() is reached, not after.
             self.session.start_receiver()
             self.show_chat()
+
+            # BUG 1 -- if the local encrypted key store could not be
+            # unlocked, say so plainly. Login itself succeeded and new
+            # messages work normally; what the user needs to know is
+            # that OLDER history may not be readable on this device.
+            # Deliberately vague about the cause: it carries no
+            # password, no key, and no cryptographic detail.
+            if self.session.key_store_error:
+                self.chat_window.messages.add_system_message(
+                    "Saved message keys on this device could not be "
+                    "unlocked, so older messages may not be readable. "
+                    "New messages are unaffected."
+                )
         except Exception as error:
             self.login_window.show_connection_error(str(error))
 

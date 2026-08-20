@@ -1,4 +1,5 @@
 import base64
+import threading
 
 from config import KEY_EXCHANGE_ALGORITHM
 from crypto.aes import AESCipher
@@ -63,6 +64,23 @@ class KeyManager:
         #     "9c21...": {1: b"...", 2: b"...", 3: b"..."},     # group, rotated twice
         # }
         self.keys = {}
+
+        # BUG 1 -- guards the conversation key map. store_key() can be
+        # called concurrently by the receiver thread (an arriving
+        # session_key / group_key_distribution) and by the GUI thread
+        # (establish_session_key), and the persistence callback exports
+        # the map from inside store_key(), so export and mutation must
+        # not interleave. Reentrant because that callback path
+        # re-enters this lock on the same thread.
+        self._lock = threading.RLock()
+
+        # BUG 1 -- optional callback invoked whenever a NEW conversation
+        # epoch key is stored, so a persistent key store can be kept up
+        # to date without every store_key() call site having to
+        # remember to save. Left None here: KeyManager itself knows
+        # nothing about persistence, and nothing about this class's
+        # behaviour changes until someone sets it.
+        self.on_change = None
 
         # conversation_id -> highest epoch ever stored for it. Tracked
         # separately (not derived by taking max(self.keys[id]) on every
@@ -145,14 +163,70 @@ class KeyManager:
         "epoch N" that would make the two no longer agree.
         """
 
-        epochs = self.keys.setdefault(conversation_id, {})
+        with self._lock:
 
-        if epoch not in epochs:
-            epochs[epoch] = key
+            epochs = self.keys.setdefault(conversation_id, {})
 
-        self._current_epoch[conversation_id] = max(
-            self._current_epoch.get(conversation_id, 0), epoch
-        )
+            added = epoch not in epochs
+
+            if added:
+                epochs[epoch] = key
+
+            self._current_epoch[conversation_id] = max(
+                self._current_epoch.get(conversation_id, 0), epoch
+            )
+
+            # BUG 1 -- notify whoever is persisting these keys, but
+            # only when something genuinely new was stored. A redundant
+            # redelivery of an epoch already held changes nothing on
+            # disk either. The callback is optional: a KeyManager with
+            # no listener behaves exactly as before.
+            #
+            # Deliberately called INSIDE the lock: the listener exports
+            # the map and writes it, and letting a second thread mutate
+            # between this thread's export and its write is exactly the
+            # lost-update that would drop an epoch from the file.
+            if added and self.on_change is not None:
+                self.on_change()
+
+    def export_conversation_keys(self):
+        """
+        A plain ``{conversation_id: {epoch: key_bytes}}`` snapshot, for
+        persisting to the local encrypted key store (BUG 1).
+
+        A copy, not the live dict, so a caller serialising it cannot be
+        affected by -- or affect -- concurrent key arrivals.
+        """
+
+        with self._lock:
+            return {
+                conversation_id: dict(epochs)
+                for conversation_id, epochs in self.keys.items()
+            }
+
+    def import_conversation_keys(self, conversation_keys):
+        """
+        Restore keys read back from the local encrypted key store
+        (BUG 1), returning how many epochs were actually added.
+
+        Routed through store_key() deliberately, rather than assigning
+        self.keys directly: that keeps the no-overwrite rule and the
+        "current epoch is the highest" bookkeeping in exactly one
+        place. Restoring can therefore only ever ADD epochs this
+        client did not already hold -- it can never replace a live key
+        with a stale one from disk.
+        """
+
+        restored = 0
+
+        with self._lock:
+            for conversation_id, epochs in (conversation_keys or {}).items():
+                for epoch, key in (epochs or {}).items():
+                    if not self.has_key(conversation_id, epoch=epoch):
+                        self.store_key(conversation_id, key, epoch=epoch)
+                        restored += 1
+
+        return restored
 
     def get_key(self, conversation_id, epoch=None):
         """
