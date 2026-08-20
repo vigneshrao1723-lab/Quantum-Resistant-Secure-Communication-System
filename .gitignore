@@ -34,3 +34,17 @@ storage_blobs/
 # they are a user's private key material and a local runtime artifact
 # either way -- never source, and never committed.
 .keystore/
+
+# Database dumps. These are development snapshots of the live database
+# and contain user records, Argon2 password hashes, session rows and
+# message data -- never source, and never safe to commit. Two such
+# dumps were previously committed and had to be removed from history
+# (D8/F1), which is why this rule is explicit rather than assumed.
+#
+# Deliberately narrow: Alembic migrations live in alembic/versions/ as
+# .py files and are NOT affected by these rules. If a legitimate .sql
+# file is ever needed in the repository, add it with `git add -f` after
+# confirming it contains no real data.
+milestone2_backup.sql
+milestone4_backup.sql
+*_backup.sql
