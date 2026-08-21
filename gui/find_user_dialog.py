@@ -75,6 +75,10 @@ class FindUserDialog(QDialog):
 
         self.result_label = QLabel("")
 
+        # L-1: handle_search() writes a looked-up display_name and
+        # username into this label, straight from the server.
+        self.result_label.setTextFormat(Qt.PlainText)
+
         self.result_label.setWordWrap(True)
 
         layout.addWidget(self.result_label)

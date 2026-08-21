@@ -22,10 +22,12 @@ from auth.schemas import AuthenticationResult, RegistrationResult, TokenPair
 from client.conversation_store import ConversationStore
 from client.receiver import receive_messages
 from config import (
+    HANDSHAKE_TIMEOUT_SECONDS,
     MAX_ATTACHMENT_SIZE_BYTES,
     REQUEST_TIMEOUT_SECONDS,
     SERVER_HOST,
     SERVER_PORT,
+    SOCKET_STALL_TIMEOUT_SECONDS,
 )
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
@@ -313,6 +315,12 @@ class ClientSession(QObject):
             socket.SOCK_STREAM
         )
 
+        # D8 / L-3 -- bound the connect and the TLS handshake.
+        # A server that accepts the TCP connection and then
+        # never completes the handshake would otherwise hang
+        # the GUI thread indefinitely, with no way to cancel.
+        raw_socket.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+
         raw_socket.connect((SERVER_HOST, SERVER_PORT))
 
         tls_context = build_client_context()
@@ -337,6 +345,16 @@ class ClientSession(QObject):
             # socket) so a subsequent connect() attempt starts clean.
             raw_socket.close()
             raise
+
+        # D8 / L-3 -- swap the tight handshake deadline for the long
+        # stall timeout now that the connection is established. The
+        # receiver thread reads with allow_idle=True, so a quiet
+        # connection is never dropped; what stays bounded is a frame
+        # that starts arriving from the server and then stops.
+        try:
+            self.client_socket.settimeout(SOCKET_STALL_TIMEOUT_SECONDS)
+        except OSError:
+            pass
 
         self.connected = True
 

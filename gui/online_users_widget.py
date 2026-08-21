@@ -34,6 +34,10 @@ class UserRow(QWidget):
         initial = username[0].upper() if username else "?"
 
         avatar = QLabel(initial)
+        # L-1: unused in the current UI (kept for rollback safety),
+        # but hardened alongside its replacement so re-enabling it
+        # cannot silently reintroduce the injection.
+        avatar.setTextFormat(Qt.PlainText)
         avatar.setFixedSize(34, 34)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(
@@ -42,9 +46,11 @@ class UserRow(QWidget):
         )
 
         name = QLabel(username)
+        name.setTextFormat(Qt.PlainText)
         name.setStyleSheet("font-size: 10.5pt; font-weight: 500;")
 
         self.unread_badge = QLabel("")
+        self.unread_badge.setTextFormat(Qt.PlainText)
         self.unread_badge.setFixedHeight(20)
         self.unread_badge.setAlignment(Qt.AlignCenter)
         self.unread_badge.setStyleSheet(
@@ -55,6 +61,7 @@ class UserRow(QWidget):
         self.unread_badge.setVisible(False)
 
         dot = QLabel("●")
+        dot.setTextFormat(Qt.PlainText)
         dot.setStyleSheet(f"color: {COLOR_ONLINE}; font-size: 9pt;")
 
         layout.addWidget(avatar)

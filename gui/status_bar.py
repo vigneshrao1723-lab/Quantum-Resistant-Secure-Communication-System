@@ -5,6 +5,7 @@ Displays the current connection status,
 active encryption algorithm, and logged-in user.
 """
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget,
     QLabel,
@@ -44,6 +45,7 @@ class StatusBarWidget(QWidget):
         self.connection_label = QLabel(
             f"● Disconnected"
         )
+        self.connection_label.setTextFormat(Qt.PlainText)
         self.connection_label.setStyleSheet(
             f"color: {COLOR_OFFLINE}; font-weight: 600; font-size: 9.5pt;"
         )
@@ -51,6 +53,7 @@ class StatusBarWidget(QWidget):
         self.algorithm_label = QLabel(
             "Encryption: —"
         )
+        self.algorithm_label.setTextFormat(Qt.PlainText)
         self.algorithm_label.setStyleSheet(
             f"background-color: {COLOR_PANEL_ALT}; "
             "padding: 4px 12px; border-radius: 10px; "
@@ -60,11 +63,15 @@ class StatusBarWidget(QWidget):
         # BUG 7 -- the user's own discovery identifier, shown so it
         # can be shared. Populated by ChatWindow.initialize_ui().
         self.phone_label = QLabel("")
+        # L-1: both of these are filled from server-supplied account
+        # fields (own phone number, own username).
+        self.phone_label.setTextFormat(Qt.PlainText)
         self.phone_label.setObjectName("StatusPhone")
 
         self.user_label = QLabel(
             "User: -"
         )
+        self.user_label.setTextFormat(Qt.PlainText)
         self.user_label.setStyleSheet(
             f"color: {COLOR_TEXT_MUTED}; font-size: 9.5pt;"
         )

@@ -31,7 +31,10 @@ def receive_messages(session):
     while session.connected:
 
         try:
-            data = receive_message(session.client_socket)
+            # D8 / L-3 -- allow_idle=True: the receiver thread's
+            # whole job is to wait for the server to say
+            # something, which may be a long time.
+            data = receive_message(session.client_socket, allow_idle=True)
 
         except (ConnectionResetError, OSError) as error:
 

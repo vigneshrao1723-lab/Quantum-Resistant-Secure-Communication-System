@@ -55,6 +55,16 @@ class AddMembersDialog(QDialog):
         # click behavior.
         self.member_list.setSelectionMode(QAbstractItemView.NoSelection)
 
+        # The toggle LOGIC above was correct, but the checkbox was
+        # still hard to use: the default indicator is a small,
+        # low-contrast glyph on this dark palette, and the row had no
+        # padding, so the thing a user aims at was both faint and
+        # cramped. "MemberList" scopes the indicator/padding rules in
+        # gui/styles.py to the member pickers -- the conversation
+        # sidebar uses setItemWidget rows whose geometry must not
+        # change.
+        self.member_list.setObjectName("MemberList")
+
         for username in candidate_usernames:
 
             item = QListWidgetItem(username)

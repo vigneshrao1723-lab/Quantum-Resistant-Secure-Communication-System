@@ -28,7 +28,34 @@ COLOR_CLASSICAL = "#FFB020"
 COLOR_ONLINE = "#18E5B5"
 COLOR_OFFLINE = "#FF5C7C"
 
+# Deliberately NOT COLOR_OFFLINE: the unread badge and the offline dot
+# render on the same conversation row, and reusing red for both let one
+# color mean two unrelated things ("they're offline" vs "you have
+# unread messages"). The accent blue is otherwise used for interactive/
+# highlight elements, which "needs your attention" fits naturally.
+COLOR_UNREAD = COLOR_ACCENT
+
 COLOR_BUBBLE_SENT = "#5B8DFF"
+
+# Delivery-status glyphs on a SENT bubble (Task 2). These are read
+# against COLOR_BUBBLE_SENT, not against the page, which constrains
+# the choice: the sent bubble is itself the accent blue, so a
+# saturated blue tick would be nearly invisible on it (#5B8DFF on
+# #5B8DFF is 1.0:1, and COLOR_ACCENT-family blues all measure under
+# 2.1:1). The read state therefore uses a bright PALE blue, which
+# still reads unmistakably as "blue" next to the 55%-white single
+# tick while measuring 2.6:1 against the bubble -- better than the
+# timestamp text it sits beside (1.95:1).
+COLOR_READ_RECEIPT = "#C9F0FF"
+
+# Red is unusable as a glyph colour on the blue sent bubble
+# (COLOR_OFFLINE on COLOR_BUBBLE_SENT is 1.05:1 -- effectively
+# invisible), so a failed message is marked by restyling the whole
+# bubble instead of by tinting one character. It also SHOULD look
+# different at a glance: "this never left your machine" is a
+# different kind of fact from "sent".
+COLOR_BUBBLE_FAILED = "#3B1F2B"
+COLOR_SEND_FAILED = "#FF8FA3"
 COLOR_BUBBLE_RECEIVED = "#232841"
 COLOR_BUBBLE_SYSTEM = "#171A2B"
 
@@ -193,6 +220,43 @@ QListWidget::item:selected {{
 
 QListWidget::item:hover {{
     background-color: {COLOR_PANEL_ALT};
+}}
+
+
+/* ==========================================================
+   MEMBER PICKER (create group / add members)
+
+   Scoped to #MemberList on purpose. The conversation sidebar is
+   also a QListWidget, but its rows are setItemWidget() widgets
+   sized by sizeHint() -- adding padding there would desynchronise
+   the row height from the widget it contains, and it draws no
+   checkbox indicator at all.
+   ========================================================== */
+
+QListWidget#MemberList::item {{
+    padding: 9px 8px;
+}}
+
+QListWidget#MemberList::indicator {{
+    width: 18px;
+    height: 18px;
+    margin-right: 8px;
+    border: 2px solid {COLOR_TEXT_MUTED};
+    border-radius: 5px;
+    background-color: {COLOR_PANEL_ALT};
+}}
+
+QListWidget#MemberList::indicator:hover {{
+    border: 2px solid {COLOR_ACCENT};
+}}
+
+/* Filled accent block = selected. Styling ::indicator at all
+   replaces Qt's native rendering, which takes the tick glyph with
+   it, so the checked state is carried by fill and border rather
+   than by a mark -- readable without shipping an image asset. */
+QListWidget#MemberList::indicator:checked {{
+    background-color: {COLOR_ACCENT};
+    border: 2px solid {COLOR_ACCENT};
 }}
 
 

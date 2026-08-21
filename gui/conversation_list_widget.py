@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.styles import COLOR_ACCENT, COLOR_OFFLINE, COLOR_ONLINE, COLOR_TEXT_MUTED
+from gui.styles import COLOR_ACCENT, COLOR_ONLINE, COLOR_TEXT_MUTED, COLOR_UNREAD
 
 
 class ConversationRow(QWidget):
@@ -61,6 +61,10 @@ class ConversationRow(QWidget):
         initial = display_name[0].upper() if display_name else "?"
 
         avatar = QLabel(initial)
+        # L-1: every label in this row renders a display name, a
+        # group name or a message preview -- all of it written by
+        # other users and none of it markup.
+        avatar.setTextFormat(Qt.PlainText)
         avatar.setFixedSize(34, 34)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(
@@ -69,6 +73,7 @@ class ConversationRow(QWidget):
         )
 
         name = QLabel(display_name)
+        name.setTextFormat(Qt.PlainText)
         name.setStyleSheet("font-size: 10.5pt; font-weight: 500;")
 
         timestamp_text = ""
@@ -77,13 +82,15 @@ class ConversationRow(QWidget):
             timestamp_text = summary.latest_message.timestamp.strftime("%H:%M")
 
         timestamp = QLabel(timestamp_text)
+        timestamp.setTextFormat(Qt.PlainText)
         timestamp.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 8.5pt;")
 
         self.unread_badge = QLabel("")
+        self.unread_badge.setTextFormat(Qt.PlainText)
         self.unread_badge.setFixedHeight(20)
         self.unread_badge.setAlignment(Qt.AlignCenter)
         self.unread_badge.setStyleSheet(
-            f"background-color: {COLOR_OFFLINE}; color: #0B0D16; "
+            f"background-color: {COLOR_UNREAD}; color: #0B0D16; "
             "border-radius: 10px; font-size: 8.5pt; font-weight: 700; "
             "padding: 0px 7px;"
         )
@@ -92,6 +99,7 @@ class ConversationRow(QWidget):
         dot_color = COLOR_ONLINE if summary.is_online else COLOR_TEXT_MUTED
 
         dot = QLabel("●")
+        dot.setTextFormat(Qt.PlainText)
         dot.setStyleSheet(f"color: {dot_color}; font-size: 9pt;")
 
         top_row.addWidget(avatar)
@@ -107,6 +115,7 @@ class ConversationRow(QWidget):
         )
 
         preview = QLabel(preview_text)
+        preview.setTextFormat(Qt.PlainText)
         preview.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 9pt;")
 
         layout.addLayout(top_row)

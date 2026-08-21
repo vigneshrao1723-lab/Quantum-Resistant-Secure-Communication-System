@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
-from config import KEY_EXCHANGE_ALGORITHM
+from config import (
+    KEY_EXCHANGE_ALGORITHM,
+    MAX_ATTACHMENT_CIPHERTEXT_BYTES,
+    SOCKET_STALL_TIMEOUT_SECONDS,
+)
 from database.connection import SessionLocal
 from database.models.conversation import Conversation
 from database.repositories.conversation_repository import ConversationRepository
@@ -139,6 +143,35 @@ def persist_message(sender_id, receiver_id, algorithm, packet, conversation_id=N
         )
 
         if envelope.payload_type in BLOB_STORAGE_PAYLOAD_TYPES:
+
+            # D8 / P1 -- the attachment limit enforced SERVER-side.
+            #
+            # config.MAX_ATTACHMENT_SIZE_BYTES was checked only in
+            # client/session.py, i.e. only by clients that choose to
+            # check it. A modified client could write arbitrarily
+            # large blobs into FILE_STORAGE_ROOT, which has no quota,
+            # no retention policy and no cleanup -- disk exhaustion
+            # with nothing in the way.
+            #
+            # The bound is the EXACT ciphertext size a maximum-size
+            # attachment produces (see config._wire_ciphertext_bytes),
+            # so a legitimate 25 MiB file is accepted and one byte
+            # more is not. Checked before store_blob(), so an
+            # oversized payload never reaches the filesystem.
+            #
+            # This is deliberately a second, independent limit rather
+            # than a restatement of MAX_FRAME_BYTES: the frame cap
+            # protects memory during the read, this protects disk at
+            # rest, and the frame cap has to carry JSON envelope
+            # slack that must not become attachment headroom.
+            ciphertext_size = len(envelope.ciphertext or "")
+
+            if ciphertext_size > MAX_ATTACHMENT_CIPHERTEXT_BYTES:
+                raise ValueError(
+                    f"Attachment ciphertext is {ciphertext_size:,} bytes; "
+                    f"the maximum is {MAX_ATTACHMENT_CIPHERTEXT_BYTES:,}."
+                )
+
             blob_ref = encrypted_blob_store.store_blob(envelope.ciphertext.encode("utf-8"))
             ciphertext = None
         else:
@@ -2369,7 +2402,12 @@ def authenticate_connection(state, client_socket, client_address):
     "auth" branch below is otherwise untouched.
     """
 
-    auth_packet = receive_message(client_socket)
+    # D8 / L-3 -- allow_idle=False: this is the pre-authentication
+    # read, where a peer that connects and then says nothing is
+    # precisely the denial of service being defended against. The
+    # handshake deadline set in server/server.py::_serve_client()
+    # therefore has to be allowed to fire.
+    auth_packet = receive_message(client_socket, allow_idle=False)
 
     if not auth_packet:
         return None
@@ -2470,12 +2508,32 @@ def handle_client(state, client_socket, client_address):
         # -----------------------------
         # Receive RSA public key
         # -----------------------------
-        key_packet = receive_message(client_socket)
+        # Still connection SETUP, so still no idle tolerance.
+        key_packet = receive_message(client_socket, allow_idle=False)
 
         if not key_packet:
             return
 
         key_packet = parse_packet(key_packet)
+
+        # D8 / L-3 -- connection setup is complete; swap the tight
+        # handshake deadline for the long stall timeout.
+        #
+        # Deliberately AFTER the public-key read above, not straight
+        # after authentication: setup is not finished until the key
+        # packet has arrived, and a client that authenticates and then
+        # goes silent mid-setup is still holding a thread for nothing.
+        #
+        # A timeout stays SET rather than being cleared to None. From
+        # here on receive_message() is called with allow_idle=True, so
+        # a timeout that fires while a connection is merely quiet is
+        # absorbed and the read resumes -- an idle client is never
+        # disconnected. What the deadline still catches is a frame
+        # that starts arriving and then stops part-way.
+        try:
+            client_socket.settimeout(SOCKET_STALL_TIMEOUT_SECONDS)
+        except OSError:
+            pass
 
         if (
             key_packet.get("type") == "key_exchange"
@@ -2555,7 +2613,13 @@ def handle_client(state, client_socket, client_address):
         # -----------------------------
         while True:
 
-            packet = receive_message(client_socket)
+            # D8 / L-3 -- allow_idle=True: this is the long-lived
+            # dispatch loop. A connection sitting quietly between
+            # messages is normal and must never be disconnected,
+            # so a deadline firing with nothing received is
+            # absorbed and the read resumes. A frame that starts
+            # arriving and then stalls still raises.
+            packet = receive_message(client_socket, allow_idle=True)
 
             if not packet:
                 break

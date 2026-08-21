@@ -513,3 +513,35 @@ def test_image_from_history_after_reconnect_is_viewable(
     bubble._handle_save_as()
 
     assert destination.read_bytes() == original
+
+
+def test_thumbnail_bounds_a_tall_image_by_height(tmp_path):
+    """A width-only bound left tall images unbounded: a 600x4000
+    screenshot became 320x2133 and pushed the rest of the transcript
+    off screen."""
+
+    tall = tmp_path / "tall.png"
+    image = QImage(600, 4000, QImage.Format_RGB32)
+    image.fill(QColor(10, 20, 30))
+    assert image.save(str(tall), "PNG")
+
+    bubble = ImageMessageBubble(
+        tall.read_bytes(), kind="received", sender="alice"
+    )
+
+    width, height = bubble.thumbnail_size()
+
+    assert height == ImageMessageBubble.MAX_THUMBNAIL_HEIGHT
+    assert width <= ImageMessageBubble.MAX_THUMBNAIL_WIDTH
+
+    # Aspect ratio preserved, not squashed to fit the box.
+    assert abs((width / height) - (600 / 4000)) < 0.01
+
+
+def test_thumbnail_never_upscales_a_small_image_in_either_dimension(png_file):
+    _path, original = png_file
+    bubble = ImageMessageBubble(original, kind="received", sender="alice")
+
+    width, height = bubble.thumbnail_size()
+
+    assert (width, height) == bubble.full_size()

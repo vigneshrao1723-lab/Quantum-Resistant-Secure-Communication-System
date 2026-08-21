@@ -85,6 +85,31 @@ KEY_EXCHANGE_ALGORITHM = "KYBER"
 # are, and that file never leaves the server).
 # ---------------------------------------------------------------
 
+# ---------------------------------------------------------------
+# Deployment Environment (D8 / P1)
+#
+# The project previously had no environment concept at all, which is
+# what let development TLS material double as the deployment default
+# with nothing objecting. Setting APP_ENV=production makes
+# validate_config() below refuse to start on the throwaway
+# certs/dev/ material.
+#
+# Deliberately defaults to "development": every existing checkout,
+# test run and demo keeps working untouched, and production is an
+# explicit, deliberate declaration rather than something a deployment
+# can drift into.
+# ---------------------------------------------------------------
+
+APP_ENV = os.environ.get("APP_ENV", "development").strip().lower()
+
+IS_PRODUCTION = APP_ENV == "production"
+
+# The throwaway material scripts/generate_dev_certs.py writes. Named
+# so validate_config() can recognise it and refuse it in production;
+# it is NEVER generated or committed by this project for production
+# use -- a real deployment supplies its own via the environment.
+_DEV_CERTS_DIR = ROOT_DIR / "certs" / "dev"
+
 TLS_CERT_FILE = os.environ.get(
     "TLS_CERT_FILE", str(ROOT_DIR / "certs" / "dev" / "server.crt")
 )
@@ -139,6 +164,119 @@ MAX_ATTACHMENT_SIZE_BYTES = int(
 # ---------------------------------------------------------------
 
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
+
+
+# ---------------------------------------------------------------
+# Maximum Network Frame Size (D8 / L-2)
+#
+# The single authoritative bound on one length-prefixed frame, applied
+# by utils/network.py to EVERY send and receive in the system (client
+# and server alike -- receive_message() is the only socket read path
+# there is).
+#
+# Why a cap at all: the wire format is a 4-byte big-endian length
+# followed by that many bytes. Unbounded, a peer could declare up to
+# 2**32-1 (~4 GiB) and the receiver would keep accumulating -- before
+# authentication, on a thread of its own. The declared length is now
+# rejected BEFORE a single payload byte is read.
+#
+# Why this particular number: it is DERIVED from the attachment limit
+# rather than picked, because the two must never drift apart. An
+# attachment is base64-encoded twice on its way to the wire --
+# crypto/payload_cipher.py base64s the bytes before encrypting, and
+# crypto/aes.py base64s nonce+tag+ciphertext afterwards -- so the
+# frame is (4/3)**2 = 16/9 times the file, plus JSON envelope. That is
+# measured, not assumed: a MAX_ATTACHMENT_SIZE_BYTES (25 MiB) file
+# produces a 46,604,005-byte frame, 1.7778x. A "round" 32 MiB cap
+# would therefore have rejected legitimate maximum-size attachments.
+#
+# The 1 MiB addend covers the JSON envelope: field names, sender and
+# receiver usernames, an ISO timestamp, and content_metadata
+# (filename, mime type, size).
+# ---------------------------------------------------------------
+
+def _wire_ciphertext_bytes(plaintext_bytes):
+    """
+    Exact size of the base64 ciphertext an attachment of
+    ``plaintext_bytes`` produces on the wire.
+
+    Not an estimate -- it follows the two real encodings the payload
+    pipeline applies, in order:
+
+      1. crypto/payload_cipher.py base64-encodes the raw bytes BEFORE
+         encrypting:            4 * ceil(n / 3)
+      2. crypto/aes.py prepends a 12-byte nonce and 16-byte GCM tag,
+         then base64-encodes the whole thing:
+                                4 * ceil((28 + inner) / 3)
+
+    Verified against the real pipeline: a 26,214,400-byte attachment
+    produces exactly 46,603,420 ciphertext bytes, which this returns.
+    """
+
+    inner = 4 * -(-plaintext_bytes // 3)
+
+    return 4 * -(-(inner + 28) // 3)
+
+
+# The largest ciphertext a legitimate maximum-size attachment can
+# produce. Used server-side to reject oversized blobs before they are
+# written to disk (D8 / P1).
+MAX_ATTACHMENT_CIPHERTEXT_BYTES = _wire_ciphertext_bytes(MAX_ATTACHMENT_SIZE_BYTES)
+
+_MIN_FRAME_BYTES = MAX_ATTACHMENT_CIPHERTEXT_BYTES + 1024 * 1024
+
+MAX_FRAME_BYTES = int(os.environ.get("MAX_FRAME_BYTES", str(_MIN_FRAME_BYTES)))
+
+
+# ---------------------------------------------------------------
+# Socket Timeouts (D8 / L-3)
+#
+# Before these, nothing in the system ever called settimeout(). A
+# peer could open a connection, send one byte of a frame header, and
+# hold a server thread and its buffers open forever.
+#
+# Two different limits, because "idle" and "stalled" are different
+# facts and only one of them is an attack:
+#
+# SOCKET_STALL_TIMEOUT_SECONDS bounds how long a read may make NO
+#   progress once a frame has started arriving. It is deliberately
+#   NOT an idle timeout: an authenticated client sitting in a quiet
+#   conversation is supposed to block indefinitely waiting for the
+#   next packet, and disconnecting it would break normal use. The
+#   timer only applies from the first byte of a frame onward -- see
+#   utils/network.py::recvall(). A slow but continuously progressing
+#   upload is therefore never cut off, which is the correct trade:
+#   a genuinely slow uplink is indistinguishable from a malicious one
+#   that keeps paying to send real bytes.
+#
+# HANDSHAKE_TIMEOUT_SECONDS bounds the whole pre-authentication
+#   phase -- TLS handshake, then the auth/login/register packet. This
+#   is the one that closes the unauthenticated slowloris: an attacker
+#   who never authenticates cannot hold a thread beyond this.
+# ---------------------------------------------------------------
+
+SOCKET_STALL_TIMEOUT_SECONDS = float(
+    os.environ.get("SOCKET_STALL_TIMEOUT_SECONDS", "60")
+)
+
+HANDSHAKE_TIMEOUT_SECONDS = float(
+    os.environ.get("HANDSHAKE_TIMEOUT_SECONDS", "30")
+)
+
+# ---------------------------------------------------------------
+# Connection Concurrency Limit (D8 / L-4)
+#
+# The accept() loop spawns one thread per connection. Unbounded, a
+# flood of connections becomes a thread and memory exhaustion. This
+# caps the number of connections being served at once; further
+# connections are refused promptly and politely rather than queued
+# into an ever-growing thread count, and the accept() loop itself
+# never stops running.
+# ---------------------------------------------------------------
+
+MAX_CONCURRENT_CONNECTIONS = int(
+    os.environ.get("MAX_CONCURRENT_CONNECTIONS", "200")
+)
 
 # Application Information
 # =====================================================
@@ -243,8 +381,79 @@ def validate_config():
             "Example: TLS_CERT_SANS=192.168.1.42,127.0.0.1,localhost"
         )
 
+    if APP_ENV not in ("development", "production"):
+        raise ValueError(
+            f"APP_ENV must be 'development' or 'production' (got {APP_ENV!r})."
+        )
+
+    if IS_PRODUCTION:
+
+        # D8 / P1 -- development TLS material must not be reachable
+        # from a production deployment. The dev CA's PRIVATE key sits
+        # in the same directory as its certificate, so anyone with a
+        # copy of the repository's generated dev material could mint a
+        # certificate this client would trust. That is entirely
+        # acceptable for localhost development and entirely
+        # unacceptable anywhere else.
+        #
+        # This refuses to start rather than warning: a warning in a
+        # log is exactly what gets missed, and the failure mode being
+        # prevented is silent -- everything works, and the transport
+        # is trusting a keypair that is not secret.
+        for name, value in (
+            ("TLS_CERT_FILE", TLS_CERT_FILE),
+            ("TLS_KEY_FILE", TLS_KEY_FILE),
+            ("TLS_CA_FILE", TLS_CA_FILE),
+        ):
+
+            resolved = Path(value).expanduser()
+
+            try:
+                inside_dev = resolved.resolve().is_relative_to(
+                    _DEV_CERTS_DIR.resolve()
+                )
+            except OSError:
+                inside_dev = False
+
+            if inside_dev:
+                raise ValueError(
+                    f"{name} points at development TLS material "
+                    f"({_DEV_CERTS_DIR}), which must never be used with "
+                    f"APP_ENV=production. Supply real certificates via "
+                    f"{name} in the environment. This project does not "
+                    f"generate production keys."
+                )
+
+            if not resolved.exists():
+                raise ValueError(
+                    f"{name} does not exist: {value}. A production "
+                    f"deployment must supply its own TLS material."
+                )
+
     if REQUEST_TIMEOUT_SECONDS <= 0:
         raise ValueError("REQUEST_TIMEOUT_SECONDS must be a positive number.")
+
+    # A frame cap below the derived minimum would silently break
+    # maximum-size attachments, which is a worse failure than a
+    # startup error: the send succeeds locally and the receiver drops
+    # the connection. Fail loudly at import instead.
+    if SOCKET_STALL_TIMEOUT_SECONDS <= 0:
+        raise ValueError("SOCKET_STALL_TIMEOUT_SECONDS must be positive.")
+
+    if HANDSHAKE_TIMEOUT_SECONDS <= 0:
+        raise ValueError("HANDSHAKE_TIMEOUT_SECONDS must be positive.")
+
+    if MAX_CONCURRENT_CONNECTIONS < 1:
+        raise ValueError("MAX_CONCURRENT_CONNECTIONS must be at least 1.")
+
+    if MAX_FRAME_BYTES < _MIN_FRAME_BYTES:
+        raise ValueError(
+            f"MAX_FRAME_BYTES ({MAX_FRAME_BYTES:,}) is smaller than the "
+            f"largest frame a MAX_ATTACHMENT_SIZE_BYTES "
+            f"({MAX_ATTACHMENT_SIZE_BYTES:,}) attachment produces "
+            f"({_MIN_FRAME_BYTES:,}). Raise MAX_FRAME_BYTES or lower "
+            f"MAX_ATTACHMENT_SIZE_BYTES."
+        )
 
 
 validate_config()

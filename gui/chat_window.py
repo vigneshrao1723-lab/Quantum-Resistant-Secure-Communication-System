@@ -23,7 +23,7 @@ from gui.add_members_dialog import AddMembersDialog
 from gui.conversation_list_widget import ConversationListWidget
 from gui.create_group_dialog import CreateGroupDialog
 from gui.find_user_dialog import FindUserDialog
-from gui.message_widget import MessageWidget
+from gui.message_widget import STATUS_FAILED, MessageWidget
 from gui.input_bar import InputBar
 from gui.status_bar import StatusBarWidget
 from gui.styles import COLOR_TEXT_MUTED
@@ -126,7 +126,14 @@ class ChatWindow(QWidget):
 
         right_layout.setSpacing(12)
 
-        # Header: app title + current chat partner
+        # Header: current chat partner (primary) + app title (secondary)
+        #
+        # The chat partner's name is what changes on every navigation and
+        # is what the user actually needs to confirm at a glance ("am I
+        # in the right conversation?") -- it is now the large/bold line.
+        # The static app title never changes across the whole session, so
+        # it is demoted to a small muted subtitle instead of occupying
+        # the header's most prominent slot on every screen.
 
         header = QFrame()
 
@@ -141,7 +148,7 @@ class ChatWindow(QWidget):
         app_title = QLabel("Quantum-Resistant Secure Chat")
 
         app_title.setStyleSheet(
-            "font-size: 15px; font-weight: 700;"
+            f"font-size: 9pt; font-weight: 500; color: {COLOR_TEXT_MUTED};"
         )
 
         self.add_members_button = QPushButton("Add Members")
@@ -172,9 +179,21 @@ class ChatWindow(QWidget):
             self.logout_requested.emit
         )
 
+        self.chat_partner_label = QLabel(
+            "Select a user to start chatting"
+        )
+
+        # L-1: set_conversation() rewrites this with a partner
+        # username or a group name, both chosen by other users.
+        self.chat_partner_label.setTextFormat(Qt.PlainText)
+
+        self.chat_partner_label.setStyleSheet(
+            "font-size: 15px; font-weight: 700;"
+        )
+
         header_top_row = QHBoxLayout()
 
-        header_top_row.addWidget(app_title)
+        header_top_row.addWidget(self.chat_partner_label)
 
         header_top_row.addStretch()
 
@@ -184,17 +203,9 @@ class ChatWindow(QWidget):
 
         header_top_row.addWidget(self.logout_button)
 
-        self.chat_partner_label = QLabel(
-            "Select a user to start chatting"
-        )
-
-        self.chat_partner_label.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 10pt;"
-        )
-
         header_layout.addLayout(header_top_row)
 
-        header_layout.addWidget(self.chat_partner_label)
+        header_layout.addWidget(app_title)
 
         # Messages panel
 
@@ -667,13 +678,76 @@ class ChatWindow(QWidget):
 
             self.session.send_chat_message(message)
 
-            self.messages.add_sent_message(
-                message
-            )
-
         except Exception as error:
 
+            # Task 2 -- the bubble is added for a FAILED send too, not
+            # just dropped behind a dialog. Previously the message
+            # simply vanished from the transcript, so a user whose
+            # connection dropped mid-send had no record that they had
+            # ever written it, and no way to copy the text back out.
+            #
+            # STATUS_FAILED here is a fact, not a guess: send_chat_
+            # message() raised, so the ciphertext never reached the
+            # server. This is the one failure the sender can attribute
+            # to a specific message with certainty -- the asynchronous
+            # delivery_failure packet carries only a receiver and a
+            # reason, no message identity, so it stays on show_error()
+            # rather than guessing which bubble it belongs to.
+            #
+            # on_retry makes the failure recoverable rather than merely
+            # visible: the bubble keeps the text and offers to send it
+            # again, so a dropped connection costs the user nothing.
+            self.messages.add_sent_message(
+                message,
+                read_status=STATUS_FAILED,
+                on_retry=self._retry_failed_message,
+            )
+
             self.show_error(str(error))
+
+            return
+
+        # False, not None: "the server accepted this over TLS", which
+        # is what a single tick means. Not True, and not a grey double
+        # tick -- neither delivery nor reading has been reported by
+        # anybody yet. A read_receipt_notification later promotes this
+        # bubble to ✓✓ in place via MessageWidget.mark_sent_read().
+        self.messages.add_sent_message(
+            message, read_status=False
+        )
+
+    def _retry_failed_message(self, bubble):
+        """
+        Re-send the text of a bubble whose original send failed
+        (Task 2).
+
+        Called by MessageBubble's Retry button. The bubble is only
+        cleared of its failed state if send_chat_message() returns
+        without raising -- the same single fact the original send is
+        judged by, so a retry can never leave the transcript claiming
+        more than actually happened.
+
+        A retry into a different conversation is refused rather than
+        silently redirected: the failed bubble belongs to the
+        conversation it was written in, and send_chat_message() always
+        targets whatever chat is currently open.
+        """
+
+        if self.session.get_current_chat() is None:
+
+            self.show_error(
+                "Select the conversation again before retrying."
+            )
+
+            return
+
+        try:
+            self.session.send_chat_message(bubble.message_text)
+        except Exception as error:
+            self.show_error(str(error))
+            return
+
+        bubble.mark_retry_succeeded()
 
     def handle_attachment_selected(self, file_path):
         """
@@ -817,6 +891,19 @@ class ChatWindow(QWidget):
             self.messages.mark_all_sent_read()
 
     def show_error(self, message):
+        """
+        Report an operation that was actually attempted and failed
+        (a send, an attachment read, a read-receipt round trip) --
+        always a modal dialog, since these need explicit
+        acknowledgment rather than a passive status line.
+
+        This is deliberately distinct from
+        MessageWidget.add_system_message(), which this window uses for
+        ambient, non-blocking information -- a conversation being
+        opened, a join/leave event relayed by the server, the BUG 1
+        key-store notice. Nothing here has failed in that case; there
+        is nothing to acknowledge, only to be aware of.
+        """
 
         QMessageBox.critical(
             self,

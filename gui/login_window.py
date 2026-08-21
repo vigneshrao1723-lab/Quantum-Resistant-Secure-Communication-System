@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -27,7 +26,8 @@ class LoginWindow(QWidget):
     """
 
     login_requested = Signal(str, str)
-    register_requested = Signal(str, str, str, str, str, str)
+    # username, phone_number, password, confirm_password
+    register_requested = Signal(str, str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -57,9 +57,13 @@ class LoginWindow(QWidget):
 
         card_layout = QVBoxLayout(card)
 
-        card_layout.setContentsMargins(40, 40, 40, 32)
+        # Trimmed from (40, 40, 40, 32) / spacing 6: with the register
+        # fields shown the card's sizeHint exceeded the 650px minimum
+        # window height, which clipped the Register button. This keeps
+        # the same visual style with a vertical budget that fits.
+        card_layout.setContentsMargins(36, 24, 36, 24)
 
-        card_layout.setSpacing(6)
+        card_layout.setSpacing(4)
 
         card_layout.setAlignment(Qt.AlignCenter)
 
@@ -75,8 +79,8 @@ class LoginWindow(QWidget):
 
             self.logo.setPixmap(
                 pixmap.scaled(
-                    96,
-                    96,
+                    64,
+                    64,
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation
                 )
@@ -111,66 +115,47 @@ class LoginWindow(QWidget):
         subtitle.setAlignment(Qt.AlignCenter)
 
         # ----------------------------------
-        # Full Name Label
+        # Username
+        #
+        # The application identity and the name shown to other users.
+        # Full name and email were removed from this form: the identity
+        # model is username (displayed) + phone number (searchable), so
+        # neither was carrying its weight. See
+        # MainWindow.handle_registration() for how the two database
+        # columns that still exist are populated without asking the
+        # user for them.
         # ----------------------------------
 
-        self.full_name_label = QLabel("FULL NAME")
-        self.full_name_label.setObjectName("FieldLabel")
-        self.full_name_label.setAlignment(Qt.AlignLeft)
+        self.username_label = QLabel("USERNAME")
+        self.username_label.setObjectName("FieldLabel")
+        self.username_label.setAlignment(Qt.AlignLeft)
 
-        self.full_name_input = QLineEdit()
-        self.full_name_input.setPlaceholderText(
-            "Enter your full name"
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText(
+            "Enter your username"
         )
-        self.full_name_input.returnPressed.connect(
+        self.username_input.returnPressed.connect(
             self.handle_submit
         )
 
         # ----------------------------------
-        # Email Label
-        # ----------------------------------
-
-        self.email_label = QLabel("EMAIL")
-        self.email_label.setObjectName("FieldLabel")
-        self.email_label.setAlignment(Qt.AlignLeft)
-
-        self.email_input = QLineEdit()
-        self.email_input.setPlaceholderText(
-            "Enter your email"
-        )
+        # Phone Number
+        #
         # BUG 7 -- the discovery identifier. Mandatory, because other
         # users find this account by it; registration is rejected
-        # server-side without one.
+        # server-side without one. Distinct from the username: this is
+        # what other people search for, the username is what they see.
+        # ----------------------------------
+
         self.phone_label = QLabel("PHONE NUMBER")
         self.phone_label.setObjectName("FieldLabel")
         self.phone_label.setAlignment(Qt.AlignLeft)
 
         self.phone_input = QLineEdit()
         self.phone_input.setPlaceholderText(
-            "e.g. +91 98765 43210  (others find you by this)"
+            "+91 98765 43210"
         )
-
-        self.email_input.returnPressed.connect(
-            self.handle_submit
-        )
-
-        # ----------------------------------
-        # Username or Email Label
-        # ----------------------------------
-
-        username_label = QLabel("USERNAME OR EMAIL")
-        username_label.setObjectName("FieldLabel")
-        username_label.setAlignment(Qt.AlignLeft)
-
-        # ----------------------------------
-        # Username Input
-        # ----------------------------------
-
-        self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText(
-            "Enter your username or email"
-        )
-        self.username_input.returnPressed.connect(
+        self.phone_input.returnPressed.connect(
             self.handle_submit
         )
 
@@ -233,6 +218,10 @@ class LoginWindow(QWidget):
             "Not connected"
         )
 
+        # L-1: show_connection_error() puts server-supplied error
+        # text in here.
+        self.status.setTextFormat(Qt.PlainText)
+
         self.status.setAlignment(Qt.AlignCenter)
 
         self.status.setStyleSheet(
@@ -244,29 +233,27 @@ class LoginWindow(QWidget):
         # ----------------------------------
 
         card_layout.addWidget(self.logo)
-        card_layout.addSpacing(4)
         card_layout.addWidget(title)
         card_layout.addWidget(subtitle)
-        card_layout.addSpacing(24)
+        card_layout.addSpacing(14)
 
-        card_layout.addWidget(self.full_name_label)
-        card_layout.addWidget(self.full_name_input)
-        card_layout.addWidget(self.email_label)
-        card_layout.addWidget(self.email_input)
+        # Field order matches the registration spec:
+        # USERNAME, PHONE NUMBER, PASSWORD, CONFIRM PASSWORD.
+        # In login mode the phone and confirm-password rows hide, which
+        # leaves USERNAME + PASSWORD in the same positions.
+        card_layout.addWidget(self.username_label)
+        card_layout.addWidget(self.username_input)
         card_layout.addWidget(self.phone_label)
         card_layout.addWidget(self.phone_input)
-
-        card_layout.addWidget(username_label)
-        card_layout.addWidget(self.username_input)
         card_layout.addWidget(password_label)
         card_layout.addWidget(self.password_input)
         card_layout.addWidget(self.confirm_password_label)
         card_layout.addWidget(self.confirm_password_input)
 
-        card_layout.addSpacing(14)
+        card_layout.addSpacing(10)
         card_layout.addWidget(self.submit_button)
         card_layout.addWidget(self.toggle_mode_button)
-        card_layout.addSpacing(16)
+        card_layout.addSpacing(6)
         card_layout.addWidget(self.status)
 
         outer_layout.addWidget(card)
@@ -281,14 +268,22 @@ class LoginWindow(QWidget):
     def set_mode(self, register: bool):
         self.is_register_mode = register
 
-        self.full_name_label.setVisible(register)
-        self.full_name_input.setVisible(register)
-        self.email_label.setVisible(register)
-        self.email_input.setVisible(register)
         self.phone_label.setVisible(register)
         self.phone_input.setVisible(register)
         self.confirm_password_label.setVisible(register)
         self.confirm_password_input.setVisible(register)
+
+        # Existing accounts registered before this form change may still
+        # have a real email, and the server accepts either identifier --
+        # so login keeps offering both, while registration asks only for
+        # the username it will actually display.
+        self.username_label.setText(
+            "USERNAME" if register else "USERNAME OR EMAIL"
+        )
+        self.username_input.setPlaceholderText(
+            "Enter your username" if register
+            else "Enter your username or email"
+        )
 
         self.submit_button.setText("Register" if register else "Login")
         self.toggle_mode_button.setText(
@@ -310,8 +305,7 @@ class LoginWindow(QWidget):
         self.toggle_mode_button.setEnabled(not connecting)
         self.username_input.setEnabled(not connecting)
         self.password_input.setEnabled(not connecting)
-        self.full_name_input.setEnabled(not connecting)
-        self.email_input.setEnabled(not connecting)
+        self.phone_input.setEnabled(not connecting)
         self.confirm_password_input.setEnabled(not connecting)
 
         self.status.setText(
@@ -333,6 +327,25 @@ class LoginWindow(QWidget):
             f"color: {COLOR_OFFLINE}; font-size: 9.5pt;"
         )
 
+    def show_validation_error(self, message):
+        """
+        Surface a field-validation problem through the same inline
+        status channel as show_connection_error(), rather than a
+        separate modal QMessageBox.
+
+        This screen previously reported two different categories of
+        "something is wrong with what you entered/tried" through two
+        different UI mechanisms -- a blocking dialog for missing/
+        invalid fields, inline text for a rejected login/registration.
+        Both are the same kind of feedback from the user's point of
+        view, so they now go through the same channel.
+        """
+
+        self.status.setText(message)
+        self.status.setStyleSheet(
+            f"color: {COLOR_OFFLINE}; font-size: 9.5pt;"
+        )
+
     # ======================================================
     # Events
     # ======================================================
@@ -346,54 +359,40 @@ class LoginWindow(QWidget):
         password = self.password_input.text()
 
         if not username:
-            QMessageBox.warning(
-                self,
-                "Username or Email Required",
-                "Please enter your username or email."
-            )
+            self.show_validation_error("Please enter your username or email.")
             return
 
         if not password:
-            QMessageBox.warning(
-                self,
-                "Password Required",
-                "Please enter a password."
-            )
+            self.show_validation_error("Please enter a password.")
             return
 
         self.set_connecting(True)
 
         if self.is_register_mode:
-            full_name = self.full_name_input.text().strip()
-            email = self.email_input.text().strip()
             phone_number = self.phone_input.text().strip()
             confirm_password = self.confirm_password_input.text()
 
-            if not full_name or not email or not phone_number or not confirm_password:
-                QMessageBox.warning(
-                    self,
-                    "Registration Required",
-                    "Please complete all registration fields."
-                )
+            if not phone_number or not confirm_password:
+                # set_connecting(False) first: it overwrites the status
+                # text with "Not connected", so calling it before the
+                # validation message would immediately erase what we
+                # just told the user.
                 self.set_connecting(False)
+                self.show_validation_error("Please complete all registration fields.")
                 return
 
             # Checked here only to fail fast with a clear message --
             # the server validates and normalises independently, and
             # is the actual boundary.
             if not is_valid_phone_number(phone_number):
-                QMessageBox.warning(
-                    self,
-                    "Invalid Phone Number",
+                self.set_connecting(False)
+                self.show_validation_error(
                     "Enter a valid phone number, for example +91 98765 43210."
                 )
-                self.set_connecting(False)
                 return
 
             self.register_requested.emit(
-                full_name,
                 username,
-                email,
                 phone_number,
                 password,
                 confirm_password,

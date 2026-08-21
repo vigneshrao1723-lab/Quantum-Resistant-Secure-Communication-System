@@ -84,19 +84,37 @@ class MainWindow(QMainWindow):
 
     def handle_registration(
         self,
-        full_name,
         username,
-        email,
         phone_number,
         password,
         confirm_password,
     ):
+        """
+        Register using the app's actual identity model: username is the
+        displayed name, phone number is the searchable identifier.
+
+        The registration form no longer collects a full name or an
+        email, but users.display_name and users.email are both NOT NULL
+        (and email is UNIQUE), so both are derived here rather than
+        dropped from the schema. Deliberately NOT a migration: removing
+        those columns would rewrite a table that existing accounts still
+        depend on -- email remains a valid login identifier for anyone
+        who registered before this change, and the server accepts it.
+
+        display_name = username, which is exactly what the app shows.
+
+        email is synthesised from the username under the .invalid TLD,
+        which RFC 2606 reserves precisely so it can never resolve or be
+        routed to. Uniqueness follows from the username's own UNIQUE
+        constraint, so the derived value cannot collide any more often
+        than the username itself. Nothing is ever sent to it.
+        """
 
         try:
             result = self.session.register(
-                full_name=full_name,
+                full_name=username,
                 username=username,
-                email=email,
+                email=f"{username}@users.invalid",
                 phone_number=phone_number,
                 password=password,
                 confirm_password=confirm_password,
@@ -115,8 +133,7 @@ class MainWindow(QMainWindow):
         self.login_window.username_input.setText(username)
         self.login_window.password_input.clear()
         self.login_window.confirm_password_input.clear()
-        self.login_window.email_input.clear()
-        self.login_window.full_name_input.clear()
+        self.login_window.phone_input.clear()
         self.login_window.set_connecting(False)
         self.login_window.status.setText(
             "Registration successful. Please login."
