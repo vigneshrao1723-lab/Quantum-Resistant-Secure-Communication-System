@@ -12,7 +12,6 @@ from auth.schemas import LoginRequest, RegisterRequest
 from config import (
     KEY_EXCHANGE_ALGORITHM,
     MAX_ATTACHMENT_CIPHERTEXT_BYTES,
-    SOCKET_STALL_TIMEOUT_SECONDS,
 )
 from database.connection import SessionLocal
 from database.models.conversation import Conversation
@@ -2516,22 +2515,32 @@ def handle_client(state, client_socket, client_address):
 
         key_packet = parse_packet(key_packet)
 
-        # D8 / L-3 -- connection setup is complete; swap the tight
-        # handshake deadline for the long stall timeout.
+        # Connection setup is complete; CLEAR the pre-authentication
+        # deadline so an established connection reads in blocking mode.
         #
         # Deliberately AFTER the public-key read above, not straight
         # after authentication: setup is not finished until the key
         # packet has arrived, and a client that authenticates and then
         # goes silent mid-setup is still holding a thread for nothing.
+        # The deadline set in server/server.py::_serve_client() covers
+        # that whole window and is what bounds an unauthenticated peer.
         #
-        # A timeout stays SET rather than being cleared to None. From
-        # here on receive_message() is called with allow_idle=True, so
-        # a timeout that fires while a connection is merely quiet is
-        # absorbed and the read resumes -- an idle client is never
-        # disconnected. What the deadline still catches is a frame
-        # that starts arriving and then stops part-way.
+        # This previously installed a long stall timeout instead of
+        # clearing it, so an established connection kept reading in
+        # timeout mode for its whole life. That was measured to cause
+        # an intermittent regression: with it, this file's own group
+        # membership suite failed 4/30 (plus one 0xc0000374 heap
+        # corruption); with the socket returned to blocking, 30/30 and
+        # 60/60 across arms. The mechanism was never demonstrated -- a
+        # dependency-free TLS stress showed no spurious EOF on either
+        # Python 3.12.0/OpenSSL 3.0.11 or 3.13.14/OpenSSL 3.0.21 -- so
+        # the timeout is removed rather than tuned. Stall detection for
+        # an already-authenticated peer is given up knowingly; the
+        # pre-auth deadline, the frame-size cap and the connection
+        # limit all remain, and those are what bound an anonymous
+        # attacker.
         try:
-            client_socket.settimeout(SOCKET_STALL_TIMEOUT_SECONDS)
+            client_socket.settimeout(None)
         except OSError:
             pass
 

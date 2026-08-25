@@ -1,0 +1,17 @@
+# Development-only dependencies: the test suite (tests/) and the
+# performance benchmark (benchmark/). Not required to run the
+# application itself -- see requirements.txt for that.
+#
+# Install alongside the runtime dependencies:
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# benchmark/benchmark_key_exchange.py imports only the standard library
+# and this project's own crypto/ package (already covered by
+# requirements.txt), so no extra benchmark-specific packages are listed
+# here at this time.
+
+pytest==8.4.2
+colorama==0.4.6
+iniconfig==2.3.0
+pluggy==1.6.0
+Pygments==2.21.0

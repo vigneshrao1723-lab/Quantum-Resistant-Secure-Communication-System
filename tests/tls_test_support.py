@@ -22,6 +22,67 @@ import threading
 
 from security.tls import build_client_context, build_server_context
 
+# ----------------------------------------------------------------------
+# Quarantine for handler threads that could not be joined.
+#
+# A thread that is still running when its fixture goes away is the
+# whole problem: it holds TLS sockets derived from that fixture's
+# SSLContext, and once the fixture's last reference drops, OpenSSL's
+# structures are freed underneath a thread that is still inside
+# SSL_read(). That is a use-after-free, and it is what turned an
+# intermittent test failure into an interpreter crash
+# (0xc0000374 / SIGSEGV) somewhere later in the run.
+#
+# Nothing here makes a stuck thread exit -- join_handlers() still
+# asserts, loudly, exactly as before. What this does is bound the
+# CONSEQUENCE: the context and its sockets are moved somewhere that
+# lives for the rest of the process, so the objects a running thread
+# may touch can never be collected. A leak is a bounded, diagnosable
+# problem; a heap corruption is not.
+_QUARANTINE = []
+_QUARANTINE_LOCK = threading.Lock()
+
+#: OpenSSL SSL objects deliberately never freed -- see _retain_sslobj().
+_RETAINED_SSLOBJS = []
+
+
+def _retain_sslobj(sslobj):
+    """Keep an OpenSSL SSL object alive for the process lifetime.
+
+    Used before force-closing a socket a handler thread is still
+    reading -- see ServerHarness._unblock_handlers().
+    """
+
+    with _QUARANTINE_LOCK:
+        _RETAINED_SSLOBJS.append(sslobj)
+
+
+def _quarantine(context, sockets, threads):
+    """Retain everything a still-running handler thread might use, for
+    the lifetime of the process."""
+
+    with _QUARANTINE_LOCK:
+        _QUARANTINE.append(
+            {
+                "context": context,
+                "sockets": list(sockets),
+                "threads": list(threads),
+            }
+        )
+
+
+def quarantined_thread_count():
+    """Number of handler threads that had to be quarantined. Tests use
+    this to assert the harness is not accumulating live threads."""
+
+    with _QUARANTINE_LOCK:
+        return sum(
+            1
+            for entry in _QUARANTINE
+            for thread in entry["threads"]
+            if thread.is_alive()
+        )
+
 
 def wrap_server_socket(client_socket, context):
     """
@@ -57,7 +118,14 @@ def wrap_client_socket(sock, server_hostname="127.0.0.1"):
 
 
 def serve_tls_client(
-    handle_client, state, client_socket, client_address, logger=None, *, context
+    handle_client,
+    state,
+    client_socket,
+    client_address,
+    logger=None,
+    *,
+    context,
+    on_wrapped=None,
 ):
     """
     Server-side accept-loop helper: TLS-wrap one accepted connection
@@ -73,6 +141,18 @@ def serve_tls_client(
     must be built once by the caller's fixture, before its accept loop
     starts, and passed to every call for connections that fixture
     accepts -- not rebuilt per connection.
+
+    ``on_wrapped`` (optional) is called with the TLS socket as soon as
+    the handshake succeeds, so the harness can hold a reference to the
+    socket the handler thread will actually block on.
+
+    That reference is necessary rather than convenient. ssl's
+    wrap_socket() DETACHES the socket it is given -- the original
+    object's fileno() becomes -1 -- so the raw pre-handshake socket the
+    accept loop recorded is a dead handle within microseconds of being
+    stored. Every attempt to unblock a stuck handler through it raised
+    OSError and was swallowed, which is why the previous escalation
+    path in join_handlers() never actually did anything.
     """
 
     try:
@@ -88,6 +168,9 @@ def serve_tls_client(
             logger.warning(f"TLS handshake failed for {client_address}: {error}")
         client_socket.close()
         return
+
+    if on_wrapped is not None:
+        on_wrapped(tls_socket)
 
     handle_client(state, tls_socket, client_address)
 
@@ -182,10 +265,92 @@ class ServerHarness:
         self._accepting_stopped = False
         self._handlers_joined = False
 
+        # Sockets the handler threads are actually blocked on, as
+        # opposed to the pre-handshake sockets in _accepted_sockets
+        # (which ssl detaches -- see serve_tls_client()). Registered
+        # from the connection thread, read from the fixture thread, so
+        # every access is guarded.
+        self._live_sockets = []
+        self._lock = threading.Lock()
+
     def __iter__(self):
         """Preserve the ``state, port = running_server`` contract."""
 
         return iter((self.state, self.port))
+
+    def register_connection(self, tls_socket):
+        """Record a live TLS socket a handler thread is serving.
+
+        Called from the connection thread the moment the handshake
+        completes, so that join_handlers() has something real to close
+        if that thread later has to be unblocked.
+        """
+
+        with self._lock:
+            self._live_sockets.append(tls_socket)
+
+    def _unblock_handlers(self):
+        """Force every still-running handler out of its blocking read.
+
+        Uses close(), NOT shutdown(). That distinction is the whole
+        repair, and it is measured rather than assumed -- against a
+        real SSLSocket blocked in recv() on this platform:
+
+            peer close()                 wakes immediately
+            peer shutdown(SHUT_RDWR)     wakes immediately
+            own shutdown(SHUT_RDWR)      DOES NOT WAKE
+            own close()                  wakes immediately  (60/60)
+
+        The old code called shutdown(SHUT_RDWR) on the handler's own
+        socket -- the one mechanism in that list that does not work --
+        and called it on an already-detached object, so it raised
+        OSError and was swallowed. Handlers were therefore never
+        unblocked and were abandoned by the join below.
+
+        close() from another thread is safe here: CPython's _ssl module
+        serialises I/O on an SSLSocket, so the read returns b"" rather
+        than tearing the SSL object out from under the reader. Verified
+        over 60 iterations with a forced gc.collect() after each, with
+        no interpreter crash.
+        """
+
+        with self._lock:
+            live = list(self._live_sockets)
+            raw_accepted = list(self._accepted_sockets)
+
+        # Live TLS sockets first -- these are what handlers block on.
+        #
+        # The retained _sslobj reference is not incidental. close()
+        # sets SSLSocket._sslobj = None, which drops the last reference
+        # to the underlying _ssl._SSLSocket and calls SSL_free() -- and
+        # the whole reason we are here is that another thread is
+        # currently inside SSL_read() on exactly that object. Freeing it
+        # under the reader would be the same use-after-free this method
+        # exists to avoid, just triggered by the cure instead of the
+        # disease. Holding a reference keeps the OpenSSL structure alive
+        # while still closing the file descriptor, which is what
+        # actually wakes the reader.
+        for sock in live:
+            try:
+                sslobj = getattr(sock, "_sslobj", None)
+                if sslobj is not None:
+                    _retain_sslobj(sslobj)
+            except Exception:  # noqa: BLE001 - retention is best effort
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        # The raw accepted sockets are already detached on the TLS
+        # path (a no-op here), but are still the real socket for a
+        # harness whose serve_connection never wraps -- e.g.
+        # test_server_auth_integration.py's plain-socket override.
+        for sock in raw_accepted:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def stop_accepting(self):
         """Phase 1 -- no new connections, no accept() in flight."""
@@ -227,21 +392,30 @@ class ServerHarness:
 
         if any(t.is_alive() for t in self._handler_threads):
 
-            # Something is still blocked on a socket read. Unblock it
-            # rather than abandoning it -- an abandoned thread outlives
-            # this fixture's SSLContext and is what crashes the
-            # interpreter later. shutdown() (not close()) is used so
-            # the owning thread still performs its own close.
-            for accepted in list(self._accepted_sockets):
-                try:
-                    accepted.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+            # Something is still blocked on a socket read -- typically a
+            # test that finished without closing its client socket.
+            # Unblock it rather than abandoning it; see
+            # _unblock_handlers() for why this is close() and not
+            # shutdown().
+            self._unblock_handlers()
 
             for handler_thread in list(self._handler_threads):
                 handler_thread.join(timeout=self._HANDLER_FORCE_SECONDS)
 
         still_alive = [t for t in self._handler_threads if t.is_alive()]
+
+        if still_alive:
+            # Unjoinable. The assertion below still fails the test --
+            # nothing is being suppressed -- but before it does, hand
+            # everything those threads can still touch to the
+            # process-lifetime quarantine. Otherwise this fixture's
+            # SSLContext is collected while they are inside OpenSSL,
+            # and the run dies with a heap corruption far away from
+            # here instead of failing right here with a usable message.
+            with self._lock:
+                sockets = list(self._live_sockets) + list(self._accepted_sockets)
+
+            _quarantine(getattr(self, "_tls_context", None), sockets, still_alive)
 
         assert not still_alive, (
             f"{len(still_alive)} handler thread(s) did not terminate; a "
@@ -288,6 +462,35 @@ def start_test_server(serve_connection=None, state=None):
 
     context = build_server_context()
 
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(("127.0.0.1", 0))
+    server_socket.listen()
+    port = server_socket.getsockname()[1]
+
+    stop = threading.Event()
+    handler_threads = []
+    accepted_sockets = []
+
+    # Built before the accept loop starts, and before the default
+    # serve_connection below closes over it, so every connection this
+    # server accepts can register the socket its handler will block on
+    # (see ServerHarness.register_connection()).
+    harness = ServerHarness(
+        state,
+        port,
+        stop,
+        server_socket,
+        None,
+        handler_threads,
+        accepted_sockets,
+    )
+
+    # Keep the context alive for exactly as long as the harness is --
+    # no handler thread may outlive the object its TLS sockets came
+    # from.
+    harness._tls_context = context
+
     if serve_connection is None:
 
         def serve_connection(state, context, client_socket, address):
@@ -298,17 +501,8 @@ def start_test_server(serve_connection=None, state=None):
                 address,
                 state.logger,
                 context=context,
+                on_wrapped=harness.register_connection,
             )
-
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen()
-    port = server_socket.getsockname()[1]
-
-    stop = threading.Event()
-    handler_threads = []
-    accepted_sockets = []
 
     def accept_loop():
         server_socket.settimeout(0.2)
@@ -320,33 +514,25 @@ def start_test_server(serve_connection=None, state=None):
             except OSError:
                 break
 
-            accepted_sockets.append(client_socket)
-
             handler_thread = threading.Thread(
                 target=serve_connection,
                 args=(state, context, client_socket, address),
                 daemon=True,
             )
+
+            # Recorded under the harness lock, and BEFORE the thread
+            # starts: a connection that is accepted but not yet
+            # tracked is one join_handlers() would not know to wait
+            # for.
+            with harness._lock:
+                accepted_sockets.append(client_socket)
+                handler_threads.append(handler_thread)
+
             handler_thread.start()
-            handler_threads.append(handler_thread)
 
     accept_thread = threading.Thread(target=accept_loop, daemon=True)
+    harness._accept_thread = accept_thread
     accept_thread.start()
-
-    harness = ServerHarness(
-        state,
-        port,
-        stop,
-        server_socket,
-        accept_thread,
-        handler_threads,
-        accepted_sockets,
-    )
-
-    # Keep the context alive for exactly as long as the harness is --
-    # no handler thread may outlive the object its TLS sockets came
-    # from.
-    harness._tls_context = context
 
     return harness
 

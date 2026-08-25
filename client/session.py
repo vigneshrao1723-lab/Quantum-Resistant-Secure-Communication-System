@@ -27,7 +27,6 @@ from config import (
     REQUEST_TIMEOUT_SECONDS,
     SERVER_HOST,
     SERVER_PORT,
-    SOCKET_STALL_TIMEOUT_SECONDS,
 )
 from crypto.aes import AESCipher
 from crypto.key_manager import KeyManager
@@ -346,13 +345,19 @@ class ClientSession(QObject):
             raw_socket.close()
             raise
 
-        # D8 / L-3 -- swap the tight handshake deadline for the long
-        # stall timeout now that the connection is established. The
-        # receiver thread reads with allow_idle=True, so a quiet
-        # connection is never dropped; what stays bounded is a frame
-        # that starts arriving from the server and then stops.
+        # Clear the connect/handshake deadline now that the connection
+        # is established, returning the socket to blocking reads.
+        #
+        # This previously installed a long stall timeout here instead.
+        # That exact line was NOT shown to cause the server-side
+        # regression -- the reproducer drives raw sockets and never
+        # reaches ClientSession -- but it is the same unvalidated
+        # post-setup timeout pattern on the same read path, and there
+        # is no evidence justifying keeping it. The deadline above
+        # still bounds connect() and the TLS handshake, which is what
+        # stops the GUI hanging on a dead or non-TLS server.
         try:
-            self.client_socket.settimeout(SOCKET_STALL_TIMEOUT_SECONDS)
+            self.client_socket.settimeout(None)
         except OSError:
             pass
 
