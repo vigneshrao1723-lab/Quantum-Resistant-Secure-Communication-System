@@ -114,6 +114,16 @@ class ClientSession(QObject):
     # it just sees the correct status next time it opens/reloads.
     read_receipt_updated = Signal(str, str)
 
+    # BUG -- Public-Key Availability: another client's public key was
+    # just received and cached (see handle_public_key()) -- username.
+    # Purely a live-update hint for a composer that might currently be
+    # waiting on exactly this key; the authoritative check is always
+    # KeyManager.get_public_key(partner) itself (see gui/chat_window.py
+    # ::_update_composer_availability()), so a client that never
+    # receives this signal (e.g. no conversation with them is open) is
+    # not out of sync -- it just sees the key next time it checks.
+    public_key_received = Signal(str)
+
     def __init__(self):
         super().__init__()
 
@@ -2189,6 +2199,11 @@ class ClientSession(QObject):
             "system",
             f"Received {algorithm} public key from {username}."
         )
+
+        # BUG -- Public-Key Availability: emitted only after the key
+        # actually validated and was stored above -- never for a
+        # rejected/malformed one (that branch already returned).
+        self.public_key_received.emit(username)
 
     # ----------------------------------------------------------
 

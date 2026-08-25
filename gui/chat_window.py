@@ -335,6 +335,13 @@ class ChatWindow(QWidget):
             self.handle_read_receipt_updated
         )
 
+        # BUG -- Public-Key Availability: a live "this key just
+        # arrived" hint for whichever conversation is currently open --
+        # see handle_public_key_received().
+        self.session.public_key_received.connect(
+            self.handle_public_key_received
+        )
+
         # -----------------------------------------
         # Sync UI with current session state
         # -----------------------------------------
@@ -524,7 +531,12 @@ class ChatWindow(QWidget):
 
         self.chat_partner_label.setText(label)
 
-        self.input_bar.set_enabled(True)
+        # BUG -- Public-Key Availability: replaces the previous
+        # unconditional set_enabled(True) -- see
+        # _update_composer_availability()'s docstring for why a direct
+        # conversation's composer must not be usable until this client
+        # has actually received the recipient's public key.
+        self._update_composer_availability()
 
         self.input_bar.focus_input()
 
@@ -553,6 +565,80 @@ class ChatWindow(QWidget):
             # here only means the read receipt itself didn't go out;
             # it must never block or undo the open.
             self.show_error(str(error))
+
+    def _update_composer_availability(self):
+        """
+        Enable the composer only if it can actually be used right now
+        (BUG -- Public-Key Availability).
+
+        A direct conversation's first message requires this client to
+        already hold the recipient's Kyber/RSA public key --
+        ClientSession.establish_session_key() encapsulates/encrypts a
+        fresh AES session key with it (see client/session.py). That
+        key arrives only from another client that is (or was, this
+        session) actually connected at the same time as this one --
+        see server/broadcaster.py::distribute_public_keys() -- so a
+        conversation opened via Find User with someone currently
+        offline has a real, valid conversation but no usable
+        encryption target yet. Previously the composer was enabled
+        unconditionally, so the first send attempt failed with a
+        blocking "No public key found" error dialog instead of never
+        being attempted at all.
+
+        Not applicable to a group conversation: a group's key is
+        established entirely differently (group key distribution at
+        creation/add-member time -- see KeyManager.wrap_key_for_member()
+        via server-side group handlers), never gated on a single
+        peer's public key here.
+
+        Called from two places, both meaning "re-check whether the
+        currently-open conversation can be messaged right now":
+        open_conversation() (a fresh open) and
+        handle_public_key_received() (a key arrived for whoever is
+        currently open -- see its docstring for why that is the only
+        other moment this can change).
+        """
+
+        if self.session.current_chat_is_group:
+
+            self.input_bar.set_enabled(True)
+
+            return
+
+        partner = self.session.get_current_chat()
+
+        has_key = (
+            partner is not None
+            and self.session.key_manager.get_public_key(partner) is not None
+        )
+
+        self.input_bar.set_enabled(has_key)
+
+    def handle_public_key_received(self, username):
+        """
+        A public key just arrived and was cached (BUG -- Public-Key
+        Availability -- see ClientSession.public_key_received's
+        docstring). If it belongs to whoever the composer is currently
+        waiting on, re-evaluate availability so the user can start
+        messaging them immediately -- no closing/reopening the
+        conversation, no re-searching, no restart.
+
+        Ignored for a group conversation (its composer's availability
+        is never gated on a single peer's key -- see
+        _update_composer_availability()) and for any username other
+        than the one currently open, so a key arriving for someone
+        else entirely -- e.g. broadcast to this client because THEY
+        just came online, unrelated to what's on screen -- never
+        touches a composer that was not actually waiting on it.
+        """
+
+        if self.session.current_chat_is_group:
+            return
+
+        if username != self.session.get_current_chat():
+            return
+
+        self._update_composer_availability()
 
     def load_history(self, key, is_group=False):
         """
@@ -672,6 +758,24 @@ class ChatWindow(QWidget):
                 "Please select an online user."
             )
 
+            return
+
+        # BUG -- Public-Key Availability: defense in depth. The
+        # composer is already disabled whenever this would be true
+        # (see _update_composer_availability()), so InputBar.
+        # message_sent should never actually fire this way -- but a
+        # doomed encryption attempt (and the blocking error dialog it
+        # used to produce) must never happen even if this method is
+        # somehow reached another way. Silently ignored, exactly like
+        # the disabled composer itself: this is not a failed send (the
+        # user never actually sent anything the server could see), so
+        # it is not shown as one.
+        if (
+            not self.session.current_chat_is_group
+            and self.session.key_manager.get_public_key(
+                self.session.get_current_chat()
+            ) is None
+        ):
             return
 
         try:
