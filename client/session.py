@@ -561,6 +561,18 @@ class ClientSession(QObject):
         never replaced with fabricated keys. In both cases the session
         continues with whatever keys it can still obtain through the
         existing peer-recovery mechanism.
+
+        Server-Untrusted Identity Verification, Stage 2.5: also the
+        earliest point this user's own Kyber keypair can be made
+        persistent -- self.key_manager already exists (built in
+        __init__(), before any password was known) with an ephemeral
+        keypair, and this is the first moment a password-derived store
+        to load-or-persist it into becomes available. If the store
+        fails to unlock above, this step is simply never reached, and
+        the session keeps that ephemeral keypair for its own lifetime
+        (exactly today's pre-Stage-2.5 behavior) -- never a new,
+        silently-persisted identity minted on top of a store that just
+        failed to authenticate.
         """
 
         self.key_store = None
@@ -577,6 +589,18 @@ class ClientSession(QObject):
             self.key_store_error = str(error)
             self.logger.warning(f"Local key store unavailable: {error}")
             return
+
+        try:
+            self.key_manager.load_or_create_kyber_keypair(store)
+        except (KeyStoreError, OSError) as error:
+            # Same "never fatal" posture as _persist_conversation_keys():
+            # the store itself did unlock, so it stays usable for
+            # conversation-key persistence below; only this session's
+            # own keypair fails to become persistent, and it keeps the
+            # ephemeral one __init__() already generated.
+            self.logger.warning(
+                f"Could not load or persist own Kyber keypair: {error}"
+            )
 
         count = self.key_manager.import_conversation_keys(restored)
 

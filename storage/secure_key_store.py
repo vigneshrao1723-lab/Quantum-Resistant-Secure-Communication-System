@@ -31,12 +31,41 @@ stored in the same encrypted file, under the same password-derived
 key, for the same reason the conversation keys are: it must survive a
 restart, and it must never touch the server or the database.
 
-The client's long-term Kyber/RSA keypair is deliberately NOT persisted.
-It is used for key EXCHANGE, never to decrypt a stored message, so
-keeping it is not needed to read history; and persisting it would make
-this client's public key stable across restarts, which is a change to
-the identity/trust model (see D6.4) rather than a history fix. Fewer
-secrets on disk is also simply better.
+Server-Untrusted Identity Verification, Stage 2.5 adds one more small
+section: this local user's OWN Kyber (ML-KEM-768) keypair -- both
+halves, public and private. Originally (D6.4) this was deliberately
+NOT persisted, on the reasoning that it is used for key EXCHANGE, not
+to decrypt stored messages, so keeping it was not needed to read
+history, and persisting it would make this client's public key stable
+across restarts -- a change to the identity/trust model rather than a
+history fix.
+
+That reasoning held only as long as key stability across restarts was
+out of scope. Stage 1/2 (peer-key fingerprinting and substitution
+detection) made it in scope: KeyManager.__init__() regenerates a fresh
+ML-KEM keypair on every login, so without this section a user's
+"legitimate key rotation" and "a malicious server substituting a
+different key" become the same event on every single relogin --
+indistinguishable, and happening constantly, which would make Stage
+2's already-proven protection either unusable or ignored. Persisting
+this local user's own keypair here -- reusing exactly the same
+encrypted-at-rest, password-derived-key infrastructure already
+protecting conversation keys and peer fingerprints, not a new
+mechanism -- is what makes a VERIFIED peer fingerprint (of THIS user,
+from someone else's perspective) mean anything across more than one
+login. It remains algorithm-specific to Kyber: RSA (kept only for
+classical-vs-post-quantum comparison) still generates a fresh keypair
+every session, unchanged -- see KeyManager.load_or_create_kyber_keypair().
+
+The private half never leaves this file: it is written only into this
+same encrypted payload, is never sent to the server (see
+ClientSession.send_public_key(), which only ever transmits
+KeyManager.public_key -- the encapsulation/public half), and this
+module still changes nothing about the server, the protocol, the
+database, or the message flow. Fewer secrets on disk was, and remains,
+simply better where it doesn't cost anything -- this is the one place
+persisting a secret buys a real security property Stage 1/2 cannot
+provide without it.
 
 Security properties
 -------------------
@@ -108,6 +137,7 @@ from config import (
     KEY_STORE_DIR,
 )
 from crypto.aes import AESCipher
+from crypto.kyber import ML_KEM_768_PRIVATE_KEY_BYTES, ML_KEM_768_PUBLIC_KEY_BYTES
 
 # Bumped only if the on-disk layout changes incompatibly. Readers
 # refuse a version they do not understand rather than guessing.
@@ -184,6 +214,13 @@ class SecureKeyStore:
         # record_observed_peer_fingerprint()/verify_peer_fingerprint().
         self._peers = {}
 
+        # This local user's own Kyber (ML-KEM-768) keypair (Server-
+        # Untrusted Identity Verification, Stage 2.5):
+        # (encapsulation_key, decapsulation_key), both raw bytes, or
+        # None if never persisted -- populated by unlock(), mutated
+        # only through save_own_kyber_keypair().
+        self._own_kyber_keypair = None
+
         # The most recently known {conversation_id: {epoch: key_bytes}}
         # snapshot -- set by unlock() and by save(). Needed so the
         # peer-verification methods below, which have no conversation-
@@ -240,6 +277,7 @@ class SecureKeyStore:
             }
             self._derived_key = _derive_key(password, self._salt, **self._params)
             self._peers = {}
+            self._own_kyber_keypair = None
             self._last_keys_snapshot = {}
             return {}
 
@@ -290,6 +328,15 @@ class SecureKeyStore:
             # state is the true, honest description of "never recorded
             # any peer fingerprints", not a malformed file.
             peers_raw = document.get("peers", {})
+            # Absent, not required, same reasoning: every store written
+            # before Stage 2.5 existed has no "own_kyber_keypair"
+            # section -- that honestly means "no keypair persisted
+            # yet", not a malformed file (Server-Untrusted Identity
+            # Verification, Stage 2.5). KeyManager.
+            # load_or_create_kyber_keypair() treats None exactly the
+            # same whether it comes from a pre-Stage-2.5 store or a
+            # brand-new one: generate once, persist from here on.
+            own_kyber_keypair_raw = document.get("own_kyber_keypair")
         except (KeyError, TypeError, ValueError) as error:
             raise KeyStoreLocked(
                 "The local key store contents are malformed."
@@ -300,6 +347,30 @@ class SecureKeyStore:
         except (KeyError, TypeError, ValueError) as error:
             raise KeyStoreLocked(
                 "The local key store's peer verification data is malformed."
+            ) from error
+
+        try:
+            decoded_own_kyber_keypair = self._decode_own_kyber_keypair(
+                own_kyber_keypair_raw
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            # Fail closed (Server-Untrusted Identity Verification,
+            # Stage 2.5): this section is only ever absent (handled
+            # above) or exactly what this module itself previously
+            # wrote, since it lives inside the same GCM-authenticated
+            # payload as everything else here -- reaching this branch
+            # means the authenticated contents are structurally wrong,
+            # not that an attacker forged them (a forged payload would
+            # already have failed the GCM tag check above). Refusing
+            # the whole store rather than silently generating a
+            # replacement keypair is deliberate: a replacement would
+            # be a NEW identity that any peer who already VERIFIED this
+            # user's old fingerprint would see as an unexplained
+            # KEY_CHANGED, with no way to tell it apart from an actual
+            # attack. The same fail-closed handling already applies to
+            # a malformed "peers" section above, for the same reason.
+            raise KeyStoreLocked(
+                "The local key store's own Kyber keypair data is malformed."
             ) from error
 
         # The plaintext header is only trustworthy if it matches the
@@ -317,6 +388,7 @@ class SecureKeyStore:
         self._params = params
         self._derived_key = derived
         self._peers = decoded_peers
+        self._own_kyber_keypair = decoded_own_kyber_keypair
 
         decoded_keys = self._decode(raw)
         self._last_keys_snapshot = decoded_keys
@@ -373,6 +445,9 @@ class SecureKeyStore:
                 "header": bound,
                 "keys": self._encode(conversation_keys),
                 "peers": self._encode_peers(self._peers),
+                "own_kyber_keypair": self._encode_own_kyber_keypair(
+                    self._own_kyber_keypair
+                ),
             })
         )
 
@@ -396,6 +471,7 @@ class SecureKeyStore:
         self._salt = None
         self._params = None
         self._peers = {}
+        self._own_kyber_keypair = None
         self._last_keys_snapshot = {}
 
     # ------------------------------------------------------------------
@@ -532,6 +608,98 @@ class SecureKeyStore:
             }
 
         return decoded
+
+    # ------------------------------------------------------------------
+    # This local user's own Kyber (ML-KEM-768) keypair (Server-Untrusted
+    # Identity Verification, Stage 2.5)
+    # ------------------------------------------------------------------
+
+    def get_own_kyber_keypair(self):
+        """
+        Return this local user's persisted Kyber keypair as
+        ``(encapsulation_key, decapsulation_key)`` -- both raw bytes,
+        byte-for-byte identical to what was originally passed to
+        save_own_kyber_keypair() -- or None if none has ever been
+        persisted (a fresh installation, or a store created before
+        Stage 2.5 existed).
+        """
+
+        return self._own_kyber_keypair
+
+    def save_own_kyber_keypair(self, encapsulation_key, decapsulation_key):
+        """
+        Persist this local user's Kyber keypair. Called exactly once
+        ever, per installation -- the first time KeyManager.
+        load_or_create_kyber_keypair() finds nothing already on file.
+
+        Deliberately refuses to overwrite an existing persisted
+        keypair, unlike a conversation-key epoch or an observed peer
+        fingerprint: there is no legitimate "this changed, update it"
+        case for this user's own identity key from this method's
+        caller -- Stage 2.5 exists specifically so this key does NOT
+        change across logins. A caller reaching this branch with a
+        keypair already on file is a bug, not a routine event: minting
+        a second, silently-swapped identity underneath whatever peers
+        have already VERIFIED this user's current fingerprint is
+        exactly the failure this store must never produce on its own,
+        so this fails closed (raises) rather than silently proceeding.
+        """
+
+        if not isinstance(encapsulation_key, (bytes, bytearray)) or not encapsulation_key:
+            raise KeyStoreError("An encapsulation (public) key is required.")
+
+        if not isinstance(decapsulation_key, (bytes, bytearray)) or not decapsulation_key:
+            raise KeyStoreError("A decapsulation (private) key is required.")
+
+        with self._lock:
+
+            if self._own_kyber_keypair is not None:
+                raise KeyStoreError(
+                    "An own Kyber keypair is already persisted for this "
+                    "user; it must never be silently replaced."
+                )
+
+            self._own_kyber_keypair = (
+                bytes(encapsulation_key),
+                bytes(decapsulation_key),
+            )
+            self._write(self._last_keys_snapshot)
+
+    @staticmethod
+    def _encode_own_kyber_keypair(own_kyber_keypair):
+        if own_kyber_keypair is None:
+            return None
+
+        encapsulation_key, decapsulation_key = own_kyber_keypair
+
+        return {
+            "encapsulation_key": base64.b64encode(encapsulation_key).decode("ascii"),
+            "decapsulation_key": base64.b64encode(decapsulation_key).decode("ascii"),
+        }
+
+    @staticmethod
+    def _decode_own_kyber_keypair(raw):
+        if raw is None:
+            return None
+
+        encapsulation_key = base64.b64decode(raw["encapsulation_key"], validate=True)
+        decapsulation_key = base64.b64decode(raw["decapsulation_key"], validate=True)
+
+        if len(encapsulation_key) != ML_KEM_768_PUBLIC_KEY_BYTES:
+            raise ValueError(
+                f"Persisted Kyber encapsulation key must decode to exactly "
+                f"{ML_KEM_768_PUBLIC_KEY_BYTES} bytes; got "
+                f"{len(encapsulation_key)}."
+            )
+
+        if len(decapsulation_key) != ML_KEM_768_PRIVATE_KEY_BYTES:
+            raise ValueError(
+                f"Persisted Kyber decapsulation key must decode to exactly "
+                f"{ML_KEM_768_PRIVATE_KEY_BYTES} bytes; got "
+                f"{len(decapsulation_key)}."
+            )
+
+        return (encapsulation_key, decapsulation_key)
 
     # ------------------------------------------------------------------
 

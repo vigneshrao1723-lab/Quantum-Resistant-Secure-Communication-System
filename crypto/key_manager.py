@@ -145,6 +145,62 @@ class KeyManager:
 
         return self.rsa.export_public_key()
 
+    def load_or_create_kyber_keypair(self, key_store):
+        """
+        Make this local user's Kyber (ML-KEM-768) keypair the one
+        persisted in ``key_store``, instead of the ephemeral one
+        __init__() always generates (Server-Untrusted Identity
+        Verification, Stage 2.5).
+
+        __init__() runs before any SecureKeyStore is available --
+        ClientSession constructs KeyManager before login, and
+        SecureKeyStore cannot be unlocked until the account password
+        is known -- so it always generates a keypair first, unaware of
+        whatever may already be on file. This method is called exactly
+        once, from ClientSession._unlock_key_store() right after that
+        store successfully unlocks, and resolves the two keypairs into
+        one of the following:
+
+        * ``key_store`` already holds a persisted keypair (every login
+          after the very first): it REPLACES __init__()'s keypair.
+          That one is discarded -- never exported, sent, or used for
+          any cryptographic operation, since self.public_key is
+          recomputed below before this method returns and nothing
+          reads self.kyber's fields before this method runs (see
+          ClientSession.send_public_key(), always called later).
+
+        * ``key_store`` holds none yet (first login ever, or a store
+          created before Stage 2.5 existed): __init__()'s keypair
+          becomes the permanent one, persisted here so every
+          subsequent login loads the same keypair instead of
+          generating a new one.
+
+        Never calls KyberKEM.generate_keys() itself -- by the time this
+        runs, a keypair already exists (from __init__()) or is loaded
+        from key_store; this method only ever assigns already-existing
+        bytes, in either direction.
+
+        A no-op if the active algorithm is not KYBER: RSA is
+        deliberately out of Stage 2.5's scope (see
+        storage/secure_key_store.py's module docstring) and keeps
+        generating a fresh keypair every session, unchanged.
+        """
+
+        if self.algorithm != "KYBER":
+            return
+
+        persisted = key_store.get_own_kyber_keypair()
+
+        if persisted is not None:
+            self.kyber.encapsulation_key, self.kyber.decapsulation_key = persisted
+        else:
+            key_store.save_own_kyber_keypair(
+                self.kyber.encapsulation_key,
+                self.kyber.decapsulation_key,
+            )
+
+        self.public_key = self._export_own_public_key()
+
     # =====================================================
     # Public Key Management
     # =====================================================

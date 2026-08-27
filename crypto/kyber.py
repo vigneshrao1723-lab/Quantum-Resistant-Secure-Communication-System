@@ -31,6 +31,13 @@ from kyber_py.ml_kem import ML_KEM_768
 # letting it reach ML_KEM_768.encaps() much later (D6.5).
 ML_KEM_768_PUBLIC_KEY_BYTES = 1184
 
+# Size, in bytes, of an ML-KEM-768 decapsulation ("private") key: FIPS
+# 203's expanded secret key, 768 * k + 96 with k = 3. Used by
+# storage/secure_key_store.py (Server-Untrusted Identity Verification,
+# Stage 2.5) to validate a persisted keypair's private half before
+# ever loading it back into this process.
+ML_KEM_768_PRIVATE_KEY_BYTES = 2400
+
 
 class KyberKEM:
     """
