@@ -29,10 +29,12 @@ from config import (
     SERVER_PORT,
 )
 from crypto.aes import AESCipher
-from crypto.key_manager import KeyManager
+from crypto.key_manager import KeyManager, fingerprint_public_key
 from storage.secure_key_store import (
     KeyStoreError,
     KeyStoreLocked,
+    PEER_STATE_UNVERIFIED,
+    PEER_STATE_VERIFIED,
     SecureKeyStore,
 )
 from domain.conversation_summary import ConversationSummary, MessagePreview
@@ -77,6 +79,16 @@ from utils.request_registry import PendingRequestRegistry, RequestTimeoutError
 # with the currently cached AES session key (e.g. it was encrypted in
 # a previous run, under a key that no longer exists in memory).
 _UNDECRYPTABLE_PLACEHOLDER = "Message unavailable (encrypted in a previous session)"
+
+# Server-Untrusted Identity Verification, Stage 2: a purely in-memory,
+# session-local peer-verification state, layered on top of
+# storage.secure_key_store's persisted PEER_STATE_UNVERIFIED/
+# PEER_STATE_VERIFIED. Never written to the key store -- it describes
+# "the most recently observed key disagreed with the locally VERIFIED
+# one", not new evidence about what should be considered VERIFIED, so
+# it belongs to this session's lifetime only (see ClientSession.
+# _evaluate_peer_key_verification()'s docstring).
+PEER_KEY_STATE_CHANGED = "KEY_CHANGED"
 
 
 class ClientSession(QObject):
@@ -123,6 +135,16 @@ class ClientSession(QObject):
     # receives this signal (e.g. no conversation with them is open) is
     # not out of sync -- it just sees the key next time it checks.
     public_key_received = Signal(str)
+
+    # Server-Untrusted Identity Verification, Stage 2: emitted --
+    # username only -- the moment a received public key's fingerprint
+    # is found to disagree with a fingerprint this user previously,
+    # explicitly VERIFIED for that peer (see
+    # _evaluate_peer_key_verification()). Never emitted for a brand
+    # new, never-verified peer (that is the ordinary UNVERIFIED case,
+    # not a change from anything). A later GUI layer (Stage 3) is the
+    # intended consumer; nothing in this stage reacts to it itself.
+    peer_key_changed = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -261,6 +283,13 @@ class ClientSession(QObject):
         # carries a user-presentable reason in that case.
         self.key_store = None
         self.key_store_error = None
+
+        # Server-Untrusted Identity Verification, Stage 2: usernames
+        # whose most recently received public key disagreed with their
+        # locally VERIFIED fingerprint. Session-local only -- reset on
+        # every login/lock (see _lock_key_store()), never persisted;
+        # see _evaluate_peer_key_verification()'s docstring.
+        self._peer_keys_changed = set()
 
         # ---------------------------------
         # Legacy Callbacks
@@ -608,6 +637,11 @@ class ClientSession(QObject):
 
         self.key_manager.keys = {}
         self.key_manager._current_epoch = {}
+
+        # Server-Untrusted Identity Verification, Stage 2: this
+        # session-local state has no meaning without the key store
+        # that VERIFIED/UNVERIFIED records live in.
+        self._peer_keys_changed = set()
 
     def login(self, username):
         """
@@ -2168,6 +2202,33 @@ class ClientSession(QObject):
         import_public_key() documents for untrusted input. Anything
         else propagates to the receiver loop as before, so a genuine
         bug is never disguised as a bad peer key.
+
+        Server-Untrusted Identity Verification, Stage 2 ENFORCEMENT
+        (revised after a security-correctness audit found the first
+        version detected a mismatch but never actually stopped it: an
+        earlier design ran the fingerprint comparison AFTER
+        KeyManager.add_public_key() had already overwritten
+        KeyManager.public_keys[username] unconditionally -- so a
+        server-substituted key was cached and immediately usable by
+        establish_session_key()/wrap_key_for_member()/
+        handle_direct_key_redelivery_required() regardless of the
+        KEY_CHANGED flag, empirically confirmed to let a malicious
+        server extract an already-established AES session key with no
+        user interaction at all).
+
+        _is_verified_key_mismatch() now runs FIRST, computed from the
+        packet's raw bytes -- before add_public_key() is ever called.
+        If it reports a mismatch against a VERIFIED fingerprint, this
+        method returns immediately: add_public_key() never runs, so
+        KeyManager.public_keys[username] is never touched and keeps
+        whatever key was already trusted. Fail closed, not
+        detect-then-allow. This is the single point every peer public
+        key this client will ever use (direct or group; the server
+        relays both through this same packet type) passes through, so
+        it is the smallest integration point that covers
+        establish_session_key(), wrap_key_for_member(), and every
+        reconnect/key-recovery caller that later reads KeyManager.
+        get_public_key() -- none of which needed to change themselves.
         """
 
         username = packet["username"]
@@ -2175,6 +2236,17 @@ class ClientSession(QObject):
         algorithm = packet["algorithm"]
 
         public_key = packet["public_key"]
+
+        if self._is_verified_key_mismatch(username, public_key):
+
+            # Fail closed: KeyManager.add_public_key() below is
+            # skipped entirely -- the substituted key is never
+            # imported or cached, so the trusted key already in
+            # KeyManager.public_keys[username] (if any) remains in
+            # effect for every cryptographic operation that reads it.
+            self._flag_peer_key_changed(username)
+
+            return
 
         try:
             self.key_manager.add_public_key(
@@ -2200,10 +2272,154 @@ class ClientSession(QObject):
             f"Received {algorithm} public key from {username}."
         )
 
+        self._record_peer_key_observation(username, public_key)
+
         # BUG -- Public-Key Availability: emitted only after the key
         # actually validated and was stored above -- never for a
         # rejected/malformed one (that branch already returned).
         self.public_key_received.emit(username)
+
+    def _is_verified_key_mismatch(self, username, raw_public_key):
+        """
+        True only if this user has an existing VERIFIED fingerprint
+        for ``username`` AND the key just received on the wire
+        disagrees with it (Server-Untrusted Identity Verification,
+        Stage 2 enforcement).
+
+        Deliberately a pure predicate -- no side effects, nothing
+        written anywhere -- called from handle_public_key() BEFORE
+        KeyManager.add_public_key(), so its answer decides whether
+        that call happens at all. Fingerprinted from ``raw_public_key``
+        exactly as received on the wire (a base64 string for Kyber,
+        PEM text for RSA) via crypto/key_manager.py::
+        fingerprint_public_key(), which already accepts either str or
+        bytes directly -- the RAW wire value, not whatever
+        algorithm-specific object add_public_key() would have parsed
+        it into, both because that keeps this algorithm-agnostic with
+        no special-casing, and because it is exactly the value a
+        malicious server would have to substitute to mount the attack
+        this method exists to catch.
+
+        False (never a mismatch) whenever there is nothing VERIFIED to
+        compare against: no local key store (this session never
+        authenticated with a password), no record at all, or an
+        UNVERIFIED one. A first-contact or still-unverified peer's key
+        is never blocked here -- Stage 3's future explicit
+        verification step is what decides whether the FIRST key ever
+        seen for a peer should be trusted, not this method.
+        """
+
+        if self.key_store is None:
+            return False
+
+        entry = self.key_store.get_peer_verification(username)
+
+        if entry is None or entry["state"] != PEER_STATE_VERIFIED:
+            return False
+
+        return entry["fingerprint"] != fingerprint_public_key(raw_public_key)
+
+    def _flag_peer_key_changed(self, username):
+        """
+        Record, session-locally only, that the most recently OBSERVED
+        key for ``username`` disagreed with their VERIFIED fingerprint
+        (Server-Untrusted Identity Verification, Stage 2) -- never
+        written to SecureKeyStore (see PEER_KEY_STATE_CHANGED's module
+        docstring: this describes a disagreement, not new evidence
+        about what should be trusted). Called only from
+        handle_public_key(), after it has already decided -- via
+        _is_verified_key_mismatch() -- NOT to call KeyManager.
+        add_public_key() at all, so by the time this runs the
+        substituted key has already been kept out of KeyManager
+        entirely; this method only ever records the fact and notifies,
+        it never itself touches any key material.
+        """
+
+        self._peer_keys_changed.add(username)
+
+        self.logger.warning(
+            f"SECURITY: public key received for {username} does not "
+            f"match the previously verified fingerprint -- the new "
+            f"key was NOT imported into KeyManager, and the trusted "
+            f"key already cached (if any) remains in effect. Treating "
+            f"as KEY_CHANGED."
+        )
+
+        self.peer_key_changed.emit(username)
+
+    def _record_peer_key_observation(self, username, raw_public_key):
+        """
+        Record this newly received key's fingerprint (Server-Untrusted
+        Identity Verification, Stage 2) -- called only AFTER
+        KeyManager.add_public_key() has already accepted it, so a key
+        reaching this point has definitely not been rejected as a
+        mismatch against a VERIFIED entry (handle_public_key() already
+        returned before add_public_key() ran, in that case -- see
+        _is_verified_key_mismatch()/_flag_peer_key_changed()).
+
+        Unconditionally calls SecureKeyStore.
+        record_observed_peer_fingerprint() -- safe to do so
+        unconditionally here specifically because that method already
+        refuses, on its own, to touch an existing VERIFIED entry; the
+        two remaining possibilities it may actually act on are "no
+        local record, or only an UNVERIFIED one" (records the
+        observation; the peer remains UNVERIFIED -- observing a key is
+        never verifying it) and "a VERIFIED record whose fingerprint
+        matches" (a true no-op write, but still clears any stale
+        same-session KEY_CHANGED flag below -- e.g. a key that changed
+        earlier in this session and has now changed back to the
+        trusted one).
+
+        Never required for existing messaging: if the local key store
+        is unavailable, this is a silent no-op, exactly like
+        _persist_conversation_keys()'s own "if self.key_store is None:
+        return". Peer-verification state is a new, additive layer; it
+        is never a precondition for establish_session_key()/
+        wrap_key_for_member() or anything else already reading
+        KeyManager.get_public_key().
+
+        IMPORTANT -- what this method deliberately does NOT do: it
+        never calls verify_peer_fingerprint(), the only method allowed
+        to set PEER_STATE_VERIFIED (see storage/secure_key_store.py).
+        Nothing here ever promotes a key to VERIFIED; that remains
+        exclusively a future, explicit user action.
+        """
+
+        if self.key_store is None:
+            return
+
+        fingerprint = fingerprint_public_key(raw_public_key)
+
+        self.key_store.record_observed_peer_fingerprint(
+            username, fingerprint
+        )
+
+        self._peer_keys_changed.discard(username)
+
+    def get_peer_verification_state(self, username):
+        """
+        Returns this user's current knowledge of ``username``'s
+        identity-key verification (Server-Untrusted Identity
+        Verification, Stage 2): PEER_STATE_VERIFIED,
+        PEER_STATE_UNVERIFIED, PEER_KEY_STATE_CHANGED, or None if
+        nothing has ever been recorded (or the local key store is
+        unavailable).
+
+        KEY_CHANGED -- session-local -- takes precedence over
+        whatever SecureKeyStore itself reports: it means the most
+        recent observation disagreed with the still-intact VERIFIED
+        record underneath it (see _evaluate_peer_key_verification()).
+        """
+
+        if username in self._peer_keys_changed:
+            return PEER_KEY_STATE_CHANGED
+
+        if self.key_store is None:
+            return None
+
+        entry = self.key_store.get_peer_verification(username)
+
+        return entry["state"] if entry is not None else None
 
     # ----------------------------------------------------------
 

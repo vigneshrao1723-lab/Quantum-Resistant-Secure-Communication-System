@@ -1,10 +1,52 @@
 import base64
+import hashlib
 import threading
 
 from config import KEY_EXCHANGE_ALGORITHM
 from crypto.aes import AESCipher
 from crypto.kyber import KyberKEM
 from crypto.rsa import RSAEncryption
+
+
+def fingerprint_public_key(public_key_bytes):
+    """
+    Deterministic SHA-256 fingerprint of a peer's raw public-key bytes
+    (Server-Untrusted Identity Verification, Stage 1).
+
+    A pure function, deliberately: no KeyManager instance, no network
+    I/O, no GUI dependency, no mutation of the input -- it only ever
+    reads ``public_key_bytes``. Exists so a received public key's
+    identity can eventually be compared by a human through a channel
+    the server does not control (a later stage's job -- this function
+    only computes the value to compare, it does not display, transmit,
+    or store it). Does not alter, wrap, or otherwise touch ML-KEM/RSA
+    key material or behavior in any way.
+
+    Works identically regardless of which algorithm produced the
+    bytes -- KyberKEM.export_public_key() (base64 text, encoded here
+    as UTF-8) and RSAEncryption.export_public_key() (PEM bytes) both
+    already return something hashable; this makes no assumption about
+    key format beyond "some bytes".
+
+    Representation: the SHA-256 digest, encoded as uppercase hex and
+    grouped into 4-character blocks separated by spaces (e.g.
+    "A1B2 C3D4 ..."), the same convention GPG/Signal-style manual
+    fingerprint comparison already uses -- easier to read aloud or
+    compare in short chunks than one unbroken 64-character string.
+    """
+
+    if isinstance(public_key_bytes, str):
+        public_key_bytes = public_key_bytes.encode("utf-8")
+
+    if not isinstance(public_key_bytes, (bytes, bytearray)):
+        raise TypeError(
+            f"Public key must be bytes-like or str, not "
+            f"{type(public_key_bytes).__name__}."
+        )
+
+    digest = hashlib.sha256(bytes(public_key_bytes)).hexdigest().upper()
+
+    return " ".join(digest[i:i + 4] for i in range(0, len(digest), 4))
 
 
 class KeyManager:

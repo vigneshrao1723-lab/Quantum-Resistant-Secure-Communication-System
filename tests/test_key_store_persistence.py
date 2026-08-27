@@ -193,6 +193,241 @@ def test_lock_drops_the_derived_key_but_keeps_the_file(store_dir):
 
 
 # ----------------------------------------------------------------------
+# Peer public-key verification state (Server-Untrusted Identity
+# Verification, Stage 1)
+# ----------------------------------------------------------------------
+
+
+def test_unverified_peer_state_can_be_stored_and_retrieved(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+
+    store.record_observed_peer_fingerprint("bob", "AAAA BBBB")
+
+    entry = store.get_peer_verification("bob")
+
+    assert entry == {"fingerprint": "AAAA BBBB", "state": "UNVERIFIED"}
+    assert store.has_verified_fingerprint("bob") is False
+
+
+def test_verified_fingerprint_can_be_stored_and_retrieved(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+
+    store.verify_peer_fingerprint("bob", "AAAA BBBB")
+
+    entry = store.get_peer_verification("bob")
+
+    assert entry == {"fingerprint": "AAAA BBBB", "state": "VERIFIED"}
+    assert store.has_verified_fingerprint("bob") is True
+
+
+def test_unknown_peer_has_no_verification_entry(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+
+    assert store.get_peer_verification("nobody-ever-seen") is None
+    assert store.has_verified_fingerprint("nobody-ever-seen") is False
+
+
+def test_verified_fingerprint_survives_key_store_reload(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.verify_peer_fingerprint("bob", "AAAA BBBB CCCC")
+
+    reopened = _store(store_dir)
+    reopened.unlock(PASSWORD)
+
+    assert reopened.get_peer_verification("bob") == {
+        "fingerprint": "AAAA BBBB CCCC",
+        "state": "VERIFIED",
+    }
+    assert reopened.has_verified_fingerprint("bob") is True
+
+
+def test_unverified_fingerprint_also_survives_reload(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.record_observed_peer_fingerprint("bob", "1111 2222")
+
+    reopened = _store(store_dir)
+    reopened.unlock(PASSWORD)
+
+    assert reopened.get_peer_verification("bob") == {
+        "fingerprint": "1111 2222",
+        "state": "UNVERIFIED",
+    }
+
+
+def test_newly_observed_key_does_not_automatically_become_verified(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+
+    store.record_observed_peer_fingerprint("bob", "AAAA BBBB")
+
+    assert store.has_verified_fingerprint("bob") is False
+    assert store.get_peer_verification("bob")["state"] == "UNVERIFIED"
+
+
+def test_matching_fingerprint_is_detected_correctly(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.verify_peer_fingerprint("bob", "AAAA BBBB")
+
+    assert store.fingerprint_matches_verified("bob", "AAAA BBBB") is True
+
+
+def test_changed_fingerprint_is_detected_correctly(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.verify_peer_fingerprint("bob", "AAAA BBBB")
+
+    assert store.fingerprint_matches_verified("bob", "ZZZZ YYYY") is False
+
+
+def test_fingerprint_match_check_against_an_unverified_peer_is_false(store_dir):
+    """Not a match, and not treated as one: matching is only ever
+    meaningful against an entry this user has actually verified."""
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.record_observed_peer_fingerprint("bob", "AAAA BBBB")
+
+    assert store.fingerprint_matches_verified("bob", "AAAA BBBB") is False
+
+
+def test_verified_fingerprint_cannot_be_silently_overwritten_by_observation(store_dir):
+    """The central protection: once verified, a newly OBSERVED
+    (unverified-by-definition) key must never silently replace it --
+    only verify_peer_fingerprint() itself may ever do that."""
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.verify_peer_fingerprint("bob", "AAAA BBBB")
+
+    # A different key arrives -- e.g. a malicious server substituting
+    # one -- and is merely observed, not explicitly re-verified.
+    store.record_observed_peer_fingerprint("bob", "EVIL EVIL")
+
+    entry = store.get_peer_verification("bob")
+
+    assert entry == {"fingerprint": "AAAA BBBB", "state": "VERIFIED"}, (
+        "an observed key silently overwrote a verified one"
+    )
+
+
+def test_verify_peer_fingerprint_can_explicitly_replace_a_verified_entry(store_dir):
+    """The one and only path that MAY change a VERIFIED entry: an
+    explicit call to verify_peer_fingerprint() itself (the future
+    user-driven re-verification action)."""
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.verify_peer_fingerprint("bob", "AAAA BBBB")
+
+    store.verify_peer_fingerprint("bob", "NEW1 NEW2")
+
+    assert store.get_peer_verification("bob") == {
+        "fingerprint": "NEW1 NEW2",
+        "state": "VERIFIED",
+    }
+
+
+def test_verification_state_stays_associated_with_the_correct_peer(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+
+    store.verify_peer_fingerprint("alice", "ALIC E000")
+    store.record_observed_peer_fingerprint("bob", "BOB0 0000")
+    store.verify_peer_fingerprint("carol", "CARO L000")
+
+    assert store.get_peer_verification("alice") == {
+        "fingerprint": "ALIC E000", "state": "VERIFIED",
+    }
+    assert store.get_peer_verification("bob") == {
+        "fingerprint": "BOB0 0000", "state": "UNVERIFIED",
+    }
+    assert store.get_peer_verification("carol") == {
+        "fingerprint": "CARO L000", "state": "VERIFIED",
+    }
+    assert store.has_verified_fingerprint("alice") is True
+    assert store.has_verified_fingerprint("bob") is False
+    assert store.has_verified_fingerprint("carol") is True
+
+
+def test_peer_verification_coexists_with_conversation_keys_on_reload(store_dir):
+    """Both kinds of persisted state -- conversation keys and peer
+    verification -- live in the same encrypted file; a reload must
+    recover both correctly, neither clobbering the other."""
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.save({"conv-a": {1: b"K" * 32}})
+    store.verify_peer_fingerprint("bob", "AAAA BBBB")
+
+    reopened = _store(store_dir)
+    restored_keys = reopened.unlock(PASSWORD)
+
+    assert restored_keys == {"conv-a": {1: b"K" * 32}}
+    assert reopened.get_peer_verification("bob") == {
+        "fingerprint": "AAAA BBBB", "state": "VERIFIED",
+    }
+
+
+def test_recording_a_peer_fingerprint_does_not_erase_conversation_keys(store_dir):
+    """record_observed_peer_fingerprint()/verify_peer_fingerprint() has
+    no conversation-key snapshot of its own -- it must write back
+    whatever was last known, never an empty keys section."""
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.save({"conv-a": {1: b"K" * 32}})
+
+    store.record_observed_peer_fingerprint("bob", "AAAA BBBB")
+
+    reopened = _store(store_dir)
+    restored_keys = reopened.unlock(PASSWORD)
+
+    assert restored_keys == {"conv-a": {1: b"K" * 32}}
+
+
+def test_peer_verification_file_contains_no_plaintext_fingerprint(store_dir):
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.verify_peer_fingerprint("bob", "AAAA BBBB CCCC")
+
+    raw = store.path.read_bytes()
+
+    assert b"AAAA BBBB CCCC" not in raw
+    assert b"bob" not in raw
+
+
+def test_a_store_written_before_peer_verification_existed_still_unlocks(store_dir):
+    """Backward compatibility: a file with no "peers" section at all
+    (every store written before this feature existed) must still
+    unlock cleanly, with an empty, honest peer-verification state --
+    not an error."""
+    store = _store(store_dir)
+    store.unlock(PASSWORD)
+    store.save({"conv-a": {1: b"K" * 32}})  # writes with no peer calls at all
+
+    reopened = _store(store_dir)
+    restored_keys = reopened.unlock(PASSWORD)
+
+    assert restored_keys == {"conv-a": {1: b"K" * 32}}
+    assert reopened.get_peer_verification("anyone") is None
+
+
+def test_record_observed_peer_fingerprint_requires_unlocking_first(store_dir):
+    store = _store(store_dir)
+
+    with pytest.raises(KeyStoreError):
+        store.record_observed_peer_fingerprint("bob", "AAAA BBBB")
+
+
+def test_verify_peer_fingerprint_requires_unlocking_first(store_dir):
+    store = _store(store_dir)
+
+    with pytest.raises(KeyStoreError):
+        store.verify_peer_fingerprint("bob", "AAAA BBBB")
+
+
+# ----------------------------------------------------------------------
 # KeyManager restore semantics
 # ----------------------------------------------------------------------
 

@@ -19,8 +19,17 @@ server, the protocol, the database, or the message flow.
 
 What is stored, and what is not
 -------------------------------
-Only ``{conversation_id: {epoch: key_bytes}}`` -- the minimum required
-to read history.
+``{conversation_id: {epoch: key_bytes}}`` -- the minimum required to
+read history -- plus, since Server-Untrusted Identity Verification
+Stage 1, one small additional section: a per-peer public-key
+fingerprint and verification state (PEER_STATE_UNVERIFIED or
+PEER_STATE_VERIFIED). This is presentation/comparison metadata, not
+key material used for encryption -- it lets a peer's identity claim be
+checked against what THIS user has previously observed or explicitly
+verified, independent of anything the server currently asserts. It is
+stored in the same encrypted file, under the same password-derived
+key, for the same reason the conversation keys are: it must survive a
+restart, and it must never touch the server or the database.
 
 The client's long-term Kyber/RSA keypair is deliberately NOT persisted.
 It is used for key EXCHANGE, never to decrypt a stored message, so
@@ -107,6 +116,16 @@ KEY_STORE_VERSION = 1
 SALT_SIZE = 16
 DERIVED_KEY_SIZE = 32
 
+# Peer public-key verification state (Server-Untrusted Identity
+# Verification, Stage 1). A peer is UNVERIFIED the moment any key is
+# first observed for them -- never automatically VERIFIED, since
+# nothing about merely receiving a key (from the untrusted server)
+# establishes that it genuinely belongs to that peer. Only an
+# explicit future verification action (a later stage, not yet
+# implemented) may ever produce VERIFIED.
+PEER_STATE_UNVERIFIED = "UNVERIFIED"
+PEER_STATE_VERIFIED = "VERIFIED"
+
 
 class KeyStoreError(Exception):
     """Base class for key-store failures."""
@@ -159,6 +178,20 @@ class SecureKeyStore:
         self._salt = None
         self._params = None
 
+        # Peer verification state, {username: {"fingerprint": str,
+        # "state": PEER_STATE_UNVERIFIED | PEER_STATE_VERIFIED}} --
+        # populated by unlock(), mutated only through
+        # record_observed_peer_fingerprint()/verify_peer_fingerprint().
+        self._peers = {}
+
+        # The most recently known {conversation_id: {epoch: key_bytes}}
+        # snapshot -- set by unlock() and by save(). Needed so the
+        # peer-verification methods below, which have no conversation-
+        # key snapshot of their own to write, can still persist through
+        # the same single-file _write() without ever having to guess
+        # at or discard the conversation keys already on disk.
+        self._last_keys_snapshot = {}
+
         # BUG 1 -- serialises the whole snapshot-and-write sequence.
         # Keys arrive on several threads (receiver, key recovery, GUI),
         # and a save built from a stale snapshot would silently drop
@@ -206,6 +239,8 @@ class SecureKeyStore:
                 "parallelism": KEY_STORE_ARGON2_PARALLELISM,
             }
             self._derived_key = _derive_key(password, self._salt, **self._params)
+            self._peers = {}
+            self._last_keys_snapshot = {}
             return {}
 
         try:
@@ -249,9 +284,22 @@ class SecureKeyStore:
             document = json.loads(plaintext)
             bound = document["header"]
             raw = document["keys"]
+            # Absent, not required: every store written before Stage 1
+            # existed has no "peers" section at all, and must unlock
+            # exactly as it always did -- an empty peer-verification
+            # state is the true, honest description of "never recorded
+            # any peer fingerprints", not a malformed file.
+            peers_raw = document.get("peers", {})
         except (KeyError, TypeError, ValueError) as error:
             raise KeyStoreLocked(
                 "The local key store contents are malformed."
+            ) from error
+
+        try:
+            decoded_peers = self._decode_peers(peers_raw)
+        except (KeyError, TypeError, ValueError) as error:
+            raise KeyStoreLocked(
+                "The local key store's peer verification data is malformed."
             ) from error
 
         # The plaintext header is only trustworthy if it matches the
@@ -268,8 +316,12 @@ class SecureKeyStore:
         self._salt = salt
         self._params = params
         self._derived_key = derived
+        self._peers = decoded_peers
 
-        return self._decode(raw)
+        decoded_keys = self._decode(raw)
+        self._last_keys_snapshot = decoded_keys
+
+        return decoded_keys
 
     def save(self, conversation_keys):
         """
@@ -286,6 +338,7 @@ class SecureKeyStore:
         # is what keeps the lock-order graph acyclic -- see the
         # "Locking" note in this module's docstring.
         with self._lock:
+            self._last_keys_snapshot = conversation_keys
             self._write(conversation_keys)
 
     def _write(self, conversation_keys):
@@ -316,7 +369,11 @@ class SecureKeyStore:
         }
 
         payload = AESCipher(self._derived_key).encrypt(
-            json.dumps({"header": bound, "keys": self._encode(conversation_keys)})
+            json.dumps({
+                "header": bound,
+                "keys": self._encode(conversation_keys),
+                "peers": self._encode_peers(self._peers),
+            })
         )
 
         document = {
@@ -338,6 +395,143 @@ class SecureKeyStore:
         self._derived_key = None
         self._salt = None
         self._params = None
+        self._peers = {}
+        self._last_keys_snapshot = {}
+
+    # ------------------------------------------------------------------
+    # Peer public-key verification (Server-Untrusted Identity
+    # Verification, Stage 1)
+    # ------------------------------------------------------------------
+
+    def get_peer_verification(self, username):
+        """
+        Return {"fingerprint": str, "state": PEER_STATE_*} for
+        ``username``, or None if no fingerprint has ever been
+        observed for them.
+        """
+
+        entry = self._peers.get(username)
+
+        if entry is None:
+            return None
+
+        return dict(entry)
+
+    def has_verified_fingerprint(self, username):
+        """True only if this peer has an explicitly VERIFIED entry --
+        never true merely because a key was observed."""
+
+        entry = self._peers.get(username)
+
+        return entry is not None and entry["state"] == PEER_STATE_VERIFIED
+
+    def fingerprint_matches_verified(self, username, fingerprint):
+        """
+        True if ``fingerprint`` matches the VERIFIED fingerprint on
+        file for ``username``. False both when it does not match AND
+        when there is no verified entry at all to match against --
+        callers that need to distinguish "no verified entry" from "a
+        mismatch" should call has_verified_fingerprint() first.
+        """
+
+        entry = self._peers.get(username)
+
+        if entry is None or entry["state"] != PEER_STATE_VERIFIED:
+            return False
+
+        return entry["fingerprint"] == fingerprint
+
+    def record_observed_peer_fingerprint(self, username, fingerprint):
+        """
+        Record ``fingerprint`` as this peer's current UNVERIFIED key.
+
+        Never touches an existing VERIFIED entry -- silently does
+        nothing in that case, by design: the server is not trusted to
+        assert identity, so a freshly-observed key can never demote or
+        replace one this user has already explicitly verified. Only
+        verify_peer_fingerprint() (a later stage's explicit user
+        action) may ever change a VERIFIED entry. Safe and expected to
+        be called every time a peer's key is (re)observed, including
+        repeatedly for the same still-unverified key.
+
+        The "is it already VERIFIED" check and the write below MUST
+        happen as one atomic step under self._lock, not as a check
+        followed by a separately-locked write: a client's receiver
+        thread (a live key arriving) and an explicit verification
+        action can genuinely run concurrently against the same peer
+        (Server-Untrusted Identity Verification, Stage 2 is exactly
+        this -- ClientSession.handle_public_key() calls this method
+        from the receiver thread). An unlocked check-then-locked-write
+        leaves a window where verify_peer_fingerprint() could complete
+        in between -- this call would then still see its own
+        (correct, at the time) "not verified yet" result and overwrite
+        the VERIFIED entry that had just been set, defeating the exact
+        protection this method exists to provide.
+        """
+
+        if not username:
+            raise KeyStoreError("A peer username is required.")
+
+        with self._lock:
+
+            existing = self._peers.get(username)
+
+            if existing is not None and existing["state"] == PEER_STATE_VERIFIED:
+                return
+
+            self._peers[username] = {
+                "fingerprint": fingerprint,
+                "state": PEER_STATE_UNVERIFIED,
+            }
+            self._write(self._last_keys_snapshot)
+
+    def verify_peer_fingerprint(self, username, fingerprint):
+        """
+        Explicitly mark ``fingerprint`` as ``username``'s VERIFIED
+        key -- the action a later stage's explicit user-driven
+        verification step performs. This is the ONLY method that ever
+        sets PEER_STATE_VERIFIED, and the only one allowed to
+        overwrite an existing VERIFIED entry: calling it IS the
+        explicit authorization record_observed_peer_fingerprint()'s
+        protection exists to require.
+        """
+
+        if not username:
+            raise KeyStoreError("A peer username is required.")
+
+        with self._lock:
+            self._peers[username] = {
+                "fingerprint": fingerprint,
+                "state": PEER_STATE_VERIFIED,
+            }
+            self._write(self._last_keys_snapshot)
+
+    @staticmethod
+    def _encode_peers(peers):
+        return {
+            str(username): {
+                "fingerprint": str(entry["fingerprint"]),
+                "state": str(entry["state"]),
+            }
+            for username, entry in (peers or {}).items()
+        }
+
+    @staticmethod
+    def _decode_peers(raw):
+        decoded = {}
+
+        for username, entry in (raw or {}).items():
+            state = entry["state"]
+
+            if state not in (PEER_STATE_UNVERIFIED, PEER_STATE_VERIFIED):
+                raise ValueError(f"Unknown peer verification state {state!r}.")
+
+            decoded[str(username)] = {
+                "fingerprint": str(entry["fingerprint"]),
+                "state": state,
+            }
+
+        return decoded
 
     # ------------------------------------------------------------------
 
