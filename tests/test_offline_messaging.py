@@ -35,6 +35,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession, _UNDECRYPTABLE_PLACEHOLDER
+from crypto.key_manager import KeyManager, fingerprint_public_key
 from database.connection import SessionLocal
 from database.models.message import Message
 from database.models.message_recipient import MessageRecipient
@@ -137,13 +138,26 @@ def accounts():
 
 
 @pytest.fixture()
-def connect(running_server, monkeypatch):
+def connect(running_server, monkeypatch, tmp_path):
     """Factory for real, connected ClientSessions.
 
     Every call builds a brand-new ClientSession, so unless a test
     explicitly hands back a previous session's KeyManager, each
     connection is a genuinely restarted client with an empty key store
     and a new keypair.
+
+    Server-Untrusted Identity Verification, Stage 3: establish_
+    session_key()/handle_direct_key_redelivery_required() now refuse a
+    cached-but-unverified peer key, so every session here also needs a
+    real, unlocked SecureKeyStore to verify against (the reference
+    pattern in tests/test_peer_key_verification.py's `app` fixture).
+    Each call points KEY_STORE_DIR at its OWN fresh, never-reused
+    directory -- not one shared by username -- so unlocking it never
+    itself hands back a previous session's peer-verification record or
+    conversation keys. Sharing one would defeat this file's entire
+    point: a "genuinely restarted client" must recover solely through
+    the redelivery mechanism under test, never through persistence
+    smuggled in by the test harness.
     """
 
     _state, port = running_server
@@ -152,11 +166,24 @@ def connect(running_server, monkeypatch):
     opened = []
 
     def _connect(payload, key_manager=None):
+        monkeypatch.setattr(
+            "storage.secure_key_store.KEY_STORE_DIR",
+            tmp_path / f"keystore-{uuid.uuid4().hex}",
+        )
+
         session = ClientSession()
         if key_manager is not None:
             session.key_manager = key_manager
-        session.user_id = payload["user_id"]
-        session.access_token = _token(payload)
+
+        result = session.authenticate_credentials(
+            payload["phone_number"], payload["password"]
+        )
+        assert result.success, result.message
+
+        session.user_id = result.user_id
+        session.username = result.username
+        session.access_token = result.token_pair.access_token
+
         session.connect()
         session.login(payload["username"])
         session.send_public_key()
@@ -195,6 +222,24 @@ def _establish_direct_key(sender, recipient, sender_name, recipient_name):
 
     assert _wait_for(lambda: sender.key_manager.get_public_key(recipient_name) is not None)
     assert _wait_for(lambda: recipient.key_manager.get_public_key(sender_name) is not None)
+
+    # Server-Untrusted Identity Verification, Stage 3: establish_
+    # session_key() now refuses a cached-but-unverified peer key, and
+    # the direct-key-redelivery path silently skips an unverified
+    # recipient. Every test in this file exercises one direction or
+    # the other of that machinery (a live send here, a later
+    # redelivery to a reconnecting partner elsewhere), so both sides
+    # verify the other's CURRENT, just-exchanged fingerprint up front
+    # -- the precondition this suite's setup never needed before this
+    # feature existed. A party that later reconnects with a genuinely
+    # new keypair is re-verified individually, at that point, by the
+    # tests that do so.
+    sender.key_store.verify_peer_fingerprint(
+        recipient_name, fingerprint_public_key(recipient.key_manager.public_key)
+    )
+    recipient.key_store.verify_peer_fingerprint(
+        sender_name, fingerprint_public_key(sender.key_manager.public_key)
+    )
 
     _open_direct(sender, recipient_name)
     sender.send_chat_message("establishing the session key")
@@ -443,8 +488,16 @@ def test_queued_messages_decrypt_after_a_real_restart_via_key_recovery(
     _open_direct(alice, bob_payload["username"])
     alice.send_chat_message("waiting for bob to restart")
 
-    # Fresh session == fresh KeyManager == fresh keypair.
-    bob_restarted = connect(bob_payload)
+    # Fresh session == fresh KeyManager == fresh keypair. Bob's new
+    # public key is generated up front so alice can verify its
+    # fingerprint BEFORE he ever reconnects -- the redelivery his
+    # reconnect triggers is a one-shot event with no retry, so
+    # verifying only after `connect` returns would race it.
+    bob_new_key_manager = KeyManager()
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob_new_key_manager.public_key)
+    )
+    bob_restarted = connect(bob_payload, key_manager=bob_new_key_manager)
     assert bob_restarted.key_manager is not bob.key_manager
     assert _wait_for_key(bob_restarted, conversation_id), "key recovery never landed"
 
@@ -479,7 +532,15 @@ def test_multiple_queued_messages_arrive_in_order_without_duplicates(
         alice.send_chat_message(f"queued {index}")
         time.sleep(0.15)
 
-    bob_restarted = connect(bob_payload)
+    # Bob's new public key is generated up front so alice can verify
+    # its fingerprint before he ever reconnects -- the redelivery his
+    # reconnect triggers is a one-shot event with no retry.
+    bob_restarted_key_manager = KeyManager()
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"],
+        fingerprint_public_key(bob_restarted_key_manager.public_key),
+    )
+    bob_restarted = connect(bob_payload, key_manager=bob_restarted_key_manager)
     assert _wait_for_key(bob_restarted, conversation_id)
     texts = _received_texts(_history(bob_restarted, alice_payload["username"]))
 
@@ -493,7 +554,11 @@ def test_multiple_queued_messages_arrive_in_order_without_duplicates(
     # Reconnect again -- recovery re-runs, and must not duplicate
     # anything or lose what already decrypted.
     _disconnect(bob_restarted)
-    bob_third = connect(bob_payload)
+    bob_third_key_manager = KeyManager()
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob_third_key_manager.public_key)
+    )
+    bob_third = connect(bob_payload, key_manager=bob_third_key_manager)
     assert _wait_for_key(bob_third, conversation_id)
     repeat = _received_texts(_history(bob_third, alice_payload["username"]))
 
@@ -557,7 +622,15 @@ def test_recovery_uses_each_messages_own_epoch_not_the_current_epoch(
     assert alice.key_manager.has_key(conversation_id, epoch=message_epoch)
     assert not alice.key_manager.has_key(conversation_id, epoch=reserved)
 
-    bob_restarted = connect(bob_payload)
+    # Bob's new public key is generated up front so alice can verify
+    # its fingerprint before he ever reconnects -- the redelivery his
+    # reconnect triggers is a one-shot event with no retry.
+    bob_restarted_key_manager = KeyManager()
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"],
+        fingerprint_public_key(bob_restarted_key_manager.public_key),
+    )
+    bob_restarted = connect(bob_payload, key_manager=bob_restarted_key_manager)
     assert _wait_for_key(bob_restarted, conversation_id, epoch=message_epoch)
     texts = _received_texts(_history(bob_restarted, alice_payload["username"]))
 
@@ -691,12 +764,23 @@ def test_recovery_happens_when_the_partner_comes_back(connect, accounts):
     assert all(text == _UNDECRYPTABLE_PLACEHOLDER for text in early)
     _disconnect(bob_early)
 
-    # Alice comes back still holding the epoch's key...
-    connect(alice_payload, key_manager=alice_key_manager)
+    # Alice comes back still holding the epoch's key... She keeps her
+    # own KeyManager (crypto identity + cached conversation keys), but
+    # this new ClientSession gets its own fresh, isolated key store
+    # (see the `connect` fixture), so it has forgotten bob's earlier
+    # verification even though bob's identity has not changed.
+    alice_reconnected = connect(alice_payload, key_manager=alice_key_manager)
     time.sleep(0.3)
 
-    # ...so Bob's next reconnect recovers it.
-    bob_late = connect(bob_payload)
+    # ...so Bob's next reconnect recovers it. Bob's new public key is
+    # generated up front so alice_reconnected can verify its
+    # fingerprint before he ever reconnects -- the redelivery his
+    # reconnect triggers is a one-shot event with no retry.
+    bob_late_key_manager = KeyManager()
+    alice_reconnected.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob_late_key_manager.public_key)
+    )
+    bob_late = connect(bob_payload, key_manager=bob_late_key_manager)
     assert _wait_for_key(bob_late, conversation_id)
     texts = _received_texts(_history(bob_late, alice_payload["username"]))
 
@@ -972,7 +1056,14 @@ def test_history_still_decrypts_after_being_read_and_restarting(connect, account
 
     # 1st restart: recovery, then read the conversation (what the GUI
     # does on every open -- see ClientSession.mark_conversation_read()).
-    bob_second = connect(bob_payload)
+    # Bob's new public key is generated up front so alice can verify
+    # its fingerprint before he ever reconnects -- the redelivery his
+    # reconnect triggers is a one-shot event with no retry.
+    bob_second_key_manager = KeyManager()
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob_second_key_manager.public_key)
+    )
+    bob_second = connect(bob_payload, key_manager=bob_second_key_manager)
     assert _wait_for_key(bob_second, conversation_id)
     assert "must survive being read" in _received_texts(
         _history(bob_second, alice_payload["username"])
@@ -988,7 +1079,11 @@ def test_history_still_decrypts_after_being_read_and_restarting(connect, account
     # 2nd restart: nothing is QUEUED any more. Recovery must still
     # happen, because the messages still exist and Bob may still read
     # them.
-    bob_third = connect(bob_payload)
+    bob_third_key_manager = KeyManager()
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob_third_key_manager.public_key)
+    )
+    bob_third = connect(bob_payload, key_manager=bob_third_key_manager)
     assert bob_third.key_manager is not bob_second.key_manager
     assert _wait_for_key(bob_third, conversation_id), (
         "recovery did not run for a conversation with no QUEUED rows"
@@ -1026,8 +1121,16 @@ def test_sender_can_still_read_their_own_history_after_restarting(
     )
 
     # Alice restarts. Bob -- who holds the epoch -- stays connected.
+    # Alice's new public key is generated up front so bob can verify
+    # its fingerprint before she ever reconnects -- the redelivery her
+    # reconnect triggers is a one-shot event with no retry.
     _disconnect(alice_first)
-    alice_restarted = connect(alice_payload)
+    alice_restarted_key_manager = KeyManager()
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"],
+        fingerprint_public_key(alice_restarted_key_manager.public_key),
+    )
+    alice_restarted = connect(alice_payload, key_manager=alice_restarted_key_manager)
     assert alice_restarted.key_manager is not alice_first.key_manager
     assert _wait_for_key(alice_restarted, conversation_id), (
         "the sender recovered no key for their own conversation"

@@ -40,7 +40,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession, _UNDECRYPTABLE_PLACEHOLDER
-from crypto.key_manager import KeyManager
+from crypto.key_manager import KeyManager, fingerprint_public_key
 from database.connection import SessionLocal
 from database.models.message import Message
 from database.repositories.session_repository import SessionRepository
@@ -632,6 +632,13 @@ def test_history_decrypts_after_both_participants_restart(app):
         lambda: bob.key_manager.get_public_key(alice_payload["username"]) is not None
     )
 
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
+    )
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"], fingerprint_public_key(alice.key_manager.public_key)
+    )
+
     _open_direct(alice, bob_payload["username"])
     _open_direct(bob, alice_payload["username"])
 
@@ -681,6 +688,10 @@ def test_older_epochs_remain_decryptable_after_restart(app):
     bob = app["launch"](bob_payload)
     assert _wait_for(
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
+    )
+
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
     )
 
     _open_direct(alice, bob_payload["username"])
@@ -744,6 +755,10 @@ def test_attachment_from_a_previous_session_still_decrypts(app, tmp_path):
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
     )
 
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
+    )
+
     image_path = tmp_path / "shared.png"
     image = QImage(40, 30, QImage.Format_RGB32)
     image.fill(QColor(12, 34, 56))
@@ -791,6 +806,10 @@ def test_logout_then_login_preserves_history(app):
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
     )
 
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
+    )
+
     _open_direct(alice, bob_payload["username"])
     _open_direct(bob, alice_payload["username"])
     alice.send_chat_message("message before logout")
@@ -833,6 +852,9 @@ def test_wrong_password_does_not_break_login_or_destroy_the_store(app):
     bob = app["launch"](bob_payload)
     assert _wait_for(
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
+    )
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
     )
     _open_direct(alice, bob_payload["username"])
     alice.send_chat_message("stored under the real password")

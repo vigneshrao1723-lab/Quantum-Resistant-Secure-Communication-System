@@ -43,6 +43,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
 from database.connection import SessionLocal
 from database.models.message import Message
 from database.repositories.session_repository import SessionRepository
@@ -51,6 +52,7 @@ from domain.conversation_summary import ConversationSummary
 from domain.payload_type import PayloadType
 from gui.message_widget import ImageMessageBubble, MessageWidget
 from storage import encrypted_blob_store
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
 _app = QApplication.instance() or QApplication([])
@@ -316,11 +318,13 @@ def running_server():
 
 
 @pytest.fixture()
-def chat(running_server, monkeypatch):
+def chat(running_server, monkeypatch, tmp_path):
     """Two connected sessions plus cleanup of accounts and blobs."""
 
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
+    key_store_dir = tmp_path / "keystores"
 
     created = []
     opened = []
@@ -332,6 +336,22 @@ def chat(running_server, monkeypatch):
         session.access_token = _token(payload)
         session.connect()
         session.login(payload["username"])
+        # Server-Untrusted Identity Verification, Stage 3: this
+        # lighter connect()-only pattern skips authenticate_credentials(),
+        # the only place a key store is normally unlocked -- unlock a
+        # real, isolated, on-disk one here too, so establish_session_key()
+        # / handle_direct_key_redelivery_required() below can verify
+        # whichever peer they need to. Done BEFORE send_public_key(),
+        # exactly like authenticate_credentials()'s own
+        # _unlock_key_store(), so a reconnecting session (Stage 2.5)
+        # broadcasts the SAME persisted identity key instead of a
+        # fresh ephemeral one that would look like a KEY_CHANGED to an
+        # already-verified peer.
+        session.key_store = SecureKeyStore(
+            payload["user_id"], storage_dir=key_store_dir / payload["username"]
+        )
+        session.key_store.unlock(payload["password"])
+        session.key_manager.load_or_create_kyber_keypair(session.key_store)
         session.send_public_key()
         session.start_receiver()
         opened.append(session)
@@ -349,6 +369,13 @@ def chat(running_server, monkeypatch):
     )
     assert _wait_for(
         lambda: bob.key_manager.get_public_key(alice_payload["username"]) is not None
+    )
+
+    # Only Alice ever sends in this file's real-server tests (an
+    # image, then a direct-key-redelivery on Bob's reconnect) -- so
+    # only Alice needs Bob verified.
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
     )
 
     yield {

@@ -30,6 +30,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
 from database.connection import SessionLocal
 from database.models.message import Message
 from database.models.message_recipient import MessageRecipient
@@ -38,6 +39,7 @@ from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
 from domain.message_delivery_status import MessageDeliveryStatus
 from gui.message_widget import MessageWidget
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
 _app = QApplication.instance() or QApplication([])
@@ -130,9 +132,11 @@ def accounts():
 
 
 @pytest.fixture()
-def connect(running_server, monkeypatch):
+def connect(running_server, monkeypatch, tmp_path):
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
+    key_store_dir = tmp_path / "keystores"
 
     opened = []
 
@@ -142,6 +146,20 @@ def connect(running_server, monkeypatch):
         session.access_token = _token(payload)
         session.connect()
         session.login(payload["username"])
+        # Server-Untrusted Identity Verification, Stage 3: this
+        # lighter connect()-only pattern skips authenticate_credentials(),
+        # the only place a key store is normally unlocked -- unlock a
+        # real, isolated, on-disk one here too, so _send_and_receive()
+        # below can verify whichever peer establish_session_key()
+        # needs. Done before send_public_key(), like
+        # authenticate_credentials()'s own _unlock_key_store(), so a
+        # reconnecting session (Stage 2.5) broadcasts the same
+        # persisted identity key rather than a fresh ephemeral one.
+        session.key_store = SecureKeyStore(
+            payload["user_id"], storage_dir=key_store_dir / payload["username"]
+        )
+        session.key_store.unlock(payload["password"])
+        session.key_manager.load_or_create_kyber_keypair(session.key_store)
         session.send_public_key()
         session.start_receiver()
         opened.append(session)
@@ -187,6 +205,15 @@ def _send_and_receive(alice, bob, alice_name, bob_name, text):
 
     assert _wait_for(lambda: alice.key_manager.get_public_key(bob_name) is not None)
     assert _wait_for(lambda: bob.key_manager.get_public_key(alice_name) is not None)
+
+    # Server-Untrusted Identity Verification, Stage 3:
+    # establish_session_key() (called inside send_chat_message()
+    # below) now requires Alice to have explicitly verified Bob before
+    # wrapping a session key for him. Only Alice ever sends in this
+    # file's tests, so only this one direction is needed.
+    alice.key_store.verify_peer_fingerprint(
+        bob_name, fingerprint_public_key(bob.key_manager.public_key)
+    )
 
     _open_direct(alice, bob_name)
     alice.send_chat_message(text)

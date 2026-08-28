@@ -38,10 +38,12 @@ from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.conversation_store import ConversationStore
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
 
@@ -147,7 +149,7 @@ def _last_received_text(session, from_username):
 
 
 @pytest.fixture()
-def alice_and_bob(running_server, monkeypatch):
+def alice_and_bob(running_server, monkeypatch, tmp_path):
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
@@ -159,6 +161,22 @@ def alice_and_bob(running_server, monkeypatch):
 
     assert _wait_for(lambda: alice.key_manager.get_public_key(bob.username) is not None)
     assert _wait_for(lambda: bob.key_manager.get_public_key(alice.username) is not None)
+
+    # _make_connected_session() logs in with a bare token (unlike
+    # gui/main_window.py's real authenticate_credentials() flow) and so
+    # never unlocks a local key store -- required, since
+    # Server-Untrusted Identity Verification, Stage 3 checks
+    # alice.key_store regardless. Give alice (the only sender in either
+    # test below) an isolated, unlocked store of her own so bob can be
+    # explicitly verified, exactly as both tests' original intent
+    # (server-supplied conversation_id consumption) always assumed.
+    alice.key_store = SecureKeyStore(
+        alice_payload["user_id"], storage_dir=tmp_path / "keystore"
+    )
+    alice.key_store.unlock(alice_payload["password"])
+    alice.key_store.verify_peer_fingerprint(
+        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+    )
 
     yield {"alice": alice, "bob": bob}
 

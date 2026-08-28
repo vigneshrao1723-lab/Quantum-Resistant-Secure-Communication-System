@@ -34,7 +34,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
-from crypto.key_manager import KeyManager
+from crypto.key_manager import KeyManager, fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.session_repository import SessionRepository
@@ -99,15 +99,43 @@ def _login_and_get_token(payload):
         db.close()
 
 
-def _make_connected_session(payload):
+def _make_connected_session(payload, monkeypatch, tmp_path, key_manager=None):
     """Build and fully connect a real ClientSession for this user --
     connect() -> login() -> send_public_key() -> start_receiver(),
     exactly the sequence gui/main_window.py::start_chat_session() uses.
     A fresh KeyManager (ClientSession.__init__'s own doing) is exactly
-    what a real app restart leaves a client with."""
+    what a real app restart leaves a client with, unless ``key_manager``
+    is supplied to simulate a session that kept its identity keypair
+    across the reconnect.
+
+    Server-Untrusted Identity Verification, Stage 3: also unlocks a
+    real SecureKeyStore via authenticate_credentials() -- required so
+    this session's peer-verification state can be checked at all (see
+    tests/test_peer_key_verification.py's `app` fixture, the
+    established pattern for this). KEY_STORE_DIR is repointed at a
+    fresh, never-reused directory for every call -- not one shared by
+    username -- so unlocking it never itself hands back a previous
+    session's peer-verification record or conversation keys: sharing
+    one would let a "restarted" client recover through disk
+    persistence instead of through the epoch-recovery mechanism this
+    suite exists to prove.
+    """
+    monkeypatch.setattr(
+        "storage.secure_key_store.KEY_STORE_DIR",
+        tmp_path / f"keystore-{uuid.uuid4().hex}",
+    )
+
     session = ClientSession()
-    session.user_id = payload["user_id"]
-    session.access_token = _login_and_get_token(payload)
+    if key_manager is not None:
+        session.key_manager = key_manager
+
+    result = session.authenticate_credentials(payload["phone_number"], payload["password"])
+    assert result.success, result.message
+
+    session.user_id = result.user_id
+    session.username = result.username
+    session.access_token = result.token_pair.access_token
+
     session.connect()
     session.login(payload["username"])
     session.send_public_key()
@@ -145,7 +173,7 @@ def _get_epoch_state(conversation_id):
 
 
 @pytest.fixture()
-def alice_and_bob(running_server, monkeypatch):
+def alice_and_bob(running_server, monkeypatch, tmp_path):
     """Two real, fully-connected ClientSessions -- Alice and Bob --
     each already knowing the other's public key, direct conversation
     already resolved. ClientSession.connect() always dials
@@ -172,8 +200,8 @@ def alice_and_bob(running_server, monkeypatch):
     # tests in the same run. Tests use fixture["connect"](payload).
     tracked = []
 
-    def _connect(payload):
-        session = _make_connected_session(payload)
+    def _connect(payload, key_manager=None):
+        session = _make_connected_session(payload, monkeypatch, tmp_path, key_manager=key_manager)
         tracked.append(session)
         return session
 
@@ -182,6 +210,22 @@ def alice_and_bob(running_server, monkeypatch):
 
     assert _wait_for(lambda: alice.key_manager.get_public_key(bob.username) is not None)
     assert _wait_for(lambda: bob.key_manager.get_public_key(alice.username) is not None)
+
+    # Server-Untrusted Identity Verification, Stage 3: establish_
+    # session_key()/handle_direct_key_redelivery_required() now refuse
+    # a cached-but-unverified peer key. Every test built on this
+    # fixture exercises some direction of that machinery -- a live
+    # send here, a later redelivery to a reconnecting partner in the
+    # restart tests -- so both sides verify the other's CURRENT,
+    # just-exchanged fingerprint here, once, up front. A party that
+    # later reconnects with a genuinely new keypair is re-verified
+    # individually, at that point, by the tests that do so.
+    alice.key_store.verify_peer_fingerprint(
+        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+    )
+    bob.key_store.verify_peer_fingerprint(
+        alice.username, fingerprint_public_key(alice.key_manager.public_key)
+    )
 
     _open_direct_chat(alice, bob.username)
     _open_direct_chat(bob, alice.username)
@@ -284,7 +328,24 @@ def test_restart_recovers_the_historical_key_when_the_partner_is_connected(
     # --- Alice restarts; Bob stays connected holding the key ---
     old_alice.disconnect()
 
-    new_alice = fixture["connect"](fixture["alice_payload"])
+    # Alice's new public key is generated up front so bob can verify
+    # its fingerprint before she ever reconnects -- the redelivery her
+    # reconnect triggers is a one-shot event with no retry, so
+    # verifying only after `connect` returns would race it.
+    new_alice_key_manager = KeyManager()
+    bob.key_store.verify_peer_fingerprint(
+        fixture["alice_payload"]["username"],
+        fingerprint_public_key(new_alice_key_manager.public_key),
+    )
+    new_alice = fixture["connect"](fixture["alice_payload"], key_manager=new_alice_key_manager)
+
+    # And the reverse direction: new_alice's own key store is fresh
+    # and isolated (see the `alice_and_bob` fixture), so she must
+    # verify bob -- whose identity has not changed -- before she can
+    # send to him again below.
+    new_alice.key_store.verify_peer_fingerprint(
+        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+    )
 
     assert _wait_for(
         lambda: new_alice.key_manager.get_public_key(bob.username) is not None
@@ -383,6 +444,17 @@ def test_restart_reserves_a_new_epoch_when_no_recovery_is_possible(alice_and_bob
         lambda: new_bob.key_manager.get_public_key(new_alice.username) is not None
     )
 
+    # Both sessions are brand-new, with their own fresh, isolated key
+    # stores (see the `alice_and_bob` fixture) -- neither has verified
+    # the other's new post-restart fingerprint yet, and both directions
+    # send below.
+    new_alice.key_store.verify_peer_fingerprint(
+        new_bob.username, fingerprint_public_key(new_bob.key_manager.public_key)
+    )
+    new_bob.key_store.verify_peer_fingerprint(
+        new_alice.username, fingerprint_public_key(new_alice.key_manager.public_key)
+    )
+
     # Nothing can be recovered -- neither side has the key to give.
     assert new_alice.key_manager.get_key(conversation_id) is None
     assert new_bob.key_manager.get_key(conversation_id) is None
@@ -452,7 +524,23 @@ def test_restart_without_recovery_never_collides_with_the_partners_epoch(
     time.sleep(0.4)
     old_alice.disconnect()
 
-    new_alice = fixture["connect"](fixture["alice_payload"])
+    # Alice's new public key is generated up front so bob (his own
+    # identity and key store both untouched by this blip) can verify
+    # its fingerprint before she ever reconnects -- the redelivery her
+    # reconnect triggers is a one-shot event with no retry.
+    new_alice_key_manager = KeyManager()
+    bob.key_store.verify_peer_fingerprint(
+        fixture["alice_payload"]["username"],
+        fingerprint_public_key(new_alice_key_manager.public_key),
+    )
+    new_alice = fixture["connect"](fixture["alice_payload"], key_manager=new_alice_key_manager)
+
+    # And the reverse direction: new_alice's own key store is fresh
+    # and isolated, but bob's identity has not changed, so she can
+    # verify him immediately.
+    new_alice.key_store.verify_peer_fingerprint(
+        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+    )
     time.sleep(0.6)
 
     assert new_alice.key_manager.get_key(conversation_id) is None, (

@@ -70,11 +70,13 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
 from gui.chat_window import ChatWindow
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
 _app = QApplication.instance() or QApplication([])
@@ -220,7 +222,7 @@ def _composer_enabled(window):
 
 
 def test_available_public_key_enables_the_composer_and_sending_works(
-    connect, accounts
+    connect, accounts, tmp_path
 ):
     alice_payload = accounts("alice_")
     bob_payload = accounts("bob_")
@@ -230,6 +232,23 @@ def test_available_public_key_enables_the_composer_and_sending_works(
 
     assert _wait_for(
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
+    )
+
+    # The `connect` fixture logs in with a bare token (unlike gui/
+    # main_window.py's real authenticate_credentials() flow) and so
+    # never unlocks a local key store -- required, since
+    # Server-Untrusted Identity Verification, Stage 3 checks
+    # alice.key_store regardless whenever the recipient's public key is
+    # already cached, which it is here (both are online). Without this,
+    # alice_window.send_message() below raises PeerNotVerifiedError,
+    # which ChatWindow.send_message() turns into a MODAL QMessageBox
+    # that would hang this test forever under QT_QPA_PLATFORM=offscreen.
+    alice.key_store = SecureKeyStore(
+        alice_payload["user_id"], storage_dir=tmp_path / "keystore"
+    )
+    alice.key_store.unlock(alice_payload["password"])
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
     )
 
     alice_window = ChatWindow(alice)

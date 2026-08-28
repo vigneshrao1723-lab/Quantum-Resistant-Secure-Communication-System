@@ -51,11 +51,12 @@ from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
 from crypto.aes import AESCipher
-from crypto.key_manager import KeyManager
+from crypto.key_manager import KeyManager, fingerprint_public_key
 from crypto.kyber import ML_KEM_768_PUBLIC_KEY_BYTES
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import (
     start_test_server,
     wrap_client_socket,
@@ -224,20 +225,29 @@ class _GroupClient:
             pass
 
 
-def _distributor_session(client):
+def _distributor_session(client, key_store):
     """A real ClientSession wired to this client's socket and
-    KeyManager, so _distribute_group_key() runs for real."""
+    KeyManager, so _distribute_group_key() runs for real.
+
+    Server-Untrusted Identity Verification, Stage 3: also wired to a
+    real SecureKeyStore (``key_store``) -- _distribute_group_key() now
+    silently skips any recipient this key store does not report as
+    PEER_STATE_VERIFIED, so a bare ClientSession with key_store left
+    at its default None (never verified) would skip every recipient
+    unconditionally.
+    """
 
     session = ClientSession()
     session.username = client.username
     session.client_socket = client.sock
     session.key_manager = client.key_manager
+    session.key_store = key_store
 
     return session
 
 
 @pytest.fixture()
-def trio(running_server):
+def trio(running_server, tmp_path):
     """Three real group members with fully exchanged public keys."""
 
     _state, port = running_server
@@ -270,6 +280,23 @@ def trio(running_server):
         assert result is not None
         conversation_id = result["conversation_id"]
 
+    # Server-Untrusted Identity Verification, Stage 3: a real,
+    # unlocked SecureKeyStore for the distributor -- _distribute()
+    # (below) wires this into every ClientSession it builds, and
+    # individual tests call verify_peer_fingerprint() on it for
+    # whichever members they expect distribution to actually reach.
+    # Genuinely unlocked (not just constructed) because
+    # verify_peer_fingerprint() writes through to disk, which requires
+    # a real derived key from unlock() -- exactly the established
+    # pattern in tests/test_peer_key_verification.py's `app` fixture,
+    # just built directly here since these tests use raw _GroupClient
+    # sockets rather than a full ClientSession.authenticate_credentials()
+    # launch.
+    distributor_key_store = SecureKeyStore(
+        distributor.user_id, storage_dir=tmp_path / "distributor-keystore"
+    )
+    distributor_key_store.unlock(payloads[0]["password"])
+
     yield {
         "port": port,
         "conversation_id": conversation_id,
@@ -277,6 +304,7 @@ def trio(running_server):
         "healthy": healthy,
         "affected": affected,
         "payloads": payloads,
+        "distributor_key_store": distributor_key_store,
     }
 
     for client in clients:
@@ -289,7 +317,7 @@ def _distribute(trio, group_key, epoch=1):
     """Run the real distribution path for both non-distributor members."""
 
     distributor = trio["distributor"]
-    session = _distributor_session(distributor)
+    session = _distributor_session(distributor, trio["distributor_key_store"])
 
     distributor.key_manager.store_key(trio["conversation_id"], group_key, epoch=epoch)
 
@@ -337,6 +365,15 @@ def test_missing_key_member_is_skipped_and_others_still_served(trio):
     # Simulate "never learned this member's key".
     distributor.key_manager.public_keys.pop(affected.username, None)
     assert distributor.key_manager.get_public_key(affected.username) is None
+
+    # Server-Untrusted Identity Verification, Stage 3: healthy's real,
+    # genuinely cached key must be verified for distribution to reach
+    # them -- affected needs none, since a missing key is skipped
+    # before verification is ever checked.
+    trio["distributor_key_store"].verify_peer_fingerprint(
+        trio["healthy"].username,
+        fingerprint_public_key(trio["healthy"].key_manager.public_key),
+    )
 
     group_key = os.urandom(32)
     _distribute(trio, group_key, epoch=1)
@@ -387,6 +424,21 @@ def test_right_length_invalid_key_does_not_block_other_members(trio):
     ).decode("ascii")
 
     distributor.key_manager.add_public_key(affected.username, plausible_but_invalid)
+
+    # Server-Untrusted Identity Verification, Stage 3: verify healthy's
+    # real key (needed for delivery to reach them), and affected's
+    # right-length-but-invalid key too -- this test is specifically
+    # about the ML-KEM wrap failure that happens AFTER a key is
+    # imported and cached, so affected must reach that check rather
+    # than being skipped earlier as merely "unverified". Fingerprinted
+    # from the exact same raw string just fed to add_public_key().
+    trio["distributor_key_store"].verify_peer_fingerprint(
+        trio["healthy"].username,
+        fingerprint_public_key(trio["healthy"].key_manager.public_key),
+    )
+    trio["distributor_key_store"].verify_peer_fingerprint(
+        affected.username, fingerprint_public_key(plausible_but_invalid)
+    )
 
     group_key = os.urandom(32)
     _distribute(trio, group_key, epoch=1)
@@ -469,6 +521,16 @@ def test_reconnect_replaces_stale_key_and_restores_consistency(trio):
     )
     assert refreshed
 
+    # Server-Untrusted Identity Verification, Stage 3: verify healthy's
+    # unchanged key, and affected's refreshed one -- fingerprinted from
+    # the exact raw value learn_key_of() just fed to add_public_key().
+    trio["distributor_key_store"].verify_peer_fingerprint(
+        healthy.username, fingerprint_public_key(healthy.key_manager.public_key)
+    )
+    trio["distributor_key_store"].verify_peer_fingerprint(
+        affected.username, fingerprint_public_key(refreshed)
+    )
+
     # Redistribute the current epoch to everyone.
     group_key = os.urandom(32)
     _distribute(trio, group_key, epoch=1)
@@ -514,7 +576,16 @@ def test_recovered_member_receives_a_later_epoch_normally(trio):
     conversation_id = trio["conversation_id"]
 
     affected.reconnect(trio["port"])
-    distributor.learn_key_of(affected.username)
+    refreshed = distributor.learn_key_of(affected.username)
+
+    # Server-Untrusted Identity Verification, Stage 3: verify
+    # affected's refreshed fingerprint (fingerprinted from the exact
+    # raw value learn_key_of() just fed to add_public_key()) -- this
+    # covers both the epoch-1 and epoch-2 distributions below, since
+    # the distributor's key store persists across both.
+    trio["distributor_key_store"].verify_peer_fingerprint(
+        affected.username, fingerprint_public_key(refreshed)
+    )
 
     epoch_one_key = os.urandom(32)
     _distribute(trio, epoch_one_key, epoch=1)

@@ -91,6 +91,44 @@ _UNDECRYPTABLE_PLACEHOLDER = "Message unavailable (encrypted in a previous sessi
 PEER_KEY_STATE_CHANGED = "KEY_CHANGED"
 
 
+class PeerNotVerifiedError(ValueError):
+    """
+    Server-Untrusted Identity Verification, Stage 3: raised by
+    establish_session_key() when the current direct chat partner's
+    cached public key exists but is not PEER_STATE_VERIFIED (either
+    PEER_STATE_UNVERIFIED -- first contact or never verified -- or
+    PEER_KEY_STATE_CHANGED -- a previously VERIFIED key was just
+    replaced by a different one).
+
+    A ValueError subclass so it is caught for free by every existing
+    generic exception handler around send_chat_message()/
+    send_attachment() in the GUI (e.g. gui/chat_window.py's existing
+    "except (OSError, ValueError)" around send_attachment()) even
+    before any Stage-3-specific handling is added there -- this
+    exists to be LOUD, never to be silently swallowed. ``username``
+    and ``state`` let a caller build the exact, state-specific message
+    text and offer a direct path to verification, rather than a bare
+    string a user has to parse.
+    """
+
+    def __init__(self, username, state):
+        self.username = username
+        self.state = state
+
+        if state == PEER_KEY_STATE_CHANGED:
+            message = (
+                f"This contact's security identity has changed. "
+                f"Verify the new fingerprint before continuing."
+            )
+        else:
+            message = (
+                f"Secure messaging is unavailable until you verify "
+                f"this contact."
+            )
+
+        super().__init__(message)
+
+
 class ClientSession(QObject):
     """
     Represents a single client session.
@@ -290,6 +328,19 @@ class ClientSession(QObject):
         # every login/lock (see _lock_key_store()), never persisted;
         # see _evaluate_peer_key_verification()'s docstring.
         self._peer_keys_changed = set()
+
+        # Server-Untrusted Identity Verification, Stage 3: {username:
+        # fingerprint} for the NEW (rejected, not cached, not
+        # persisted) key that triggered PEER_KEY_STATE_CHANGED for
+        # that username -- see _flag_peer_key_changed(). Needed so a
+        # verification dialog can show the user what to compare
+        # against: SecureKeyStore still holds only the OLD VERIFIED
+        # fingerprint (Stage 2 deliberately never stores or caches the
+        # substituted key), so the new key's fingerprint has nowhere
+        # else to live. Exactly as session-local as
+        # _peer_keys_changed, for the same reason -- reset on every
+        # login/lock, never persisted.
+        self._pending_key_changed_fingerprints = {}
 
         # ---------------------------------
         # Legacy Callbacks
@@ -667,6 +718,11 @@ class ClientSession(QObject):
         # that VERIFIED/UNVERIFIED records live in.
         self._peer_keys_changed = set()
 
+        # Server-Untrusted Identity Verification, Stage 3: same
+        # reasoning -- a pending new-key fingerprint has no meaning
+        # once the key store it would be verified against is locked.
+        self._pending_key_changed_fingerprints = {}
+
     def login(self, username):
         """
         Authenticate this client with the server using the JWT
@@ -987,6 +1043,28 @@ class ClientSession(QObject):
 
         receiver = self.current_chat
         conversation_id = self.current_conversation_id
+
+        # Server-Untrusted Identity Verification, Stage 3: checked
+        # FIRST, before the has_key() short-circuit below, and on
+        # EVERY call -- not only the one that first creates this
+        # conversation's key. Without that ordering, a first blocked
+        # attempt would still reach store_key() further down on a
+        # later call once has_key() started returning True, silently
+        # letting a second send attempt through with no further check.
+        #
+        # `is not None` is the deliberate distinction from a missing
+        # key entirely (see this method's own docstring on Offline
+        # First Contact): a peer whose key has never even been
+        # observed is not "unverified" in any meaningful sense yet --
+        # that case falls through unchanged to the deferred-delivery
+        # branch below, exactly as before Stage 3.
+        if (
+            self.key_manager.get_public_key(receiver) is not None
+            and not self._peer_key_is_verified(receiver)
+        ):
+            raise PeerNotVerifiedError(
+                receiver, self.get_peer_verification_state(receiver)
+            )
 
         if self.key_manager.has_key(conversation_id):
             return
@@ -2169,6 +2247,38 @@ class ClientSession(QObject):
 
             return
 
+        # Server-Untrusted Identity Verification, Stage 3: this
+        # handler is fully automatic and server-triggered, on the
+        # receiver thread -- there is no user action here to raise a
+        # PeerNotVerifiedError against (unlike establish_session_key()).
+        # Silently declining is the correct outcome, exactly like the
+        # has_key() check just above: the recipient's queued messages
+        # stay queued, and this same redelivery is retried on their
+        # next reconnect -- once verified, that later attempt succeeds
+        # with no other change. The user still learns about this
+        # peer's state proactively, from the conversation's own
+        # verification badge, not from this background handler.
+        #
+        # `is not None` -- same distinction as establish_session_key():
+        # a recipient with no cached public key at all falls through
+        # unchanged to wrap_key_for_member()'s own existing
+        # ValueError/"no public key" handling below, exactly as before
+        # Stage 3. This check only ever fires for a key that IS cached
+        # but is not currently PEER_STATE_VERIFIED.
+        if (
+            self.key_manager.get_public_key(recipient) is not None
+            and not self._peer_key_is_verified(recipient)
+        ):
+
+            self.logger.warning(
+                f"SECURITY: refusing to redeliver key for "
+                f"{conversation_id} epoch {epoch} to {recipient}: "
+                f"peer is not verified "
+                f"({self.get_peer_verification_state(recipient)})."
+            )
+
+            return
+
         session_key = self.key_manager.get_key(conversation_id, epoch=epoch)
 
         try:
@@ -2268,7 +2378,9 @@ class ClientSession(QObject):
             # imported or cached, so the trusted key already in
             # KeyManager.public_keys[username] (if any) remains in
             # effect for every cryptographic operation that reads it.
-            self._flag_peer_key_changed(username)
+            self._flag_peer_key_changed(
+                username, fingerprint_public_key(public_key)
+            )
 
             return
 
@@ -2343,7 +2455,7 @@ class ClientSession(QObject):
 
         return entry["fingerprint"] != fingerprint_public_key(raw_public_key)
 
-    def _flag_peer_key_changed(self, username):
+    def _flag_peer_key_changed(self, username, new_fingerprint):
         """
         Record, session-locally only, that the most recently OBSERVED
         key for ``username`` disagreed with their VERIFIED fingerprint
@@ -2357,9 +2469,23 @@ class ClientSession(QObject):
         substituted key has already been kept out of KeyManager
         entirely; this method only ever records the fact and notifies,
         it never itself touches any key material.
+
+        ``new_fingerprint`` (Stage 3) is the REJECTED key's fingerprint
+        -- computed by the caller from the same raw wire bytes
+        _is_verified_key_mismatch() just compared, before this method
+        is called. Kept only in _pending_key_changed_fingerprints
+        (session-local, same lifetime as _peer_keys_changed) so a
+        verification dialog has something to show the user: the
+        rejected key itself was never imported or cached anywhere, so
+        this is the only place its fingerprint can still be read from
+        for the user to compare and, if they confirm it, re-verify
+        against (see get_peer_fingerprint_for_verification()/
+        confirm_peer_verification()).
         """
 
         self._peer_keys_changed.add(username)
+
+        self._pending_key_changed_fingerprints[username] = new_fingerprint
 
         self.logger.warning(
             f"SECURITY: public key received for {username} does not "
@@ -2420,6 +2546,8 @@ class ClientSession(QObject):
 
         self._peer_keys_changed.discard(username)
 
+        self._pending_key_changed_fingerprints.pop(username, None)
+
     def get_peer_verification_state(self, username):
         """
         Returns this user's current knowledge of ``username``'s
@@ -2444,6 +2572,99 @@ class ClientSession(QObject):
         entry = self.key_store.get_peer_verification(username)
 
         return entry["state"] if entry is not None else None
+
+    def _peer_key_is_verified(self, username):
+        """
+        True only if ``username``'s CURRENT verification state is
+        exactly PEER_STATE_VERIFIED (Server-Untrusted Identity
+        Verification, Stage 3). False for PEER_STATE_UNVERIFIED,
+        PEER_KEY_STATE_CHANGED, and None (nothing recorded, or no
+        local key store this session) alike -- all three mean the
+        same thing to a caller deciding whether it is safe to
+        establish protected communication: there is no confirmed
+        binding between this key and this peer right now. The
+        difference between them only matters for what the UI tells
+        the user, never for this decision -- see
+        establish_session_key(), handle_direct_key_redelivery_
+        required(), and _distribute_group_key(), the three (and only
+        three) places KeyManager.wrap_key_for_member() is ever called.
+        """
+
+        return self.get_peer_verification_state(username) == PEER_STATE_VERIFIED
+
+    def get_peer_fingerprint_for_verification(self, username):
+        """
+        Returns the fingerprint a verification dialog should display
+        and, on explicit user confirmation, pass to
+        confirm_peer_verification() (Server-Untrusted Identity
+        Verification, Stage 3).
+
+        For PEER_KEY_STATE_CHANGED, this is the NEW key's fingerprint
+        -- the one that triggered the mismatch, held only in
+        _pending_key_changed_fingerprints, since Stage 2 deliberately
+        never imports or persists the rejected key itself anywhere
+        else. For PEER_STATE_UNVERIFIED or PEER_STATE_VERIFIED, this
+        is whatever SecureKeyStore already has on file for username --
+        first-contact verification and re-confirming an already-
+        VERIFIED key both compare against the same, currently-active
+        fingerprint. None if nothing has ever been recorded, or the
+        local key store is unavailable this session.
+        """
+
+        if username in self._pending_key_changed_fingerprints:
+            return self._pending_key_changed_fingerprints[username]
+
+        if self.key_store is None:
+            return None
+
+        entry = self.key_store.get_peer_verification(username)
+
+        return entry["fingerprint"] if entry is not None else None
+
+    def confirm_peer_verification(self, username, fingerprint):
+        """
+        The ONLY method the GUI should ever call to promote a peer to
+        PEER_STATE_VERIFIED (Server-Untrusted Identity Verification,
+        Stage 3) -- called ONLY after the user has explicitly
+        confirmed, through their own independent out-of-band
+        comparison, that ``fingerprint`` (as obtained from
+        get_peer_fingerprint_for_verification(), never re-derived or
+        guessed here) is correct. Never called automatically, never
+        called speculatively, never called on a dialog merely being
+        opened or cancelled.
+
+        Wraps SecureKeyStore.verify_peer_fingerprint() -- the only
+        method allowed to set PEER_STATE_VERIFIED, unchanged since
+        Stage 1 -- and additionally clears this username's
+        session-local PEER_KEY_STATE_CHANGED bookkeeping
+        (_peer_keys_changed/_pending_key_changed_fingerprints), which
+        verify_peer_fingerprint() itself has no reason to know about:
+        KEY_CHANGED is deliberately session-local (see
+        PEER_KEY_STATE_CHANGED's module docstring), so without this
+        second step get_peer_verification_state() would keep reporting
+        KEY_CHANGED for the rest of this session even after the store
+        underneath it correctly says VERIFIED -- it checks the
+        session-local flag first, by design (Stage 2).
+
+        Raises KeyStoreError if the local key store is unavailable
+        this session -- there is nothing to persist the verification
+        into, and silently accepting it in memory only would make
+        VERIFIED here mean something different than VERIFIED
+        everywhere else this state is checked (all of which read
+        SecureKeyStore).
+        """
+
+        if self.key_store is None:
+            raise KeyStoreError(
+                "The local key store is not available; identity "
+                "verification cannot be saved."
+            )
+
+        self.key_store.verify_peer_fingerprint(username, fingerprint)
+
+        self._peer_keys_changed.discard(username)
+
+        self._pending_key_changed_fingerprints.pop(username, None)
 
     # ----------------------------------------------------------
 
@@ -2634,6 +2855,27 @@ class ClientSession(QObject):
                 self.logger.warning(
                     f"No public key for {member}; cannot distribute "
                     f"group key for {conversation_id} epoch {epoch}."
+                )
+
+                continue
+
+            # Server-Untrusted Identity Verification, Stage 3: same
+            # per-recipient skip-and-continue shape as the "no public
+            # key" case just above -- one unverified member never
+            # blocks the group key from reaching everyone else (D6 --
+            # Group Key Distribution Robustness already established
+            # this independence for unusable keys; verification status
+            # is just one more reason a given member may be skipped).
+            # Once that member is verified, the next rotation/
+            # reconnect-triggered redelivery for them succeeds with no
+            # other change -- there is no separate retry path to add.
+            if not self._peer_key_is_verified(member):
+
+                self.logger.warning(
+                    f"SECURITY: {member} is not verified; skipping "
+                    f"group key distribution for {conversation_id} "
+                    f"epoch {epoch} to this member "
+                    f"({self.get_peer_verification_state(member)})."
                 )
 
                 continue

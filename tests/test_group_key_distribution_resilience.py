@@ -47,6 +47,8 @@ import base64
 import pytest
 
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
+from storage.secure_key_store import SecureKeyStore
 
 
 class _StubKeyManager:
@@ -86,17 +88,31 @@ class _StubKeyManager:
 
 
 @pytest.fixture()
-def session_and_sent(monkeypatch):
+def session_and_sent(monkeypatch, tmp_path):
     """
     A bare ClientSession with the network stubbed out. Returns the
     session plus the list every outgoing packet lands in, so tests
     assert on real create_group_key_distribution_packet() output
     rather than on a mock's call args.
+
+    Server-Untrusted Identity Verification, Stage 3: _distribute_group_key()
+    now skips any recipient who is not explicitly VERIFIED in
+    session.key_store, before it ever reaches wrap_key_for_member() --
+    on top of, not instead of, the pre-existing missing-key/unusable-key
+    handling this module exists to test. A bare ClientSession() never
+    unlocks a key store (that normally happens inside
+    authenticate_credentials()), so a real, isolated, on-disk
+    SecureKeyStore is unlocked here; individual tests verify whichever
+    recipients they need to actually reach the wrapping call.
     """
 
     session = ClientSession()
     session.username = "distributor"
     session.client_socket = object()  # never touched; send is stubbed
+    session.key_store = SecureKeyStore(
+        "distribution-resilience-test-user", storage_dir=tmp_path / "keystore"
+    )
+    session.key_store.unlock("Str0ng!Passw0rd")
 
     sent = []
 
@@ -106,6 +122,18 @@ def session_and_sent(monkeypatch):
     )
 
     return session, sent
+
+
+def _verify_stub_recipients(session, *usernames):
+    """Marks each of ``usernames`` VERIFIED, using the fingerprint of
+    _StubKeyManager.get_public_key()'s fixed b"stub-public-key" --
+    the same raw value every non-"missing" stub recipient's key
+    resolves to, so this matches what a real handle_public_key() ->
+    verify_peer_fingerprint() flow would have recorded."""
+
+    fingerprint = fingerprint_public_key(b"stub-public-key")
+    for username in usernames:
+        session.key_store.verify_peer_fingerprint(username, fingerprint)
 
 
 def _recipients_of(sent):
@@ -119,6 +147,7 @@ def _recipients_of(sent):
 def test_all_valid_recipients_receive_the_key(session_and_sent):
     session, sent = session_and_sent
     session.key_manager = _StubKeyManager({})
+    _verify_stub_recipients(session, "alice", "bob", "carol")
 
     session._distribute_group_key("conv-1", b"group-key", 1, ["alice", "bob", "carol"])
 
@@ -156,6 +185,7 @@ def test_unusable_key_is_skipped_and_others_still_receive(
 
     session, sent = session_and_sent
     session.key_manager = _StubKeyManager({bad_member: bad_error})
+    _verify_stub_recipients(session, *recipients)
 
     session._distribute_group_key("conv-1", b"group-key", 4, recipients)
 
@@ -177,6 +207,7 @@ def test_every_recipient_unusable_sends_nothing_but_does_not_raise(session_and_s
     session.key_manager = _StubKeyManager(
         {"a": ValueError, "b": TypeError, "c": ValueError}
     )
+    _verify_stub_recipients(session, "a", "b", "c")
 
     session._distribute_group_key("conv-1", b"group-key", 2, ["a", "b", "c"])
 
@@ -191,6 +222,7 @@ def test_every_recipient_unusable_sends_nothing_but_does_not_raise(session_and_s
 def test_missing_public_key_is_still_skipped_without_wrapping(session_and_sent):
     session, sent = session_and_sent
     session.key_manager = _StubKeyManager({"offline": "missing"})
+    _verify_stub_recipients(session, "alice", "bob")
 
     session._distribute_group_key(
         "conv-1", b"group-key", 1, ["alice", "offline", "bob"]
@@ -208,6 +240,7 @@ def test_missing_and_unusable_keys_mix_correctly(session_and_sent):
     session.key_manager = _StubKeyManager(
         {"offline": "missing", "corrupt": ValueError}
     )
+    _verify_stub_recipients(session, "alice", "corrupt", "bob")
 
     session._distribute_group_key(
         "conv-1", b"group-key", 3, ["offline", "alice", "corrupt", "bob"]
@@ -232,6 +265,7 @@ def test_unexpected_errors_still_propagate(session_and_sent, unexpected):
 
     session, _sent = session_and_sent
     session.key_manager = _StubKeyManager({"boom": unexpected})
+    _verify_stub_recipients(session, "boom")
 
     with pytest.raises(unexpected):
         session._distribute_group_key("conv-1", b"group-key", 1, ["boom", "alice"])
@@ -244,6 +278,7 @@ def test_unexpected_errors_still_propagate(session_and_sent, unexpected):
 def test_unusable_key_is_logged_as_a_warning(session_and_sent, caplog):
     session, _sent = session_and_sent
     session.key_manager = _StubKeyManager({"corrupt": ValueError})
+    _verify_stub_recipients(session, "corrupt")
 
     with caplog.at_level("WARNING"):
         session._distribute_group_key("conv-1", b"group-key", 7, ["corrupt", "alice"])
@@ -308,6 +343,13 @@ def test_right_length_but_invalid_kyber_key_does_not_stop_distribution(
     assert key_manager.get_public_key("badpeer") is not None, (
         "a right-length key still passes D6.5 validation -- which is "
         "why the per-recipient guard is still required"
+    )
+
+    session.key_store.verify_peer_fingerprint(
+        "goodpeer", fingerprint_public_key(good_peer.export_public_key())
+    )
+    session.key_store.verify_peer_fingerprint(
+        "badpeer", fingerprint_public_key(plausible_but_invalid)
     )
 
     session.key_manager = key_manager

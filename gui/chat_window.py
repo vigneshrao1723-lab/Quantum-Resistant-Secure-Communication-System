@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPushButton,
 )
 
+from client.session import PEER_KEY_STATE_CHANGED, PeerNotVerifiedError
 from domain.conversation_summary import ConversationSummary
 from domain.payload_type import PayloadType
 from gui.add_members_dialog import AddMembersDialog
@@ -27,6 +28,8 @@ from gui.message_widget import STATUS_FAILED, MessageWidget
 from gui.input_bar import InputBar
 from gui.status_bar import StatusBarWidget
 from gui.styles import COLOR_TEXT_MUTED
+from gui.verify_identity_dialog import VerifyIdentityDialog
+from storage.secure_key_store import PEER_STATE_UNVERIFIED, PEER_STATE_VERIFIED
 
 
 class ChatWindow(QWidget):
@@ -191,9 +194,44 @@ class ChatWindow(QWidget):
             "font-size: 15px; font-weight: 700;"
         )
 
+        # Server-Untrusted Identity Verification, Stage 3: a
+        # persistent (never a one-shot toast) indicator of the open
+        # direct conversation's verification state -- presentation
+        # only, driven entirely by ClientSession.
+        # get_peer_verification_state(), which is also the exact same
+        # state client/session.py's enforcement gates
+        # (establish_session_key() etc.) already check. Hidden for a
+        # group conversation, where verification is a per-member
+        # concern enforced at key-distribution time rather than a
+        # single conversation-wide state -- see
+        # _update_verification_status()'s docstring.
+        self.verification_status_label = QLabel("")
+
+        self.verification_status_label.setTextFormat(Qt.PlainText)
+
+        self.verification_status_label.setStyleSheet(
+            "font-size: 11px; font-weight: 700;"
+        )
+
+        self.verification_status_label.setVisible(False)
+
+        self.verify_identity_button = QPushButton("Verify Identity")
+
+        self.verify_identity_button.setCursor(Qt.PointingHandCursor)
+
+        self.verify_identity_button.clicked.connect(
+            self.handle_verify_identity
+        )
+
+        self.verify_identity_button.setVisible(False)
+
         header_top_row = QHBoxLayout()
 
         header_top_row.addWidget(self.chat_partner_label)
+
+        header_top_row.addWidget(self.verification_status_label)
+
+        header_top_row.addWidget(self.verify_identity_button)
 
         header_top_row.addStretch()
 
@@ -340,6 +378,13 @@ class ChatWindow(QWidget):
         # see handle_public_key_received().
         self.session.public_key_received.connect(
             self.handle_public_key_received
+        )
+
+        # Server-Untrusted Identity Verification, Stage 2 signal,
+        # first connected here in Stage 3: a previously VERIFIED
+        # peer's key just changed -- see handle_peer_key_changed().
+        self.session.peer_key_changed.connect(
+            self.handle_peer_key_changed
         )
 
         # -----------------------------------------
@@ -538,6 +583,11 @@ class ChatWindow(QWidget):
         # has actually received the recipient's public key.
         self._update_composer_availability()
 
+        # Server-Untrusted Identity Verification, Stage 3: refresh the
+        # persistent verification badge for whichever conversation is
+        # now open -- see _update_verification_status()'s docstring.
+        self._update_verification_status()
+
         self.input_bar.focus_input()
 
         self.messages.clear_messages()
@@ -614,6 +664,152 @@ class ChatWindow(QWidget):
 
         self.input_bar.set_enabled(has_key)
 
+    def _update_verification_status(self):
+        """
+        Refresh the persistent verification badge/button for the
+        currently open conversation (Server-Untrusted Identity
+        Verification, Stage 3).
+
+        Presentation only: reads ClientSession.
+        get_peer_verification_state(), the exact same state
+        client/session.py's enforcement (establish_session_key(),
+        handle_direct_key_redelivery_required(),
+        _distribute_group_key()) already gates on -- this method never
+        decides whether communication IS protected, only reflects a
+        decision ClientSession has already made. Hidden entirely for
+        a group conversation: verification there is a per-member
+        concern enforced at key-distribution time (see
+        _distribute_group_key()'s Stage-3 gate), not a single state
+        for the whole conversation the way a direct partner's is.
+
+        Deliberately persistent, not a one-shot notification -- stays
+        visible for as long as the conversation is open and the state
+        warrants it, satisfying the requirement that a user blocked
+        from protected communication is never left to wonder why.
+        """
+
+        if self.session.current_chat_is_group:
+
+            self.verification_status_label.setVisible(False)
+
+            self.verify_identity_button.setVisible(False)
+
+            return
+
+        partner = self.session.get_current_chat()
+
+        if partner is None:
+
+            self.verification_status_label.setVisible(False)
+
+            self.verify_identity_button.setVisible(False)
+
+            return
+
+        state = self.session.get_peer_verification_state(partner)
+
+        if state == PEER_STATE_VERIFIED:
+
+            self.verification_status_label.setText("✓ Verified")
+
+            self.verification_status_label.setStyleSheet(
+                "font-size: 11px; font-weight: 700; color: #4FCB9B;"
+            )
+
+            self.verification_status_label.setVisible(True)
+
+            self.verify_identity_button.setText("Re-verify")
+
+            self.verify_identity_button.setVisible(True)
+
+        elif state == PEER_KEY_STATE_CHANGED:
+
+            self.verification_status_label.setText(
+                "⚠ Security identity changed"
+            )
+
+            self.verification_status_label.setStyleSheet(
+                "font-size: 11px; font-weight: 700; color: #E5637E;"
+            )
+
+            self.verification_status_label.setVisible(True)
+
+            self.verify_identity_button.setText("Verify New Identity")
+
+            self.verify_identity_button.setVisible(True)
+
+        elif state == PEER_STATE_UNVERIFIED:
+
+            self.verification_status_label.setText(
+                "Identity not verified"
+            )
+
+            self.verification_status_label.setStyleSheet(
+                "font-size: 11px; font-weight: 700; color: #FFB020;"
+            )
+
+            self.verification_status_label.setVisible(True)
+
+            self.verify_identity_button.setText("Verify Identity")
+
+            self.verify_identity_button.setVisible(True)
+
+        else:
+
+            # No key has ever been received for this partner yet
+            # (Offline First Contact) -- nothing to verify, and this
+            # is explicitly NOT the same thing as UNVERIFIED (see
+            # ClientSession.establish_session_key()'s Stage-3
+            # docstring): showing a verification prompt for a peer
+            # whose key hasn't even arrived would be misleading.
+            self.verification_status_label.setVisible(False)
+
+            self.verify_identity_button.setVisible(False)
+
+    def handle_verify_identity(self):
+        """
+        Open VerifyIdentityDialog for the currently open direct
+        partner (Server-Untrusted Identity Verification, Stage 3).
+
+        The dialog is the only place confirm_peer_verification() is
+        ever called, and only on an explicit confirming click inside
+        it -- this method itself makes no trust decision, it only
+        opens/refreshes the UI around one already made in
+        ClientSession.
+        """
+
+        partner = self.session.get_current_chat()
+
+        if partner is None or self.session.current_chat_is_group:
+            return
+
+        state = self.session.get_peer_verification_state(partner)
+
+        dialog = VerifyIdentityDialog(self.session, partner, state, self)
+
+        dialog.exec()
+
+        self._update_verification_status()
+
+    def handle_peer_key_changed(self, username):
+        """
+        A previously VERIFIED peer's key just changed (Server-
+        Untrusted Identity Verification, Stage 2's peer_key_changed
+        signal, first connected to the GUI in Stage 3).
+
+        Refreshes the badge only if this is the conversation currently
+        open -- otherwise the next open_conversation() picks up the
+        correct state, exactly like handle_public_key_received().
+        """
+
+        if self.session.current_chat_is_group:
+            return
+
+        if username != self.session.get_current_chat():
+            return
+
+        self._update_verification_status()
+
     def handle_public_key_received(self, username):
         """
         A public key just arrived and was cached (BUG -- Public-Key
@@ -630,6 +826,10 @@ class ChatWindow(QWidget):
         else entirely -- e.g. broadcast to this client because THEY
         just came online, unrelated to what's on screen -- never
         touches a composer that was not actually waiting on it.
+
+        Server-Untrusted Identity Verification, Stage 3: also the
+        point a first-contact key's arrival (UNVERIFIED) needs to
+        become visible -- see _update_verification_status().
         """
 
         if self.session.current_chat_is_group:
@@ -639,6 +839,8 @@ class ChatWindow(QWidget):
             return
 
         self._update_composer_availability()
+
+        self._update_verification_status()
 
     def load_history(self, key, is_group=False):
         """
@@ -782,6 +984,25 @@ class ChatWindow(QWidget):
 
             self.session.send_chat_message(message)
 
+        except PeerNotVerifiedError as error:
+
+            # Server-Untrusted Identity Verification, Stage 3: caught
+            # BEFORE the generic Exception handler below, specifically
+            # so the user gets a direct path to resolve this rather
+            # than just an acknowledgment -- see
+            # _show_peer_not_verified_dialog(). The bubble is still
+            # added as FAILED, exactly like any other blocked send,
+            # so the drafted text is never silently lost.
+            self.messages.add_sent_message(
+                message,
+                read_status=STATUS_FAILED,
+                on_retry=self._retry_failed_message,
+            )
+
+            self._show_peer_not_verified_dialog(error)
+
+            return
+
         except Exception as error:
 
             # Task 2 -- the bubble is added for a FAILED send too, not
@@ -847,6 +1068,9 @@ class ChatWindow(QWidget):
 
         try:
             self.session.send_chat_message(bubble.message_text)
+        except PeerNotVerifiedError as error:
+            self._show_peer_not_verified_dialog(error)
+            return
         except Exception as error:
             self.show_error(str(error))
             return
@@ -879,6 +1103,17 @@ class ChatWindow(QWidget):
             payload_type, content, content_metadata = (
                 self.session.send_attachment(file_path)
             )
+
+        except PeerNotVerifiedError as error:
+
+            # Server-Untrusted Identity Verification, Stage 3: caught
+            # ahead of the generic (OSError, ValueError) branch below
+            # -- PeerNotVerifiedError is itself a ValueError (see its
+            # docstring) and would otherwise be caught there too, just
+            # without the direct path to resolve it.
+            self._show_peer_not_verified_dialog(error)
+
+            return
 
         except (OSError, ValueError) as error:
 
@@ -1014,3 +1249,35 @@ class ChatWindow(QWidget):
             "Error",
             message
         )
+
+    def _show_peer_not_verified_dialog(self, error):
+        """
+        Report a send blocked by PeerNotVerifiedError (Server-
+        Untrusted Identity Verification, Stage 3) -- deliberately
+        distinct from show_error(): a bare acknowledgment would leave
+        the user knowing WHY but not what to do about it, so this
+        modal offers a direct action instead of only a message. This
+        is the reactive counterpart to the persistent header badge
+        (_update_verification_status()) -- that badge is the proactive
+        warning shown before the user even tries to send; this dialog
+        is what they see if they try anyway.
+        """
+
+        box = QMessageBox(self)
+
+        box.setIcon(QMessageBox.Warning)
+
+        box.setWindowTitle("Identity Not Verified")
+
+        box.setText(str(error))
+
+        verify_button = box.addButton(
+            "Verify Identity", QMessageBox.AcceptRole
+        )
+
+        box.addButton("Close", QMessageBox.RejectRole)
+
+        box.exec()
+
+        if box.clickedButton() == verify_button:
+            self.handle_verify_identity()

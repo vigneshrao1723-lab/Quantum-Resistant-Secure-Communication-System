@@ -47,6 +47,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
@@ -56,6 +57,7 @@ from security.phone_number import (
     is_valid_phone_number,
     normalize_phone_number,
 )
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server, wrap_client_socket
 from utils.protocol import create_auth_packet, create_public_key_packet
 
@@ -653,7 +655,9 @@ def test_three_clients_can_each_discover_the_others(accounts, connected):
             assert found["username"] == people[target]["username"]
 
 
-def test_lookup_leads_into_the_existing_direct_conversation_flow(accounts, connected):
+def test_lookup_leads_into_the_existing_direct_conversation_flow(
+    accounts, connected, tmp_path
+):
     """
     15: a successful lookup feeds the unchanged conversation flow --
     the found username opens a direct conversation, resolved
@@ -668,6 +672,21 @@ def test_lookup_leads_into_the_existing_direct_conversation_flow(accounts, conne
 
     assert _wait_for(
         lambda: alice_session.key_manager.get_public_key(bob["username"]) is not None
+    )
+
+    # The `connected` fixture logs in with a bare token (unlike the
+    # `app` fixture used elsewhere) and so never unlocks a local key
+    # store -- required, since Server-Untrusted Identity Verification,
+    # Stage 3 checks alice_session.key_store regardless. Give this one
+    # session an isolated, unlocked store of its own so bob can be
+    # explicitly verified, exactly as this test's original intent
+    # (lookup -> conversation -> delivered message) always assumed.
+    alice_session.key_store = SecureKeyStore(
+        alice["user_id"], storage_dir=tmp_path / "keystore"
+    )
+    alice_session.key_store.unlock(alice["password"])
+    alice_session.key_store.verify_peer_fingerprint(
+        bob["username"], fingerprint_public_key(bob_session.key_manager.public_key)
     )
 
     found = alice_session.find_user_by_phone_number("+919876532123")

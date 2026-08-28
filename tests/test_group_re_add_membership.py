@@ -44,11 +44,13 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
 
@@ -106,9 +108,17 @@ def _login_and_get_token(payload):
         db.close()
 
 
-def _connect(payload):
+def _connect(payload, key_store_dir):
     """connect() -> login() -> send_public_key() -> start_receiver(),
-    the sequence gui/main_window.py::start_chat_session() performs."""
+    the sequence gui/main_window.py::start_chat_session() performs.
+
+    Also unlocks a real, isolated, on-disk SecureKeyStore -- this
+    lighter connect()-only pattern normally never does that (it skips
+    authenticate_credentials(), the only place that happens), but
+    Server-Untrusted Identity Verification, Stage 3 needs one to exist
+    so the fixture below can explicitly verify these peers with
+    key_store.verify_peer_fingerprint(), exactly as a real login would
+    have unlocked one for the same purpose."""
 
     session = ClientSession()
     session.user_id = payload["user_id"]
@@ -117,6 +127,10 @@ def _connect(payload):
     session.login(payload["username"])
     session.send_public_key()
     session.start_receiver()
+    session.key_store = SecureKeyStore(
+        payload["user_id"], storage_dir=key_store_dir / payload["username"]
+    )
+    session.key_store.unlock(payload["password"])
     return session
 
 
@@ -177,7 +191,7 @@ def _received(session, text):
 
 
 @pytest.fixture()
-def group_of_three(running_server, monkeypatch):
+def group_of_three(running_server, monkeypatch, tmp_path):
     """
     Alice, Bob and Ramya in one group, plus an ``outsider`` who is
     connected and authenticated but was never a member.
@@ -190,11 +204,15 @@ def group_of_three(running_server, monkeypatch):
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
+    key_store_dir = tmp_path / "keystores"
+
     payloads = {
         name: _register_user(f"{name}_")
         for name in ("alice", "bob", "ramya", "outsider")
     }
-    sessions = {name: _connect(payload) for name, payload in payloads.items()}
+    sessions = {
+        name: _connect(payload, key_store_dir) for name, payload in payloads.items()
+    }
 
     alice, bob, ramya = sessions["alice"], sessions["bob"], sessions["ramya"]
     names = {name: payload["username"] for name, payload in payloads.items()}
@@ -212,6 +230,29 @@ def group_of_three(running_server, monkeypatch):
                     holder.key_manager.get_public_key(other) is not None
                 )
             ), f"public key for {other} never arrived"
+
+    # Server-Untrusted Identity Verification, Stage 3:
+    # _distribute_group_key() silently skips any recipient who is not
+    # explicitly VERIFIED -- and the server picks an arbitrary
+    # currently-connected active member to (re)distribute the key on
+    # every creation/leave/re-add rotation (see server/client_handler.py
+    # ::_select_connected_active_member() -- "any valid connected
+    # member is acceptable... no election"), so whichever of
+    # alice/bob/ramya ends up distributing must already have the other
+    # two verified. All three verify each other here, before the group
+    # is even created, so the fixture's own baseline (three members,
+    # one shared key) does not depend on which one the server happens
+    # to pick.
+    for verifier, peers in (
+        (alice, (("bob", bob), ("ramya", ramya))),
+        (bob, (("alice", alice), ("ramya", ramya))),
+        (ramya, (("alice", alice), ("bob", bob))),
+    ):
+        for peer_name, peer_session in peers:
+            verifier.key_store.verify_peer_fingerprint(
+                names[peer_name],
+                fingerprint_public_key(peer_session.key_manager.public_key),
+            )
 
     alice.create_group_conversation("Re-Add Group", [names["bob"], names["ramya"]])
 

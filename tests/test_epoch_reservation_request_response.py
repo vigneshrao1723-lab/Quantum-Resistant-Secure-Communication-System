@@ -34,6 +34,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
+from crypto.key_manager import fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.session_repository import SessionRepository
@@ -162,14 +163,32 @@ def _connect_and_authenticate(port, user_payload, algorithm="KYBER"):
     return sock, username
 
 
-def _make_connected_session(payload):
+def _make_connected_session(payload, monkeypatch, tmp_path):
     """Real ClientSession: connect() -> login() -> send_public_key()
     -> start_receiver() -- required because establish_session_key()
     now uses send_request() (D4.1), which can only be resolved by a
-    running receiver thread reading real socket data."""
+    running receiver thread reading real socket data.
+
+    Server-Untrusted Identity Verification, Stage 3: also unlocks a
+    real, isolated SecureKeyStore via authenticate_credentials() --
+    required so this session's peer-verification state can be checked
+    at all (see tests/test_peer_key_verification.py's `app` fixture,
+    the established pattern for this).
+    """
+    monkeypatch.setattr(
+        "storage.secure_key_store.KEY_STORE_DIR",
+        tmp_path / f"keystore-{uuid.uuid4().hex}",
+    )
+
     session = ClientSession()
-    session.user_id = payload["user_id"]
-    session.access_token = _login_and_get_token(payload)
+
+    result = session.authenticate_credentials(payload["phone_number"], payload["password"])
+    assert result.success, result.message
+
+    session.user_id = result.user_id
+    session.username = result.username
+    session.access_token = result.token_pair.access_token
+
     session.connect()
     session.login(payload["username"])
     session.send_public_key()
@@ -569,18 +588,26 @@ def test_epoch_reservation_request_id_correlation_and_increment(running_server):
 
 
 @pytest.fixture()
-def alice_and_bob(running_server, monkeypatch):
+def alice_and_bob(running_server, monkeypatch, tmp_path):
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
     alice_payload = _register_user("cliab_")
     bob_payload = _register_user("clibb_")
 
-    alice = _make_connected_session(alice_payload)
-    bob = _make_connected_session(bob_payload)
+    alice = _make_connected_session(alice_payload, monkeypatch, tmp_path)
+    bob = _make_connected_session(bob_payload, monkeypatch, tmp_path)
 
     assert _wait_for(lambda: alice.key_manager.get_public_key(bob.username) is not None)
     assert _wait_for(lambda: bob.key_manager.get_public_key(alice.username) is not None)
+
+    # Server-Untrusted Identity Verification, Stage 3: establish_
+    # session_key() now refuses a cached-but-unverified peer key.
+    # Only alice ever sends in the tests built on this fixture, so
+    # only she needs bob verified.
+    alice.key_store.verify_peer_fingerprint(
+        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+    )
 
     yield {"alice": alice, "bob": bob}
 
@@ -652,7 +679,7 @@ def test_direct_chat_end_to_end_still_works_through_establish_session_key(alice_
 
 
 def test_establish_session_key_raises_for_a_conversation_not_a_member_of(
-    running_server, monkeypatch
+    running_server, monkeypatch, tmp_path
 ):
     """Defense in depth: even if a client's own local state were
     forged or corrupted into pointing current_conversation_id at a
@@ -673,7 +700,7 @@ def test_establish_session_key_raises_for_a_conversation_not_a_member_of(
         carol_payload["user_id"], dave_payload["user_id"]
     )
 
-    alice = _make_connected_session(alice_payload)
+    alice = _make_connected_session(alice_payload, monkeypatch, tmp_path)
 
     try:
         alice.current_chat = dave_payload["username"]

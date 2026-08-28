@@ -55,7 +55,7 @@ from PySide6.QtWidgets import QApplication
 import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
-from client.session import ClientSession, PEER_KEY_STATE_CHANGED
+from client.session import ClientSession, PEER_KEY_STATE_CHANGED, PeerNotVerifiedError
 from crypto.key_manager import KeyManager, fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
@@ -147,7 +147,9 @@ def app(running_server, monkeypatch, tmp_path):
         session = ClientSession()
         opened.append(session)
 
-        result = session.authenticate_credentials(payload["username"], password)
+        # UI Finalization -- Login Identifier: phone number, not username,
+        # is what authenticate_credentials() now authenticates with.
+        result = session.authenticate_credentials(payload["phone_number"], password)
         assert result.success, result.message
 
         session.user_id = result.user_id
@@ -691,10 +693,23 @@ def test_wrap_key_for_member_cannot_use_the_malicious_key(app):
 def test_direct_key_redelivery_required_does_not_leak_to_the_malicious_key(app):
     """The exact attack the security audit proved: a malicious server
     substitutes Bob's key, then sends a direct_key_redelivery_required
-    packet for an ALREADY-established conversation. The redelivery
-    mechanism itself must keep working (existing, approved behavior)
-    -- but it must wrap under the trusted key, so the attacker gains
-    nothing from having triggered it."""
+    packet for an ALREADY-established conversation.
+
+    Historical note: this test originally asserted that the redelivery
+    mechanism kept working -- wrapping under the still-trusted K1 --
+    while the peer was KEY_CHANGED. That was correct under Stage 2
+    alone. Server-Untrusted Identity Verification, Stage 3 (approved
+    after this test was written) deliberately makes this stricter,
+    per an explicit mandatory decision: KEY_CHANGED blocks ALL
+    protected communication, including continuing to use the old,
+    still-valid K1, until the user explicitly re-verifies. Continuing
+    to redeliver via K1 while an unresolved security alert is active
+    would undermine the point of surfacing that alert at all. This
+    test now proves the stricter, current guarantee: NOTHING is sent
+    at all while KEY_CHANGED -- not a leak to the attacker (Stage 2's
+    original property, still fully true, now trivially so since there
+    is nothing to intercept), and not even a delivery to the real
+    Bob."""
 
     alice_payload = app["register"]("alice_")
     bob_payload = app["register"]("bob_")
@@ -747,21 +762,25 @@ def test_direct_key_redelivery_required_does_not_leak_to_the_malicious_key(app):
         client_session_module.send_message = real_send_message
 
     distributed = [p for p in sent_packets if p.get("type") == "group_key_distribution"]
-    assert len(distributed) == 1, "the existing redelivery mechanism itself must still work"
-
-    packet = distributed[0]
-
-    # The real recipient (Bob) still recovers the exact real key --
-    # existing, legitimate behavior is fully preserved.
-    recovered_by_bob = bob.key_manager.unwrap_received_key(
-        packet["encapsulation"], packet["wrapped_key"]
+    assert len(distributed) == 0, (
+        "Stage 3: KEY_CHANGED must block ALL protected communication, "
+        "including redelivery via the still-trusted old key, until "
+        "the user explicitly re-verifies"
     )
-    assert recovered_by_bob == real_session_key
 
-    # The attacker cannot recover the AES session key with their
-    # substituted key.
-    with pytest.raises((ValueError, TypeError)):
-        attacker.unwrap_received_key(packet["encapsulation"], packet["wrapped_key"])
+    # The attacker gains nothing (Stage 2's original property, still
+    # true): there is no packet to intercept, so their substituted
+    # private key has nothing to unwrap.
+    real_key_still_active = alice.key_manager.get_public_key(
+        bob_payload["username"]
+    )
+    assert real_key_still_active is not None
+    assert real_key_still_active != attacker.kyber.encapsulation_key
+
+    # And the real, already-established session key is untouched and
+    # still exactly what it was before the attack -- KEY_CHANGED does
+    # not corrupt or discard it, it only withholds it from delivery.
+    assert alice.key_manager.get_key(conversation_id) == real_session_key
 
 
 def test_legitimate_matching_key_behavior_is_unaffected_by_the_fix(app):
@@ -808,10 +827,24 @@ def test_legitimate_matching_key_behavior_is_unaffected_by_the_fix(app):
     )
 
 
-def test_first_contact_unverified_behavior_is_unaffected_by_the_fix(app):
-    """The fix must never block a first-contact (never-verified)
-    peer's key -- _is_verified_key_mismatch() must return False
-    whenever there is nothing VERIFIED to compare against."""
+def test_first_contact_unverified_key_reception_is_unaffected_by_the_fix(app):
+    """The Stage-2 fix (_is_verified_key_mismatch()) must never block a
+    first-contact (never-verified) peer's key from being RECEIVED and
+    cached -- it must return False whenever there is nothing VERIFIED
+    to compare against, exactly as before.
+
+    Historical note: this test originally also asserted that sending a
+    protected message to this still-UNVERIFIED peer succeeded --
+    correct under Stage 2 alone, whose scope stopped at "detect and
+    protect an already-VERIFIED key." Server-Untrusted Identity
+    Verification, Stage 3 (approved after this test was written)
+    deliberately and explicitly changes that: an UNVERIFIED peer's key
+    must no longer be usable for protected communication at all (see
+    ClientSession.establish_session_key()'s Stage-3 gate, and
+    test_first_contact_key_reception_does_not_grant_protected_
+    communication below, which is what now covers that half). This
+    test keeps proving only the half that is still true: reception and
+    caching of a first-contact key remain completely unaffected."""
 
     alice_payload = app["register"]("alice_")
     bob_payload = app["register"]("bob_")
@@ -825,14 +858,41 @@ def test_first_contact_unverified_behavior_is_unaffected_by_the_fix(app):
     )
     assert alice.key_manager.get_public_key(bob_payload["username"]) is not None
 
-    # And the composer-availability/messaging path this originally
-    # protected is genuinely usable -- unaffected by the fix.
-    _open_direct(alice, bob_payload["username"])
-    alice.send_chat_message("first contact still works")
+
+def test_first_contact_key_reception_does_not_grant_protected_communication(app):
+    """Server-Untrusted Identity Verification, Stage 3: the other half
+    of what the renamed test above used to assert -- and now
+    explicitly no longer does. An UNVERIFIED first-contact peer's
+    key is received and cached (proven above), but must NOT be usable
+    to establish protected communication: establish_session_key()
+    must raise PeerNotVerifiedError, and no message may reach the
+    server or the recipient as a result."""
+
+    alice_payload = app["register"]("alice_")
+    bob_payload = app["register"]("bob_")
+
+    alice = app["launch"](alice_payload)
+    bob = app["launch"](bob_payload)
 
     assert _wait_for(
-        lambda: any(
-            summary.latest_message and summary.latest_message.text == "first contact still works"
-            for summary in bob.conversation_store.get_all()
-        )
+        lambda: alice.get_peer_verification_state(bob_payload["username"])
+        == PEER_STATE_UNVERIFIED
+    )
+
+    _open_direct(alice, bob_payload["username"])
+
+    with pytest.raises(PeerNotVerifiedError):
+        alice.send_chat_message("must not be sent while unverified")
+
+    # Bob never receives anything -- the block is real, not cosmetic.
+    assert not any(
+        summary.latest_message
+        and summary.latest_message.text == "must not be sent while unverified"
+        for summary in bob.conversation_store.get_all()
+    )
+
+    # Still UNVERIFIED afterward -- a blocked send must never itself
+    # change verification state in either direction.
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_STATE_UNVERIFIED
     )

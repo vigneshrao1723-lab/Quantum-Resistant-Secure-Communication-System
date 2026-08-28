@@ -60,11 +60,12 @@ import crypto.key_manager as key_manager_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
-from crypto.key_manager import KeyManager
+from crypto.key_manager import KeyManager, fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
+from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
 # RSA-2048 produces a fixed 256-byte OAEP ciphertext block. ML-KEM-768
@@ -175,7 +176,7 @@ def _last_received_text(session, from_username):
 
 
 @pytest.fixture()
-def rsa_alice_and_bob(running_server, monkeypatch):
+def rsa_alice_and_bob(running_server, monkeypatch, tmp_path):
     """
     Two real, fully connected ClientSessions running in RSA mode.
 
@@ -217,6 +218,32 @@ def rsa_alice_and_bob(running_server, monkeypatch):
     # session key can be wrapped for them.
     assert _wait_for(lambda: alice.key_manager.get_public_key(bob.username) is not None)
     assert _wait_for(lambda: bob.key_manager.get_public_key(alice.username) is not None)
+
+    # _make_connected_session() logs in with a bare token (unlike gui/
+    # main_window.py's real authenticate_credentials() flow) and so
+    # never unlocks a local key store -- required, since
+    # Server-Untrusted Identity Verification, Stage 3 checks
+    # session.key_store regardless of which key-exchange algorithm is
+    # active. verify_peer_fingerprint() itself is algorithm-agnostic --
+    # it only ever stores a fingerprint string -- so the same fix
+    # applies here as for the Kyber-mode tests, computed from each
+    # session's real RSA KeyManager.public_key. Both directions are
+    # verified since test_rsa_reply_also_round_trips has bob send too.
+    alice.key_store = SecureKeyStore(
+        alice_payload["user_id"], storage_dir=tmp_path / "keystore"
+    )
+    alice.key_store.unlock(alice_payload["password"])
+    alice.key_store.verify_peer_fingerprint(
+        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+    )
+
+    bob.key_store = SecureKeyStore(
+        bob_payload["user_id"], storage_dir=tmp_path / "keystore"
+    )
+    bob.key_store.unlock(bob_payload["password"])
+    bob.key_store.verify_peer_fingerprint(
+        alice.username, fingerprint_public_key(alice.key_manager.public_key)
+    )
 
     _open_direct_chat(alice, bob.username)
     _open_direct_chat(bob, alice.username)
