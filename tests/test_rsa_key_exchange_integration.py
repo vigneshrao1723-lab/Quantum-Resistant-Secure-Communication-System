@@ -50,6 +50,7 @@ Run with:
 """
 
 import base64
+import os
 import time
 import uuid
 
@@ -65,6 +66,7 @@ from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
+from domain.security_rejection_reason import SecurityRejectionReason
 from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
@@ -122,7 +124,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -480,3 +482,215 @@ def test_kyber_remains_the_default_algorithm():
     # Kyber exports base64 encapsulation-key bytes, never a PEM block.
     assert not key_manager.public_key.startswith(b"-----BEGIN PUBLIC KEY-----")
     assert len(base64.b64decode(key_manager.public_key)) == 1184
+
+
+# ----------------------------------------------------------------------
+# 7-11. handle_session_key() must not let a network-supplied
+# ``algorithm`` field select which decrypt routine runs (Server-
+# Untrusted Identity Verification hardening). These use bare,
+# unconnected ClientSession pairs and call handle_session_key()
+# directly -- exactly the pattern tests/test_group_key_distribution_
+# resilience.py and tests/test_receiver_thread_conversation_id_
+# consumption.py already use for other packet handlers -- since the
+# scenario under test (a forged/mismatched packet, never legitimately
+# produced by either algorithm's own establish_session_key() branch in
+# the current wire protocol) has no natural "make the server relay
+# this" trigger to hook a real end-to-end flow onto.
+# ----------------------------------------------------------------------
+
+
+def _bare_kyber_pair():
+    """Two real, unconnected ClientSessions in the default (KYBER)
+    mode, each already knowing the other's real Kyber public key."""
+
+    alice = ClientSession()
+    bob = ClientSession()
+
+    assert alice.key_manager.algorithm == "KYBER"
+    assert bob.key_manager.algorithm == "KYBER"
+
+    alice.key_manager.add_public_key("bob", bob.key_manager.public_key)
+    bob.key_manager.add_public_key("alice", alice.key_manager.public_key)
+
+    return alice, bob
+
+
+def test_handle_session_key_rejects_even_an_algorithm_matching_kyber_packet():
+    """Phase 13.8A -- KYBER Session-Key Forgery Remediation: this test
+    used to prove the OPPOSITE of what it proves now. Its original
+    premise -- that a session_key packet whose declared algorithm
+    genuinely matches this client's own KYBER configuration should be
+    ACCEPTED -- was exactly the confirmed vulnerability: no signature
+    was ever checked on this branch, so "genuinely matching algorithm
+    label" was the ENTIRE bar to clear, trivially satisfied by a
+    forged packet using nothing but the victim's already-public Kyber
+    key (Phase 13.8's audit). Exhaustive tracing found no legitimate
+    production or test dependency on this operation/algorithm
+    combination ever succeeding (KYBER-mode direct session-key
+    establishment uses group_key_distribution instead, authenticated
+    since Phase 13) -- so the fix is unconditional rejection, not
+    authentication of a path nothing real uses. This test now proves
+    that even a "well-formed, matching-algorithm" packet -- the exact
+    shape that used to succeed -- is rejected, before any decapsulation
+    is attempted."""
+
+    alice, bob = _bare_kyber_pair()
+
+    conversation_id = str(uuid.uuid4())
+
+    ciphertext_b64, shared_secret = alice.key_manager.encapsulate_session_key("bob")
+
+    packet = {
+        "type": "key_exchange",
+        "operation": "session_key",
+        "sender": "alice",
+        "conversation_id": conversation_id,
+        "algorithm": "KYBER",
+        "encrypted_key": ciphertext_b64,
+        "epoch": 1,
+    }
+
+    result = bob.handle_session_key(packet)
+
+    assert result == SecurityRejectionReason.OTHER_SECURITY_REJECTION
+    assert bob.key_manager.get_key(conversation_id, epoch=1) is None
+    assert bob.key_manager.get_key(conversation_id, epoch=1) != shared_secret
+
+
+def test_handle_session_key_rejects_a_forged_rsa_label_toward_a_kyber_client():
+    """Forged/mismatched algorithm selection is rejected: a
+    session_key packet claiming algorithm="RSA" toward a client that
+    is actually KYBER-configured must not be processed -- the network
+    must never select which decrypt routine runs. No usable key is
+    installed as a result."""
+
+    alice, bob = _bare_kyber_pair()
+
+    conversation_id = str(uuid.uuid4())
+
+    ciphertext_b64, _shared_secret = alice.key_manager.encapsulate_session_key("bob")
+
+    forged_packet = {
+        "type": "key_exchange",
+        "operation": "session_key",
+        "sender": "alice",
+        "conversation_id": conversation_id,
+        "algorithm": "RSA",
+        "encrypted_key": ciphertext_b64,
+        "epoch": 1,
+    }
+
+    bob.handle_session_key(forged_packet)
+
+    assert bob.key_manager.get_key(conversation_id, epoch=1) is None
+    assert bob.key_manager.has_key(conversation_id, epoch=1) is False
+
+
+def test_handle_session_key_rejects_a_forged_kyber_label_toward_an_rsa_client(
+    monkeypatch,
+):
+    """The more dangerous direction: RSA-OAEP decrypt fails closed on
+    the wrong ciphertext, but ML-KEM decapsulation does NOT -- it
+    deterministically returns SOME shared secret for any well-formed-
+    length ciphertext, never raising (see tests/test_kyber.py::
+    test_tampered_ciphertext_does_not_raise_but_yields_wrong_secret).
+    Before this hardening, a server forging algorithm="KYBER" toward
+    an RSA-configured client (whose KeyManager always holds a real
+    Kyber keypair too, generated unconditionally regardless of the
+    active algorithm) could have this branch run silently and install
+    a bogus key via store_key() for an epoch that had not been
+    established yet -- a key-poisoning/DoS risk distinct from (and
+    worse than) the RSA-labelled direction. Must be rejected the same
+    way, before any decapsulate call happens at all.
+    """
+
+    monkeypatch.setattr(key_manager_module, "KEY_EXCHANGE_ALGORITHM", "RSA")
+
+    bob = ClientSession()
+    assert bob.key_manager.algorithm == "RSA"
+
+    # A real Kyber ciphertext, from an unrelated real Kyber keypair --
+    # plausible-looking wire data, not just a malformed string, so the
+    # rejection is proven to happen on the algorithm label itself,
+    # before any attempt to decapsulate/decrypt it. KeyManager.__init__
+    # always builds a real self.kyber regardless of the active
+    # algorithm (see crypto/key_manager.py), so this is a genuine
+    # ML-KEM-768 encapsulation even though the RSA monkeypatch above is
+    # active -- worked through .kyber directly (bypassing
+    # KeyManager.add_public_key()/encapsulate_session_key(), which
+    # dispatch on self.algorithm and would otherwise route through the
+    # RSA path here) precisely so this test is not itself affected by
+    # that same monkeypatch.
+    attacker = KeyManager()
+    another = KeyManager()
+    ciphertext_b64, _shared_secret = another.kyber.encapsulate(
+        attacker.kyber.encapsulation_key
+    )
+
+    conversation_id = str(uuid.uuid4())
+
+    forged_packet = {
+        "type": "key_exchange",
+        "operation": "session_key",
+        "sender": "attacker",
+        "conversation_id": conversation_id,
+        "algorithm": "KYBER",
+        "encrypted_key": ciphertext_b64,
+        "epoch": 1,
+    }
+
+    bob.handle_session_key(forged_packet)
+
+    assert bob.key_manager.get_key(conversation_id, epoch=1) is None
+    assert bob.key_manager.has_key(conversation_id, epoch=1) is False
+
+
+def test_handle_session_key_mismatch_does_not_raise_and_leaves_the_session_usable():
+    """No crash / no receiver-thread death: handle_session_key() must
+    return normally (not raise) on a mismatched packet -- if it did
+    raise, pytest would report this test itself as an error, which is
+    exactly the failure this test exists to catch -- and must leave no
+    corrupted state behind.
+
+    Phase 13.8A: the original "recovery" proof here was itself a
+    genuinely-matching KYBER session_key packet -- which is now ALSO
+    correctly rejected unconditionally (see test_handle_session_key_
+    rejects_even_an_algorithm_matching_kyber_packet's own docstring),
+    so it can no longer serve as evidence of "the session still
+    works". Recovery is proven instead the same way tests/
+    test_kyber_session_key_forgery_remediation.py's own test_H does:
+    directly against the underlying KeyManager the handler itself
+    would have written to, confirming nothing about bob's session
+    object was left corrupted by the rejected packets above.
+    """
+
+    alice, bob = _bare_kyber_pair()
+
+    conversation_id = str(uuid.uuid4())
+
+    ciphertext_b64, _shared_secret = alice.key_manager.encapsulate_session_key("bob")
+
+    forged_packet = {
+        "type": "key_exchange",
+        "operation": "session_key",
+        "sender": "alice",
+        "conversation_id": conversation_id,
+        "algorithm": "RSA",
+        "encrypted_key": ciphertext_b64,
+        "epoch": 1,
+    }
+
+    bob.handle_session_key(forged_packet)  # must not raise
+
+    assert bob.key_manager.get_key(conversation_id, epoch=1) is None
+
+    genuine_packet = dict(forged_packet, algorithm="KYBER")
+
+    bob.handle_session_key(genuine_packet)  # must not raise either
+
+    assert bob.key_manager.get_key(conversation_id, epoch=1) is None
+
+    # bob's own session/KeyManager state is still fully usable.
+    real_key = os.urandom(32)
+    bob.key_manager.store_key(conversation_id, real_key, epoch=1)
+    assert bob.key_manager.get_key(conversation_id, epoch=1) == real_key

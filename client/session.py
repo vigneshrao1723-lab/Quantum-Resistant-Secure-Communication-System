@@ -29,7 +29,19 @@ from config import (
     SERVER_PORT,
 )
 from crypto.aes import AESCipher
-from crypto.key_manager import KeyManager, fingerprint_public_key
+from crypto.identity_protocol import sign_identity_payload, verify_identity_payload
+from crypto.group_key_protocol import sign_group_key_payload, verify_group_key_payload
+from crypto.session_key_protocol import (
+    sign_rsa_session_key_payload,
+    verify_rsa_session_key_payload,
+)
+from domain.security_rejection_reason import SecurityRejectionReason
+from crypto.message_protocol import sign_message_payload, verify_message_payload
+from crypto.key_manager import (
+    KeyManager,
+    fingerprint_combined_identity,
+    fingerprint_public_key,
+)
 from storage.secure_key_store import (
     KeyStoreError,
     KeyStoreLocked,
@@ -129,6 +141,23 @@ class PeerNotVerifiedError(ValueError):
         super().__init__(message)
 
 
+class PeerVerificationMismatchError(KeyStoreError):
+    """
+    Server-Untrusted Identity Verification hardening: raised by
+    confirm_peer_verification() when there is no currently observed
+    public key for the peer to verify against at all, or when the
+    caller-supplied fingerprint does not match the fingerprint
+    independently re-derived from that currently observed key.
+
+    A KeyStoreError subclass -- not because this is a storage failure,
+    but so gui/verify_identity_dialog.py's existing
+    "except KeyStoreError" handler already reports it correctly with
+    no GUI code change: from the user's point of view this is the same
+    "verification could not be saved" failure surface, just with one
+    more, independent reason it can now occur.
+    """
+
+
 class ClientSession(QObject):
     """
     Represents a single client session.
@@ -183,6 +212,23 @@ class ClientSession(QObject):
     # not a change from anything). A later GUI layer (Stage 3) is the
     # intended consumer; nothing in this stage reacts to it itself.
     peer_key_changed = Signal(str)
+
+    # Phase 13.7 -- Key-Establishment Rejection Observability & State
+    # Integrity: emitted whenever handle_group_key_distribution()
+    # (KYBER/group-key) or handle_session_key() (RSA) rejects a
+    # key-establishment packet for a security reason -- never for the
+    # ordinary "not addressed to me" routing case, which is normal,
+    # frequent, non-malicious traffic, not a security event (see
+    # _report_security_rejection()'s own docstring). Args: (reason --
+    # a domain.security_rejection_reason.SecurityRejectionReason
+    # value, sender, conversation_id). No GUI consumes this yet (that
+    # remains Phase 14's job -- this phase exposes the signal only, no
+    # dialog/badge/UI change); it exists so a future GUI layer -- or a
+    # test -- has something deterministic to react to without parsing
+    # log text. Only non-sensitive fields: never a signature, key
+    # material, or any other private value -- see
+    # _report_security_rejection()'s own docstring.
+    security_rejection = Signal(str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -341,6 +387,53 @@ class ClientSession(QObject):
         # _peer_keys_changed, for the same reason -- reset on every
         # login/lock, never persisted.
         self._pending_key_changed_fingerprints = {}
+
+        # Server-Untrusted Identity Verification hardening: {username:
+        # raw_public_key_bytes} for the same pending NEW key as above
+        # -- kept alongside its already-computed fingerprint so
+        # confirm_peer_verification() can independently re-derive and
+        # check that fingerprint itself, rather than trusting a
+        # caller-supplied string. Same session-local lifetime.
+        self._pending_key_changed_raw_keys = {}
+
+        # Server-Untrusted Identity Verification hardening: {username:
+        # raw_public_key_bytes} exactly as received on the wire for
+        # the CURRENT, legitimately-imported key -- i.e. the same raw
+        # value _record_peer_key_observation() already fingerprints
+        # for SecureKeyStore. KeyManager.public_keys[username] is NOT
+        # equivalent to this: KeyManager stores each algorithm's own
+        # parsed/decoded form (e.g. Kyber's import_public_key()
+        # returns raw-decoded bytes, not the original base64 wire
+        # value fingerprint_public_key() was computed from elsewhere),
+        # so re-fingerprinting from KeyManager would silently produce
+        # a DIFFERENT digest than the one already on file. Kept here,
+        # deliberately mirroring _pending_key_changed_raw_keys, so
+        # confirm_peer_verification() always re-derives from the exact
+        # bytes every other fingerprint in this system was computed
+        # from. Not reset on lock -- same lifetime as KeyManager.
+        # public_keys itself, which _lock_key_store() does not clear
+        # either.
+        self._observed_peer_raw_public_keys = {}
+
+        # ML-DSA identity/key-persistence foundation phase: the
+        # signing-key counterparts of the two dicts immediately above,
+        # kept as SEPARATE dicts (not merged into them) so this phase's
+        # new combined-identity methods (_record_peer_identity_
+        # observation(), _flag_peer_identity_changed(),
+        # observe_peer_identity() below) can be added, tested, and
+        # reasoned about independently of the existing single-key
+        # (KEM-only) methods above, which remain completely unmodified
+        # and unused by these new methods -- no network packet carries
+        # a peer's signing key yet (Phase 11's explicit scope
+        # boundary), so nothing currently populates these except direct
+        # calls to observe_peer_identity() itself (e.g. from tests).
+        # Same lifetime rules as their KEM counterparts: _observed_
+        # peer_signing_public_keys is NOT reset on lock (mirrors
+        # _observed_peer_raw_public_keys); _pending_key_changed_
+        # signing_raw_keys IS reset on lock (mirrors _pending_key_
+        # changed_raw_keys) -- see _lock_key_store().
+        self._observed_peer_signing_public_keys = {}
+        self._pending_key_changed_signing_raw_keys = {}
 
         # ---------------------------------
         # Legacy Callbacks
@@ -513,8 +606,12 @@ class ClientSession(QObject):
 
     def authenticate_credentials(self, identifier, password):
         """
-        Authenticate a username/email + password against the server
-        (D2 -- Server-Side API / Authentication Migration; final slice,
+        Authenticate a phone number + password against the server (UI
+        Finalization -- Login Identifier: phone number is now the only
+        accepted login identifier -- see AuthenticationService.
+        authenticate_user(); this method itself stays identifier-agnostic,
+        exactly as it already was) (D2 -- Server-Side API / Authentication
+        Migration; final slice,
         replacing gui/main_window.py's and client/client.py's previous
         direct, local AuthenticationService.authenticate_user() call).
         This is what obtains the JWT access/refresh tokens login()
@@ -653,6 +750,24 @@ class ClientSession(QObject):
                 f"Could not load or persist own Kyber keypair: {error}"
             )
 
+        try:
+            self.key_manager.load_or_create_signing_keypair(store)
+        except (ValueError, KeyStoreError, OSError) as error:
+            # Same "never fatal" posture as the Kyber keypair block
+            # above, kept in its own try/except so a failure in one
+            # keypair's persistence can never prevent the other's --
+            # the store itself did unlock, so it stays usable for
+            # conversation-key persistence below; only this session's
+            # own signing keypair fails to become persistent, and it
+            # keeps the ephemeral one __init__() already generated.
+            # ValueError is included alongside KeyStoreError/OSError
+            # because load_or_create_signing_keypair() raises plain
+            # ValueError (not KeyStoreError) for its own public/private
+            # consistency check -- see that method's docstring.
+            self.logger.warning(
+                f"Could not load or persist own signing keypair: {error}"
+            )
+
         count = self.key_manager.import_conversation_keys(restored)
 
         self.key_store = store
@@ -722,6 +837,10 @@ class ClientSession(QObject):
         # reasoning -- a pending new-key fingerprint has no meaning
         # once the key store it would be verified against is locked.
         self._pending_key_changed_fingerprints = {}
+
+        self._pending_key_changed_raw_keys = {}
+
+        self._pending_key_changed_signing_raw_keys = {}
 
     def login(self, username):
         """
@@ -901,16 +1020,40 @@ class ClientSession(QObject):
         Send this client's public key (Kyber or RSA,
         depending on config.KEY_EXCHANGE_ALGORITHM)
         to the server.
+
+        Protocol-Level ML-DSA Origin Authentication: also attaches this
+        client's persistent ML-DSA public key and an ML-DSA signature
+        over crypto/identity_protocol.py::canonical_identity_payload()
+        binding this exact (username, KEM public key, signing public
+        key) triple together. self.key_manager.ml_dsa is the SAME
+        persistent signer Phase (identity/key-persistence foundation)
+        already loads/persists through SecureKeyStore -- its private
+        key never leaves that in-memory object; sign_identity_payload()
+        only ever calls its .sign() method and returns signature bytes.
+        The KEM public key signed here is the exact wire string sent
+        below, not KeyManager's internal parsed form -- the same
+        representation handle_public_key() will reconstruct on the
+        receiving end.
         """
 
         algorithm = self.key_manager.algorithm
 
+        kem_public_key_wire = self.key_manager.public_key.decode("utf-8")
+        signing_public_key = self.key_manager.ml_dsa.export_public_key()
+
+        signature = sign_identity_payload(
+            self.key_manager.ml_dsa,
+            self.username,
+            kem_public_key_wire,
+            signing_public_key,
+        )
+
         public_key_packet = create_public_key_packet(
             username=self.username,
             algorithm=algorithm,
-            public_key=self.key_manager.public_key.decode(
-                "utf-8"
-            )
+            public_key=kem_public_key_wire,
+            signing_public_key=base64.b64encode(signing_public_key).decode("ascii"),
+            identity_signature=base64.b64encode(signature).decode("ascii"),
         )
 
         send_message(
@@ -919,7 +1062,7 @@ class ClientSession(QObject):
         )
 
         self.logger.info(
-            f"{algorithm} public key sent to server."
+            f"{algorithm} public key sent to server (ML-DSA signed)."
         )
 
     def start_receiver(self):
@@ -990,50 +1133,91 @@ class ClientSession(QObject):
 
     def establish_session_key(self):
         """
-        Generate and exchange an AES session key with the currently
-        selected direct partner, using whichever algorithm is active
-        (Kyber encapsulation or RSA encryption).
+        Generate, and -- when currently possible -- deliver, an AES
+        session key for the currently selected direct partner (BUG --
+        Offline First Contact).
 
-        The wire packet is unchanged -- still addressed by
-        ``receiver`` (username), since direct routing stays
-        username-based (Phase 1's approved scope decision). Only
-        where the resulting key is stored changes (Phase 5): under
-        ``self.current_conversation_id`` -- the real conversation_id,
-        already resolved by set_current_chat() via ConversationStore,
-        never looked up here.
+        The AES key is now ALWAYS generated locally first, via
+        os.urandom(32), independent of the recipient's Kyber/RSA
+        public key and of which algorithm is active. This is required
+        because ML-KEM (Kyber) is a KEM, not a public-key encryption
+        scheme: encapsulate() always derives its OWN fresh shared
+        secret from the recipient's public key (see crypto/kyber.py)
+        -- there is no operation that encrypts a caller-chosen 32
+        bytes. A key that must exist before the recipient's public key
+        is known -- e.g. the very first message to someone who has
+        never connected while this client was online -- can therefore
+        only ever come from independent generation, never from Kyber
+        encapsulation itself.
 
-        Key-desynchronization fix: every key established here is
-        stamped with a freshly RESERVED epoch (never an assumed
-        "epoch 1"), via the same current_key_epoch counter Phase 7
-        already uses for group-key rotation. D4.1 -- Message/History
-        Operations Migration: the reservation itself is now a server
-        request/response (epoch_reservation_request/result, via D1's
-        send_request()) rather than a direct, local
+        The key is stored (KeyManager.store_key(), under a freshly
+        RESERVED epoch, exactly as before) BEFORE any delivery is
+        attempted, so _send_encrypted_payload() can always encrypt and
+        persist a message immediately, regardless of whether the
+        recipient's public key has ever been seen. Previously this
+        method raised ValueError("No public key found for <user>")
+        at the point of generation itself, before any key existed to
+        encrypt with at all -- that was the root cause of a brand-new
+        conversation with a currently offline recipient being unusable.
+
+        Delivery, when the recipient's public key IS available, is
+        algorithm-dependent:
+
+        KYBER now uses KeyManager.wrap_key_for_member() -- the same
+        KEM-then-DEM hybrid wrap already used for group key
+        distribution and for direct key redelivery (see
+        handle_direct_key_redelivery_required()) -- sent as a
+        group_key_distribution packet, instead of the old KEM-direct
+        encapsulate_session_key()/session_key-packet pair (which
+        cannot wrap this independently-generated key at all -- see
+        above). This is a deliberate unification, not a new
+        construction: wrap_key_for_member() already accepts an
+        arbitrary, caller-chosen key, so first establishment and later
+        redelivery of that exact same key now share one wire shape
+        and one server-side authorization path -- membership in
+        conversation_id, epoch bounded by the server-reserved counter
+        (server/client_handler.py::handle_group_key_distribution()) --
+        already proven safe and already exercised today for direct
+        redelivery.
+
+        RSA is UNCHANGED: encrypt_session_key() is true public-key
+        encryption, so it already wraps a caller-chosen key directly
+        -- it never had the Kyber problem above, since RSA-OAEP can
+        encrypt any 32 bytes handed to it, generated independently or
+        not. Its wire packet (session_key, algorithm="RSA") stays
+        exactly as it was; changing it was never necessary and would
+        only have broken existing protocol-shape coverage (see
+        tests/test_rsa_key_exchange_integration.py) for no benefit.
+
+        When the recipient's public key is NOT available, delivery is
+        simply deferred: no exception, no error packet, nothing sent.
+        The key already stored above is entirely sufficient for this
+        client's own outgoing messages. Getting the recipient a
+        wrapped copy is left to the existing membership/epoch-driven
+        recovery mechanism
+        (_ensure_group_keys_current_for_reconnecting_user() /
+        handle_direct_key_redelivery_required(), unchanged), which
+        already announces and redelivers exactly this epoch's key the
+        next time the recipient connects -- it has never required a
+        key to have been previously delivered, only that the epoch
+        exists on a persisted message.
+
+        Key-desynchronization fix (unchanged): every key established
+        here is stamped with a freshly RESERVED epoch (never an
+        assumed "epoch 1"), via the same current_key_epoch counter
+        Phase 7 already uses for group-key rotation. D4.1 -- Message/
+        History Operations Migration: the reservation itself is a
+        server request/response (epoch_reservation_request/result, via
+        D1's send_request()) rather than a direct, local
         ConversationRepository.reserve_next_epoch() call -- the server
-        reuses that exact same repository method unchanged, now behind
-        an authorization check (the caller must be a member of the
-        conversation) this direct-DB path never had. This is what
-        fixes the one-sided-restart bug: previously, a client
-        with no cached key always (re)established under the hardcoded
-        default epoch 1, which collided with -- and was silently
-        rejected by -- a still-connected partner who already had
-        epoch 1 cached (KeyManager.store_key() never overwrites an
-        existing epoch), leaving the two sides permanently talking
-        past each other. Reserving a genuinely new epoch every time
-        means the partner always receives it into a brand-new,
-        never-before-seen epoch slot -- no collision is possible, and
-        KeyManager's existing "current epoch is whichever is highest"
-        rule (already proven for groups) makes both sides converge on
-        it. A brand-new conversation "wastes" epoch 1 this way (its
-        first real key lands on epoch 2) -- a harmless, permanent
-        quirk, not a bug: epoch numbers only need to be unique and
-        monotonically increasing, never to start at exactly 1.
-
-        Reserving via the server-persisted counter (not a purely
-        local guess) is what makes this safe even when BOTH sides
-        have lost their cached key at once: the counter itself
-        survives any number of client restarts, so it can never
-        replay an epoch either side has already used.
+        reuses that exact same repository method unchanged, behind an
+        authorization check (the caller must be a member of the
+        conversation) this direct-DB path never had. Reserving via the
+        server-persisted counter (not a purely local guess) is what
+        keeps this safe even when BOTH sides have lost their cached
+        key at once: the counter itself survives any number of client
+        restarts, so it can never replay an epoch either side has
+        already used.
         """
 
         if self.current_chat is None:
@@ -1080,31 +1264,7 @@ class ClientSession(QObject):
 
         epoch = response.get("epoch")
 
-        algorithm = self.key_manager.algorithm
-
-        if algorithm == "KYBER":
-
-            # Kyber derives the shared secret and its
-            # encapsulation together -- there is no
-            # separate "generate then encrypt" step.
-            encrypted_key, session_key = (
-                self.key_manager.encapsulate_session_key(
-                    receiver
-                )
-            )
-
-        else:
-
-            session_key = os.urandom(32)
-
-            encrypted_key = self.key_manager.encrypt_session_key(
-                receiver,
-                session_key
-            )
-
-            encrypted_key = base64.b64encode(
-                encrypted_key
-            ).decode("utf-8")
+        session_key = os.urandom(32)
 
         self.key_manager.store_key(
             conversation_id,
@@ -1113,22 +1273,136 @@ class ClientSession(QObject):
         )
 
         self.logger.info(
-            f"Generated AES session key for {receiver} "
-            f"({algorithm}, epoch {epoch})"
+            f"Generated AES session key for {receiver} (epoch {epoch})"
         )
 
-        packet = create_session_key_packet(
-            sender=self.username,
-            receiver=receiver,
-            algorithm=algorithm,
-            encrypted_key=encrypted_key,
-            epoch=epoch
-        )
+        if self.key_manager.get_public_key(receiver) is None:
 
-        send_message(
-            self.client_socket,
-            packet
-        )
+            # BUG -- Offline First Contact: nothing to deliver to yet.
+            # The key above is already stored and already usable for
+            # this client's own outgoing messages; delivery to
+            # receiver happens later via the existing recovery path
+            # (see docstring) once they connect and the server
+            # observes their membership + this epoch's persisted
+            # message.
+            self.logger.info(
+                f"Deferring key delivery to {receiver} for "
+                f"{conversation_id} epoch {epoch}: no public key "
+                f"available yet."
+            )
+
+            return
+
+        algorithm = self.key_manager.algorithm
+
+        if algorithm == "KYBER":
+
+            try:
+                encapsulation, wrapped_key = self.key_manager.wrap_key_for_member(
+                    receiver, session_key
+                )
+            except (ValueError, TypeError) as wrap_error:
+
+                # Narrow, and the only expected failure: the public
+                # key just checked as present turns out to be unusable
+                # to wrap_key_for_member() (e.g. a race with it being
+                # replaced). Not fatal -- the key is already stored,
+                # so delivery simply falls back to the same recovery
+                # path used when no public key was available at all.
+                self.logger.warning(
+                    f"Could not wrap session key for {receiver} "
+                    f"({conversation_id} epoch {epoch}): {wrap_error}"
+                )
+
+                return
+
+            # Group-Key-Distribution ML-DSA Origin Authentication:
+            # this "group_key_distribution" packet also carries a
+            # direct conversation's initial session key (see this
+            # method's own docstring/module history) -- signed exactly
+            # like a genuine group delivery, since handle_group_key_
+            # distribution() on the receiving end is the SAME handler
+            # either way and now requires a valid signature from a
+            # VERIFIED sender unconditionally.
+            group_key_signature = sign_group_key_payload(
+                self.key_manager.ml_dsa,
+                self.username,
+                conversation_id,
+                receiver,
+                encapsulation,
+                wrapped_key,
+                epoch,
+            )
+
+            send_message(
+                self.client_socket,
+                create_group_key_distribution_packet(
+                    sender=self.username,
+                    conversation_id=conversation_id,
+                    recipient=receiver,
+                    encapsulation=encapsulation,
+                    wrapped_key=wrapped_key,
+                    epoch=epoch,
+                    group_key_signature=base64.b64encode(group_key_signature).decode("ascii"),
+                ),
+            )
+
+        else:
+
+            # RSA: unchanged wrapping (see docstring); wire construction
+            # now also carries an ML-DSA signature -- RSA Direct-
+            # Session-Key ML-DSA Origin Authentication (Phase 13.6).
+            try:
+                encrypted_key = self.key_manager.encrypt_session_key(
+                    receiver,
+                    session_key
+                )
+            except ValueError as wrap_error:
+
+                self.logger.warning(
+                    f"Could not wrap session key for {receiver} "
+                    f"({conversation_id} epoch {epoch}): {wrap_error}"
+                )
+
+                return
+
+            encrypted_key = base64.b64encode(
+                encrypted_key
+            ).decode("utf-8")
+
+            # RSA Direct-Session-Key ML-DSA Origin Authentication
+            # (Phase 13.6): signed with this client's own persistent
+            # ML-DSA signer (the same one already used for identity
+            # announcements, messages, and group-key distribution)
+            # over the canonical envelope crypto/session_key_protocol.py
+            # defines -- AFTER encryption already produced
+            # encrypted_key, and BEFORE the packet is ever sent. The
+            # private key never leaves self.key_manager.ml_dsa; only
+            # the resulting signature bytes are put on the wire.
+            session_key_signature = sign_rsa_session_key_payload(
+                self.key_manager.ml_dsa,
+                self.username,
+                receiver,
+                conversation_id,
+                algorithm,
+                encrypted_key,
+                epoch,
+            )
+
+            send_message(
+                self.client_socket,
+                create_session_key_packet(
+                    sender=self.username,
+                    receiver=receiver,
+                    algorithm=algorithm,
+                    encrypted_key=encrypted_key,
+                    epoch=epoch,
+                    conversation_id=conversation_id,
+                    session_key_signature=base64.b64encode(
+                        session_key_signature
+                    ).decode("ascii"),
+                ),
+            )
 
         self.logger.info(
             f"Secure session established with {receiver}"
@@ -1263,6 +1537,31 @@ class ClientSession(QObject):
         # between that could change it.
         epoch = self.key_manager.current_epoch(self.current_conversation_id) or 1
 
+        # Message-Level ML-DSA Origin Authentication: signed with this
+        # client's own persistent ML-DSA signer (the same one Phase 11
+        # already uses for the identity-announcement packet) over the
+        # canonical envelope crypto/message_protocol.py defines --
+        # AFTER encryption already produced envelope.ciphertext, and
+        # BEFORE the packet is ever sent. The private key never leaves
+        # self.key_manager.ml_dsa; only the resulting signature bytes
+        # are put on the wire. receiver/conversation_id are passed
+        # exactly as they will appear on the packet below -- whichever
+        # one is None here is also None there, so the receiver
+        # reconstructs the identical canonical payload.
+        receiver = self.current_chat if not self.current_chat_is_group else None
+        conversation_id = self.current_chat if self.current_chat_is_group else None
+
+        message_signature = sign_message_payload(
+            self.key_manager.ml_dsa,
+            self.username,
+            receiver,
+            conversation_id,
+            envelope.payload_type,
+            envelope.ciphertext,
+            envelope.content_metadata,
+            epoch,
+        )
+
         if self.current_chat_is_group:
 
             packet = create_payload_packet(
@@ -1271,6 +1570,7 @@ class ClientSession(QObject):
                 timestamp=sent_at.isoformat(),
                 conversation_id=self.current_chat,
                 epoch=epoch,
+                message_signature=base64.b64encode(message_signature).decode("ascii"),
             )
 
         else:
@@ -1281,6 +1581,7 @@ class ClientSession(QObject):
                 timestamp=sent_at.isoformat(),
                 receiver=self.current_chat,
                 epoch=epoch,
+                message_signature=base64.b64encode(message_signature).decode("ascii"),
             )
 
         send_message(
@@ -1302,6 +1603,12 @@ class ClientSession(QObject):
                 if self.current_chat_is_group
                 else self.current_chat in self.online_users
             ),
+            # This is the first time ConversationStore may ever learn
+            # of a fresh direct conversation -- set_current_chat()
+            # deliberately left it uncached (see
+            # _resolve_direct_conversation_id()'s docstring). Ignored
+            # by record_message() if an entry already exists.
+            conversation_id=self.current_conversation_id,
         )
 
     def _decrypt_history_message(self, conversation_id, ciphertext, epoch=1):
@@ -1391,11 +1698,21 @@ class ClientSession(QObject):
             if response.get("error"):
                 return None
 
+            fetched_ciphertext = response.get("ciphertext")
+
+            # Message-Level ML-DSA Origin Authentication: verified here,
+            # now that the real ciphertext is finally available (it was
+            # never inline in ``message`` -- see load_conversation_
+            # history()'s own comment on why blob-stored payload types
+            # are verified in this method instead of there).
+            if not self._verify_history_message_signature(message, fetched_ciphertext):
+                return None
+
             payload_type = message.get("payload_type") or PayloadType.TEXT
 
             envelope = PayloadEnvelope(
                 payload_type=payload_type,
-                ciphertext=response.get("ciphertext"),
+                ciphertext=fetched_ciphertext,
                 content_metadata=message.get("content_metadata") or {},
             )
 
@@ -1469,18 +1786,35 @@ class ClientSession(QObject):
             payload_type = entry.get("payload_type") or PayloadType.TEXT
             epoch = entry.get("epoch") or 1
 
-            # Phase 8 -- File & Image Transfer: TEXT keeps using the
-            # existing inline-ciphertext path unchanged; a blob-stored
-            # payload_type (BLOB_STORAGE_PAYLOAD_TYPES) fetches its
-            # ciphertext lazily via _load_blob_history_content()
-            # instead -- entry["ciphertext"] is None for those rows
-            # (see handle_message_history_request()), so it must
-            # never be passed to _decrypt_history_message() for them.
+            # Message-Level ML-DSA Origin Authentication: verified
+            # BEFORE any decryption is attempted, for own messages and
+            # received ones alike -- a signature is exactly as required
+            # for offline/persisted history as it is on the live "chat"
+            # packet (see _verify_chat_message_signature()'s docstring
+            # for the shared trust-boundary rationale). A message that
+            # fails verification is never decrypted -- it is reported
+            # exactly like an undecryptable one, never distinguished in
+            # a way that would let a forged entry be told apart from a
+            # genuinely-lost key by anything reading this method's
+            # return value.
+            #
+            # Phase 8 -- File & Image Transfer: TEXT's ciphertext is
+            # inline in ``entry`` (verified here, directly); a blob-
+            # stored payload_type's ciphertext is NOT (entry["ciphertext"]
+            # is None -- see handle_message_history_request()) -- it is
+            # fetched lazily, on demand, by _load_blob_history_content(),
+            # which is where THAT ciphertext's signature is verified
+            # instead (the exact bytes to verify do not exist here yet).
             if payload_type in BLOB_STORAGE_PAYLOAD_TYPES:
                 text = None
                 content = self._load_blob_history_content(
                     self.current_conversation_id, entry, epoch
                 )
+            elif not self._verify_history_message_signature(
+                entry, entry.get("ciphertext")
+            ):
+                text = _UNDECRYPTABLE_PLACEHOLDER
+                content = None
             else:
                 text = self._decrypt_history_message(
                     self.current_conversation_id,
@@ -1678,6 +2012,17 @@ class ClientSession(QObject):
 
         Reuses the existing best-effort decrypt helper
         (_decrypt_history_message) -- no new cryptography.
+
+        Also seeds unread_counts from each conversation's server-
+        reported unread_count (BUG -- Offline Unread/Notification),
+        via set_unread_count() -- an absolute value, never
+        increment_unread(), which remains exclusively for a live
+        message arriving after this point. This is what makes a
+        conversation's unread state correct the moment a user logs
+        in, including for messages that arrived entirely while they
+        were offline: previously unread_counts started empty here and
+        was populated only by live arrivals, so nothing sent while
+        this client was disconnected ever showed as unread.
         """
 
         response = self.send_request(create_conversation_list_request_packet())
@@ -1714,6 +2059,14 @@ class ClientSession(QObject):
                     )
                 )
 
+                # BUG -- Offline Unread/Notification: seed the count
+                # from the server's authoritative value, not the
+                # live-arrival-only increment_unread() path -- see
+                # set_unread_count()'s docstring.
+                self.set_unread_count(
+                    conversation_id, conversation.get("unread_count") or 0
+                )
+
                 continue
 
             participants = conversation.get("participants") or []
@@ -1740,6 +2093,12 @@ class ClientSession(QObject):
                     is_online=partner_username in self.online_users,
                     latest_message=latest_message,
                 )
+            )
+
+            # BUG -- Offline Unread/Notification: see the identical
+            # call in the group branch above.
+            self.set_unread_count(
+                partner_username, conversation.get("unread_count") or 0
             )
 
         self.conversation_store.set_initial(summaries)
@@ -1887,11 +2246,11 @@ class ClientSession(QObject):
             f"{username} joined"
         )
 
-        self.message_received.emit(
-            "system",
-            "system",
-            f"{username} joined the chat."
-        )
+        # UI Finalization Decision (internal message cleanup): this is
+        # connection/presence state, not a user-authored message -- it
+        # no longer surfaces as a chat bubble. Still fully logged
+        # above for debugging; nothing about join handling itself
+        # changed.
 
     # ----------------------------------------------------------
 
@@ -1903,11 +2262,9 @@ class ClientSession(QObject):
             f"{username} left"
         )
 
-        self.message_received.emit(
-            "system",
-            "system",
-            f"{username} left the chat."
-        )
+        # UI Finalization Decision (internal message cleanup): see
+        # handle_join()'s identical note -- presence state, logged,
+        # not shown as a chat bubble.
 
     # ----------------------------------------------------------
 
@@ -1963,6 +2320,17 @@ class ClientSession(QObject):
         """
 
         sender = packet["sender"]
+
+        # Message-Level ML-DSA Origin Authentication: verified FIRST,
+        # from the packet's own raw fields, before anything else in
+        # this method runs -- no conversation-store caching, no
+        # session-key lookup, no decryption. See _verify_chat_message_
+        # signature()'s own docstring for the full trust-boundary
+        # rationale (in particular: the verification key is resolved
+        # from THIS receiver's own peer-identity state, never from
+        # anything inside the packet).
+        if not self._verify_chat_message_signature(packet):
+            return
 
         conversation_id = packet.get("conversation_id")
 
@@ -2096,6 +2464,235 @@ class ClientSession(QObject):
             decrypted_content,
             envelope.content_metadata,
         )
+
+    def _resolve_trusted_signing_key(self, username):
+        """
+        Returns the raw ML-DSA public-key bytes this RECEIVER currently
+        trusts/observes for ``username``, or None if nothing is known
+        yet -- the CRITICAL TRUST RULE for message authentication (see
+        crypto/message_protocol.py's own docstring): the verification
+        key always comes from THIS session's own peer-identity state
+        (populated exclusively by _handle_signed_public_key(), which
+        already required an ML-DSA signature to accept it in the first
+        place -- Phase 11/12A), never from anything inside the message
+        packet being verified. A message packet carries no signing-key
+        field at all for a malicious sender to substitute one into.
+
+        Same pending-first precedence as _currently_observed_peer_
+        identity()'s signing half: if this peer currently has a
+        pending KEY_CHANGED, that (new, disputed) key is what a
+        message claiming to be from them right now must verify under
+        -- never a stale, no-longer-current key left over from before
+        the change.
+
+        Falls back to SecureKeyStore.get_peer_signing_public_key() when
+        the session-local cache has nothing: that cache is populated
+        only by a live signed public-key packet actually arriving this
+        session, which never happens for a peer who is not currently
+        online (e.g. right after THIS session's own restart, before
+        they reconnect) -- without this fallback, offline/history
+        verification of an already-legitimately-observed-or-VERIFIED
+        peer's past messages would be permanently impossible after
+        every restart. A pending KEY_CHANGED is deliberately NOT
+        persisted (see _flag_peer_identity_changed()) and so is never
+        found here -- only the still-trusted, previously-recorded key
+        is.
+        """
+
+        if username in self._pending_key_changed_signing_raw_keys:
+            return self._pending_key_changed_signing_raw_keys[username]
+
+        cached = self._observed_peer_signing_public_keys.get(username)
+
+        if cached is not None:
+            return cached
+
+        if self.key_store is None:
+            return None
+
+        return self.key_store.get_peer_signing_public_key(username)
+
+    def _verify_chat_message_signature(self, packet):
+        """
+        Message-Level ML-DSA Origin Authentication: verifies that
+        ``packet`` (a "chat" packet -- direct or group) was genuinely
+        produced by whoever this receiver currently trusts/observes as
+        holding ``packet["sender"]``'s ML-DSA private key. Called FIRST
+        by handle_chat(), before any decryption, display, storage, or
+        conversation-store side effect.
+
+        There is no legacy unsigned message path (unlike the identity-
+        announcement packet's deliberately-preserved defense-in-depth
+        legacy branch, see client/session.py::handle_public_key()'s own
+        docstring): a message packet never establishes trust the way an
+        identity packet's mismatch-detection does, so an unsigned one
+        has no legitimate function to preserve. A missing or malformed
+        message_signature, an unresolvable verification key (this
+        receiver has never observed ANY ML-DSA identity for this
+        sender), or a signature that simply does not verify are all
+        rejected identically: the message is dropped, logged, and
+        never reaches decryption -- fail closed, never fatal to the
+        receiver thread.
+
+        Reconstructs the canonical payload from the packet's OWN raw
+        "receiver"/"conversation_id" fields (not the locally-resolved
+        identity_key/key_conversation_id computed later in handle_
+        chat() -- those incorporate server-added bookkeeping like
+        direct_conversation_id that the sender never signed over).
+
+        Returns True only if the signature verified successfully.
+        """
+
+        sender = packet["sender"]
+
+        signature_b64 = packet.get("message_signature")
+
+        if signature_b64 is None:
+            self.logger.warning(
+                f"SECURITY: rejected unsigned chat message claiming to "
+                f"be from {sender}; ML-DSA message signature is "
+                f"required."
+            )
+            return False
+
+        signing_public_key = self._resolve_trusted_signing_key(sender)
+
+        if signing_public_key is None:
+            self.logger.warning(
+                f"SECURITY: rejected chat message from {sender}: no "
+                f"ML-DSA identity has ever been observed for them; "
+                f"cannot verify origin."
+            )
+            return False
+
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+
+            verified = verify_message_payload(
+                sender,
+                packet.get("receiver"),
+                packet.get("conversation_id"),
+                packet.get("payload_type") or PayloadType.TEXT,
+                packet.get("message"),
+                packet.get("content_metadata"),
+                packet.get("epoch"),
+                signature,
+                signing_public_key,
+            )
+
+        except (TypeError, ValueError) as error:
+            # Malformed base64, wrong-length signature/key, or a
+            # structurally invalid field -- a data error describing
+            # untrusted network input, never a bug in this codebase
+            # (mirrors crypto/identity_protocol.py's own established
+            # convention). Rejected the same way an outright invalid
+            # signature is below.
+            self.logger.warning(
+                f"SECURITY: rejected malformed signed chat message "
+                f"from {sender}: {error}"
+            )
+            return False
+
+        if not verified:
+            self.logger.warning(
+                f"SECURITY: ML-DSA signature verification FAILED for "
+                f"a chat message claiming to be from {sender}; "
+                f"rejecting -- message not decrypted, displayed, or "
+                f"stored."
+            )
+            return False
+
+        return True
+
+    def _verify_history_message_signature(self, entry, ciphertext):
+        """
+        The offline/persisted-history counterpart of
+        _verify_chat_message_signature() -- verifies one
+        load_conversation_history() entry (as returned by server/
+        client_handler.py::handle_message_history_request(), which now
+        carries message_signature/receiver/conversation_id alongside
+        every stored message -- see that function's own comment)
+        against the SAME canonical construction the original sender
+        signed at send time. Proves the signature "traveled with the
+        authenticated message data" through offline storage and later
+        delivery, exactly as required: the server only ever stores and
+        relays this column unchanged, never inspecting or needing the
+        private key that produced it.
+
+        ``ciphertext`` is passed explicitly rather than read from
+        ``entry["ciphertext"]`` because that field is None for a
+        blob-stored payload type (Option A -- lazy blob delivery) --
+        the caller (_load_blob_history_content()) only has the real
+        ciphertext bytes after its own fetch, and passes those in.
+
+        Own messages (entry["is_own"] is True) are a special case:
+        this session never "observes" its OWN ML-DSA identity the way
+        it observes a peer's (there is no incoming public-key packet
+        for oneself), so the verification key here is this session's
+        own persistent self.key_manager.ml_dsa public key instead of a
+        peer-resolved one -- otherwise every message this user ever
+        sent would fail its own signature check the moment it was
+        loaded back from history, which would be a bug, not security.
+
+        Returns True only if the signature verified successfully.
+        """
+
+        sender = entry.get("sender")
+
+        signature_b64 = entry.get("message_signature")
+
+        if signature_b64 is None:
+            self.logger.warning(
+                f"SECURITY: rejected unsigned historical message "
+                f"claiming to be from {sender}; ML-DSA message "
+                f"signature is required."
+            )
+            return False
+
+        if entry.get("is_own"):
+            signing_public_key = self.key_manager.ml_dsa.export_public_key()
+        else:
+            signing_public_key = self._resolve_trusted_signing_key(sender)
+
+        if signing_public_key is None:
+            self.logger.warning(
+                f"SECURITY: rejected historical message from {sender}: "
+                f"no ML-DSA identity has ever been observed for them; "
+                f"cannot verify origin."
+            )
+            return False
+
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+
+            verified = verify_message_payload(
+                sender,
+                entry.get("receiver"),
+                entry.get("conversation_id"),
+                entry.get("payload_type") or PayloadType.TEXT,
+                ciphertext,
+                entry.get("content_metadata"),
+                entry.get("epoch"),
+                signature,
+                signing_public_key,
+            )
+
+        except (TypeError, ValueError) as error:
+            self.logger.warning(
+                f"SECURITY: rejected malformed signed historical "
+                f"message from {sender}: {error}"
+            )
+            return False
+
+        if not verified:
+            self.logger.warning(
+                f"SECURITY: ML-DSA signature verification FAILED for "
+                f"a historical message claiming to be from {sender}; "
+                f"rejecting -- message not decrypted or displayed."
+            )
+            return False
+
+        return True
 
     # ----------------------------------------------------------
 
@@ -2300,6 +2897,20 @@ class ClientSession(QObject):
 
             return
 
+        # Group-Key-Distribution ML-DSA Origin Authentication: signed
+        # for the same reason as establish_session_key()'s identical
+        # call -- this redelivery goes through the exact same
+        # handle_group_key_distribution() on the receiving end.
+        group_key_signature = sign_group_key_payload(
+            self.key_manager.ml_dsa,
+            self.username,
+            conversation_id,
+            recipient,
+            encapsulation,
+            wrapped_key,
+            epoch,
+        )
+
         send_message(
             self.client_socket,
             create_group_key_distribution_packet(
@@ -2309,6 +2920,7 @@ class ClientSession(QObject):
                 encapsulation=encapsulation,
                 wrapped_key=wrapped_key,
                 epoch=epoch,
+                group_key_signature=base64.b64encode(group_key_signature).decode("ascii"),
             ),
         )
 
@@ -2363,11 +2975,55 @@ class ClientSession(QObject):
         establish_session_key(), wrap_key_for_member(), and every
         reconnect/key-recovery caller that later reads KeyManager.
         get_public_key() -- none of which needed to change themselves.
+
+        Protocol-Level ML-DSA Origin Authentication: a packet carrying
+        "signing_public_key" is the AUTHENTICATED identity format --
+        routed entirely to _handle_signed_public_key() instead, which
+        requires a valid ML-DSA signature before anything below this
+        point ever runs. This branch is checked FIRST, before any of
+        the legacy logic below, so a packet that declares itself
+        authenticated can never fall back to the unsigned path (that
+        would let an attacker strip the signature to downgrade a
+        packet into the weaker legacy trust level).
+
+        Phase 12A security audit (downgrade attack): a packet with NO
+        "signing_public_key" at all is no longer trusted to establish
+        OR update ANY identity that is not already VERIFIED. Before
+        this audit, an unsigned packet with no existing record at all
+        (true first contact) was silently ACCEPTED and installed as a
+        new UNVERIFIED observation -- exactly like every packet was
+        before Phase 11 ever existed. Since send_public_key() has
+        signed unconditionally since Phase 11, no legitimate client
+        ever produces an unsigned packet any more; a malicious relay
+        could therefore trivially neutralize 100% of Phase 11's
+        protection for any never-before-seen peer simply by never
+        including the two new fields -- an attacker who controls the
+        server (this project's entire threat model) is never forced to
+        prove ML-DSA possession at all, defeating the stated purpose of
+        Phase 11 outright. See this phase's audit report for the full
+        traced control flow.
+
+        The fix: an unsigned packet may now ONLY ever be evaluated as a
+        potential mismatch against an EXISTING VERIFIED record (still
+        valuable defense-in-depth -- see _is_verified_key_mismatch()/
+        _flag_peer_key_changed() below, unchanged) or silently ignored
+        as a genuine no-op when it happens to match an existing record
+        exactly (nothing to protect, nothing gained by rejecting a
+        pointless re-observation). It can never again create a new
+        peer-identity record, and can never again update an existing
+        UNVERIFIED one -- both of those require cryptographic proof of
+        ML-DSA possession now, i.e. going through
+        _handle_signed_public_key() instead. Every legitimate
+        production flow already satisfies this (send_public_key()
+        always signs); only hand-crafted attack-simulation packets in
+        this test suite ever construct an unsigned one on purpose.
         """
 
-        username = packet["username"]
+        if "signing_public_key" in packet:
+            self._handle_signed_public_key(packet)
+            return
 
-        algorithm = packet["algorithm"]
+        username = packet["username"]
 
         public_key = packet["public_key"]
 
@@ -2378,41 +3034,152 @@ class ClientSession(QObject):
             # imported or cached, so the trusted key already in
             # KeyManager.public_keys[username] (if any) remains in
             # effect for every cryptographic operation that reads it.
-            self._flag_peer_key_changed(
-                username, fingerprint_public_key(public_key)
+            self._flag_peer_key_changed(username, public_key)
+
+            return
+
+        self.logger.warning(
+            f"SECURITY: rejected unsigned public-key packet for "
+            f"{username}; ML-DSA-signed identity is required to "
+            f"establish or update peer identity state. If this "
+            f"disagrees with an already-cached key, nothing changed; "
+            f"if this is a genuinely new peer, their key was not "
+            f"installed."
+        )
+
+    def _handle_signed_public_key(self, packet):
+        """
+        The AUTHENTICATED counterpart of handle_public_key()'s legacy
+        branch (Protocol-Level ML-DSA Origin Authentication) -- handles
+        a public-key packet that advertises a "signing_public_key". A
+        valid ML-DSA signature is mandatory for every packet reaching
+        this method: handle_public_key() only routes here when that
+        field is present, and once here, ANY failure (missing
+        signature, malformed base64/key/signature, or a well-formed
+        signature that simply does not verify) rejects the ENTIRE
+        packet -- the KEM key is never installed into KeyManager, the
+        signing key is never treated as trusted, and no peer
+        fingerprint is recorded. There is deliberately no fallback to
+        the legacy unsigned path from here: a packet that already
+        declared itself authenticated by including a signing key must
+        prove it, never quietly degrade to weaker trust.
+
+        Verification happens BEFORE anything else -- before the
+        combined-identity state machine and before KeyManager.
+        add_public_key() -- so an invalid signature can never insert
+        attacker-controlled key material into either.
+
+        A signature verifying successfully proves only that whoever
+        sent this packet controls the private key matching the
+        advertised ML-DSA public key -- it does NOT establish that this
+        is the claimed human peer (see crypto/identity_protocol.py's
+        module docstring). That determination is entirely the combined-
+        identity state machine's job (_is_verified_identity_mismatch()/
+        _flag_peer_identity_changed()/_record_peer_identity_observation(),
+        the same building blocks observe_peer_identity() itself is
+        built from -- called directly here, rather than through that
+        wrapper, purely to interleave KeyManager.add_public_key() at
+        the same point in the sequence handle_public_key()'s legacy
+        branch already uses, so state and installed key are never
+        observably out of step). Unchanged from the identity/key-
+        persistence foundation phase: first contact still becomes
+        UNVERIFIED, not VERIFIED; a mismatch against an existing
+        VERIFIED identity still becomes KEY_CHANGED, never silently
+        replacing the trusted record. This method only decides whether
+        the packet is authentic enough to be WORTH handing to that
+        state machine at all.
+        """
+
+        username = packet["username"]
+        algorithm = packet["algorithm"]
+        kem_public_key = packet["public_key"]
+        signing_public_key_b64 = packet["signing_public_key"]
+        signature_b64 = packet.get("identity_signature")
+
+        try:
+            if signature_b64 is None:
+                raise ValueError("Missing identity_signature.")
+
+            signing_public_key = base64.b64decode(
+                signing_public_key_b64, validate=True
+            )
+            signature = base64.b64decode(signature_b64, validate=True)
+
+            verified = verify_identity_payload(
+                username, kem_public_key, signing_public_key, signature
             )
 
+        except (TypeError, ValueError) as error:
+            # Covers: missing/malformed base64, wrong-length signing
+            # key or signature, a structurally invalid ML-DSA public
+            # key -- every case verify_identity_payload()/
+            # MLDSASigner.verify() document as a data error rather than
+            # "the signature was merely wrong" (base64.b64decode's
+            # binascii.Error is itself a ValueError subclass). Any of
+            # these means the packet cannot even be evaluated as a
+            # signature, let alone trusted -- rejected the same way an
+            # outright invalid signature is below.
+            self.logger.warning(
+                f"SECURITY: rejected malformed signed identity packet "
+                f"for {username}: {error}"
+            )
+            return
+
+        if not verified:
+            self.logger.warning(
+                f"SECURITY: ML-DSA signature verification FAILED for "
+                f"identity packet from {username}; rejecting -- no key "
+                f"material installed."
+            )
+            return
+
+        # Signature verified: this packet genuinely originated from
+        # whoever controls signing_public_key's private key. From here
+        # the ordering deliberately mirrors handle_public_key()'s
+        # legacy branch exactly -- fail-closed mismatch check (a pure
+        # predicate, no state mutated yet) FIRST, then KeyManager
+        # installation, then peer-identity-state recording LAST -- so
+        # that by the time any caller can observe
+        # get_peer_verification_state() reflecting this packet,
+        # KeyManager.get_public_key() is already usable too (the two
+        # were previously updated in the opposite order, which raced:
+        # a caller polling for the state to become UNVERIFIED could
+        # observe it before the KEM key was actually installed).
+        if self._is_verified_identity_mismatch(
+            username, kem_public_key, signing_public_key
+        ):
+            # Fail closed: KeyManager.add_public_key() below is skipped
+            # entirely -- the substituted identity is never imported or
+            # cached, so the trusted key already in KeyManager.
+            # public_keys[username] (if any) remains in effect.
+            self._flag_peer_identity_changed(
+                username, kem_public_key, signing_public_key
+            )
             return
 
         try:
-            self.key_manager.add_public_key(
-                username,
-                public_key
-            )
+            self.key_manager.add_public_key(username, kem_public_key)
         except (ValueError, TypeError) as error:
-
             self.logger.warning(
                 f"Rejected malformed {algorithm} public key from "
-                f"{username}: {error}"
+                f"{username} after signature verification: {error}"
             )
-
             return
 
         self.logger.info(
-            f"Stored {algorithm} public key for {username}"
+            f"Stored ML-DSA-authenticated {algorithm} public key for "
+            f"{username}"
         )
 
-        self.message_received.emit(
-            "system",
-            "system",
-            f"Received {algorithm} public key from {username}."
+        # Route through the SAME combined-identity state machine the
+        # identity/key-persistence foundation phase already built and
+        # tested (tests/test_peer_identity_state_transitions.py) --
+        # records the observation as UNVERIFIED (or a no-op if already
+        # VERIFIED with matching keys); never promotes to VERIFIED.
+        self._record_peer_identity_observation(
+            username, kem_public_key, signing_public_key
         )
 
-        self._record_peer_key_observation(username, public_key)
-
-        # BUG -- Public-Key Availability: emitted only after the key
-        # actually validated and was stored above -- never for a
-        # rejected/malformed one (that branch already returned).
         self.public_key_received.emit(username)
 
     def _is_verified_key_mismatch(self, username, raw_public_key):
@@ -2455,7 +3222,7 @@ class ClientSession(QObject):
 
         return entry["fingerprint"] != fingerprint_public_key(raw_public_key)
 
-    def _flag_peer_key_changed(self, username, new_fingerprint):
+    def _flag_peer_key_changed(self, username, raw_public_key):
         """
         Record, session-locally only, that the most recently OBSERVED
         key for ``username`` disagreed with their VERIFIED fingerprint
@@ -2470,22 +3237,41 @@ class ClientSession(QObject):
         entirely; this method only ever records the fact and notifies,
         it never itself touches any key material.
 
-        ``new_fingerprint`` (Stage 3) is the REJECTED key's fingerprint
-        -- computed by the caller from the same raw wire bytes
-        _is_verified_key_mismatch() just compared, before this method
-        is called. Kept only in _pending_key_changed_fingerprints
-        (session-local, same lifetime as _peer_keys_changed) so a
-        verification dialog has something to show the user: the
-        rejected key itself was never imported or cached anywhere, so
-        this is the only place its fingerprint can still be read from
-        for the user to compare and, if they confirm it, re-verify
-        against (see get_peer_fingerprint_for_verification()/
-        confirm_peer_verification()).
+        ``raw_public_key`` is the REJECTED key's raw wire bytes -- the
+        same value _is_verified_key_mismatch() just compared, before
+        this method is called. Kept in _pending_key_changed_raw_keys
+        (session-local, same lifetime as _peer_keys_changed), and its
+        fingerprint additionally cached in
+        _pending_key_changed_fingerprints, so a verification dialog has
+        something to show the user: the rejected key itself was never
+        imported or cached anywhere else, so this is the only place it
+        (and its fingerprint) can still be read from -- for the user to
+        compare and, if they confirm it, re-verify against (see
+        get_peer_fingerprint_for_verification()/
+        confirm_peer_verification(), the latter of which independently
+        re-derives the fingerprint from _pending_key_changed_raw_keys
+        rather than trusting a caller-supplied string).
+
+        Protocol-Level ML-DSA Origin Authentication: also clears any
+        stale _pending_key_changed_signing_raw_keys entry for
+        ``username``. This flag describes a LEGACY (unsigned) packet's
+        disagreement -- it carries no signing key at all -- so a
+        signing key left over from an EARLIER, unrelated pending
+        combined-identity change must not linger and be mistaken by
+        confirm_peer_verification() for part of THIS pending change
+        (which would silently combine two unrelated observations into
+        one nonsensical fingerprint that could never be confirmed).
         """
 
         self._peer_keys_changed.add(username)
 
-        self._pending_key_changed_fingerprints[username] = new_fingerprint
+        self._pending_key_changed_fingerprints[username] = (
+            fingerprint_public_key(raw_public_key)
+        )
+
+        self._pending_key_changed_raw_keys[username] = raw_public_key
+
+        self._pending_key_changed_signing_raw_keys.pop(username, None)
 
         self.logger.warning(
             f"SECURITY: public key received for {username} does not "
@@ -2533,7 +3319,25 @@ class ClientSession(QObject):
         to set PEER_STATE_VERIFIED (see storage/secure_key_store.py).
         Nothing here ever promotes a key to VERIFIED; that remains
         exclusively a future, explicit user action.
+
+        Also unconditionally refreshes _observed_peer_raw_public_keys
+        (Server-Untrusted Identity Verification hardening) -- before
+        the key-store-availability check below, since which raw bytes
+        were actually observed is a pure in-memory fact, independent
+        of whether there happens to be a local key store to persist a
+        fingerprint into this session.
+
+        Protocol-Level ML-DSA Origin Authentication: also drops any
+        stale _observed_peer_signing_public_keys entry for ``username``.
+        This LEGACY observation carries no signing key at all, so a
+        signing key left over from an EARLIER, unrelated combined-
+        identity observation of this same username must not linger and
+        be mistaken by confirm_peer_verification() for part of THIS
+        (legacy, KEM-only) observation.
         """
+
+        self._observed_peer_raw_public_keys[username] = raw_public_key
+        self._observed_peer_signing_public_keys.pop(username, None)
 
         if self.key_store is None:
             return
@@ -2547,6 +3351,9 @@ class ClientSession(QObject):
         self._peer_keys_changed.discard(username)
 
         self._pending_key_changed_fingerprints.pop(username, None)
+
+        self._pending_key_changed_raw_keys.pop(username, None)
+        self._pending_key_changed_signing_raw_keys.pop(username, None)
 
     def get_peer_verification_state(self, username):
         """
@@ -2592,6 +3399,79 @@ class ClientSession(QObject):
 
         return self.get_peer_verification_state(username) == PEER_STATE_VERIFIED
 
+    def _sender_trust_rejection_reason(self, sender):
+        """
+        Phase 13.7: distinguishes WHY _peer_key_is_verified(sender)
+        returned False, using only state this receiver already has
+        locally -- no new lookup, no network round trip. Called only
+        after _peer_key_is_verified() itself has already returned
+        False; never promotes, demotes, or otherwise touches the
+        sender's trust state -- purely a read of
+        get_peer_verification_state()'s existing return value.
+
+        Returns SecurityRejectionReason.KEY_CHANGED if this receiver's
+        last observation of ``sender`` disagreed with a previously
+        VERIFIED identity (PEER_KEY_STATE_CHANGED); UNVERIFIED_SENDER
+        if ``sender`` has been observed but never explicitly VERIFIED;
+        UNKNOWN_SENDER if nothing has ever been recorded for
+        ``sender`` at all (state is None -- never observed, or no
+        local key store this session).
+        """
+
+        state = self.get_peer_verification_state(sender)
+
+        if state == PEER_KEY_STATE_CHANGED:
+            return SecurityRejectionReason.KEY_CHANGED
+
+        if state == PEER_STATE_UNVERIFIED:
+            return SecurityRejectionReason.UNVERIFIED_SENDER
+
+        return SecurityRejectionReason.UNKNOWN_SENDER
+
+    def _report_security_rejection(self, reason, sender, conversation_id):
+        """
+        Phase 13.7 -- Key-Establishment Rejection Observability &
+        State Integrity: the ONE place handle_group_key_distribution()
+        (KYBER/group-key) and handle_session_key() (RSA) report a
+        security rejection through, so both stay consistent and
+        neither hand-rolls its own logging/signal shape.
+
+        Logs a single WARNING line identifying the security event --
+        reason, claimed sender, conversation_id -- and nothing else.
+        Deliberately never logs: signatures, encrypted/wrapped key
+        material, decrypted session keys, ML-DSA or RSA private
+        material, passwords, or tokens (none of those are parameters
+        here at all, so there is nothing for a future call site to
+        accidentally pass through). ``sender``/``conversation_id`` are
+        untrusted, attacker-influenceable strings -- logged as an f-
+        string argument (not interpolated into a format string the
+        attacker controls), and never as raw packet bytes/base64
+        blobs, so there is no log-injection surface beyond what any
+        other username-bearing log line in this codebase already
+        accepts.
+
+        Emits security_rejection(reason, sender, conversation_id) --
+        the reason as its plain string value (SecurityRejectionReason
+        is a StrEnum), so a listener never needs to import this
+        module's enum just to compare against it. No GUI is connected
+        to this signal yet (Phase 14's job); this call is the entire
+        "GUI boundary" this phase exposes.
+
+        Never raises: a security rejection must never itself become a
+        new failure mode for the receiver thread.
+        """
+
+        self.logger.warning(
+            f"SECURITY: rejected key establishment ({reason}) for "
+            f"conversation {conversation_id}, claimed sender {sender}."
+        )
+
+        self.security_rejection.emit(
+            reason.value if isinstance(reason, SecurityRejectionReason) else str(reason),
+            sender or "",
+            conversation_id or "",
+        )
+
     def get_peer_fingerprint_for_verification(self, username):
         """
         Returns the fingerprint a verification dialog should display
@@ -2621,6 +3501,47 @@ class ClientSession(QObject):
 
         return entry["fingerprint"] if entry is not None else None
 
+    def _currently_observed_peer_public_key(self, username):
+        """
+        Returns the raw public-key bytes confirm_peer_verification()
+        must independently derive ``username``'s fingerprint from
+        right now (Server-Untrusted Identity Verification hardening)
+        -- the exact same key get_peer_fingerprint_for_verification()
+        already sources its displayed fingerprint from, so the two
+        always agree for the one legitimate caller
+        (VerifyIdentityDialog, which only ever displays a fingerprint
+        it got from that method and only ever confirms the exact same
+        value back).
+
+        For a pending PEER_KEY_STATE_CHANGED, this is the NEW
+        (rejected, never imported into KeyManager) key's raw bytes,
+        held in _pending_key_changed_raw_keys -- see
+        _flag_peer_key_changed(). Otherwise, it is whatever
+        _observed_peer_raw_public_keys currently holds for username --
+        the exact raw wire bytes of the key handle_public_key() last
+        legitimately imported, which is also what SecureKeyStore's own
+        observed/verified fingerprint was computed from at the time.
+
+        Deliberately NOT KeyManager.public_keys[username]: KeyManager
+        stores each algorithm's own parsed/decoded form (e.g. Kyber's
+        import_public_key() returns raw-decoded bytes, not the
+        original base64 wire value), which is a DIFFERENT byte
+        sequence than the raw wire value every other fingerprint in
+        this system is computed from -- fingerprinting that form here
+        would silently disagree with the fingerprint already on file
+        for the exact same logical key, breaking every legitimate
+        verification. _observed_peer_raw_public_keys exists
+        specifically to avoid that trap.
+
+        None if nothing has ever been observed for this peer at all --
+        there is nothing to verify against.
+        """
+
+        if username in self._pending_key_changed_raw_keys:
+            return self._pending_key_changed_raw_keys[username]
+
+        return self._observed_peer_raw_public_keys.get(username)
+
     def confirm_peer_verification(self, username, fingerprint):
         """
         The ONLY method the GUI should ever call to promote a peer to
@@ -2628,23 +3549,39 @@ class ClientSession(QObject):
         Stage 3) -- called ONLY after the user has explicitly
         confirmed, through their own independent out-of-band
         comparison, that ``fingerprint`` (as obtained from
-        get_peer_fingerprint_for_verification(), never re-derived or
-        guessed here) is correct. Never called automatically, never
-        called speculatively, never called on a dialog merely being
-        opened or cancelled.
+        get_peer_fingerprint_for_verification()) is correct. Never
+        called automatically, never called speculatively, never called
+        on a dialog merely being opened or cancelled.
+
+        Hardening: no longer a blind pass-through of ``fingerprint``.
+        Independently re-derives the fingerprint from
+        _currently_observed_peer_public_key(username) -- the actual,
+        currently cached (or pending KEY_CHANGED) raw key bytes -- and
+        refuses (PeerVerificationMismatchError) unless the supplied
+        ``fingerprint`` matches that independently-derived value
+        exactly, or there is no observed key to verify against at all.
+        This closes the gap where any caller-supplied string could
+        previously be accepted and persisted as VERIFIED regardless of
+        whether it corresponded to anything real: the value actually
+        persisted below is always the independently-derived one, never
+        the caller-supplied string itself. The legitimate caller
+        (VerifyIdentityDialog) is unaffected -- it only ever passes
+        back the exact value get_peer_fingerprint_for_verification()
+        handed it, which is already derived from the same observed key
+        this method re-derives from, so the two always agree.
 
         Wraps SecureKeyStore.verify_peer_fingerprint() -- the only
         method allowed to set PEER_STATE_VERIFIED, unchanged since
         Stage 1 -- and additionally clears this username's
         session-local PEER_KEY_STATE_CHANGED bookkeeping
-        (_peer_keys_changed/_pending_key_changed_fingerprints), which
-        verify_peer_fingerprint() itself has no reason to know about:
-        KEY_CHANGED is deliberately session-local (see
-        PEER_KEY_STATE_CHANGED's module docstring), so without this
-        second step get_peer_verification_state() would keep reporting
-        KEY_CHANGED for the rest of this session even after the store
-        underneath it correctly says VERIFIED -- it checks the
-        session-local flag first, by design (Stage 2).
+        (_peer_keys_changed/_pending_key_changed_fingerprints/
+        _pending_key_changed_raw_keys), which verify_peer_fingerprint()
+        itself has no reason to know about: KEY_CHANGED is deliberately
+        session-local (see PEER_KEY_STATE_CHANGED's module docstring),
+        so without this second step get_peer_verification_state() would
+        keep reporting KEY_CHANGED for the rest of this session even
+        after the store underneath it correctly says VERIFIED -- it
+        checks the session-local flag first, by design (Stage 2).
 
         Raises KeyStoreError if the local key store is unavailable
         this session -- there is nothing to persist the verification
@@ -2652,6 +3589,42 @@ class ClientSession(QObject):
         VERIFIED here mean something different than VERIFIED
         everywhere else this state is checked (all of which read
         SecureKeyStore).
+
+        Protocol-Level ML-DSA Origin Authentication: gui/verify_
+        identity_dialog.py calls only this ONE method (never
+        confirm_combined_peer_verification() directly), and this
+        phase's own send_public_key()/handle_public_key() wiring now
+        makes the COMBINED-identity path the default for every real
+        peer. Rather than changing the GUI's call site, this method
+        detects which convention applies to whatever is CURRENTLY being
+        confirmed for ``username`` and dispatches accordingly.
+
+        The check uses the same pending-first precedence
+        _currently_observed_peer_public_key() itself already uses --
+        deliberately NOT "was a signing key ever observed for this
+        username at any point" (that broader check is wrong: it would
+        also fire for a peer whose combined identity was flagged
+        KEY_CHANGED by a subsequent LEGACY, unsigned packet -- see
+        _flag_peer_key_changed()'s docstring -- where the CURRENT
+        pending change carries no signing key at all, even though an
+        OLDER, no-longer-current combined observation of this same
+        username still does):
+
+        * A pending KEY_CHANGED exists (username in
+          _pending_key_changed_raw_keys): dispatch is combined only if
+          THAT pending change itself included a signing key
+          (_pending_key_changed_signing_raw_keys) -- _flag_peer_key_
+          changed()/_flag_peer_identity_changed() each populate exactly
+          one of the two signing dicts for their own pending change,
+          never both.
+        * No pending change: dispatch is combined only if the peer's
+          currently ACTIVE (non-pending) observation included a signing
+          key (_observed_peer_signing_public_keys) --
+          _record_peer_key_observation()/_record_peer_identity_
+          observation() each keep exactly this invariant.
+
+        A peer only ever reached through the legacy unsigned path falls
+        through to the unchanged single-key logic below.
         """
 
         if self.key_store is None:
@@ -2660,11 +3633,311 @@ class ClientSession(QObject):
                 "verification cannot be saved."
             )
 
-        self.key_store.verify_peer_fingerprint(username, fingerprint)
+        if username in self._pending_key_changed_raw_keys:
+            use_combined = username in self._pending_key_changed_signing_raw_keys
+        else:
+            use_combined = username in self._observed_peer_signing_public_keys
+
+        if use_combined:
+            self.confirm_combined_peer_verification(username, fingerprint)
+            return
+
+        observed_key = self._currently_observed_peer_public_key(username)
+
+        if observed_key is None:
+            raise PeerVerificationMismatchError(
+                f"No observed public key for {username}; there is "
+                f"nothing to verify."
+            )
+
+        derived_fingerprint = fingerprint_public_key(observed_key)
+
+        if derived_fingerprint != fingerprint:
+            raise PeerVerificationMismatchError(
+                "The supplied fingerprint does not match the "
+                "currently observed public key; verification was "
+                "refused."
+            )
+
+        self.key_store.verify_peer_fingerprint(username, derived_fingerprint)
 
         self._peer_keys_changed.discard(username)
 
         self._pending_key_changed_fingerprints.pop(username, None)
+
+        self._pending_key_changed_raw_keys.pop(username, None)
+
+    # ----------------------------------------------------------
+    # ML-DSA identity/key-persistence foundation phase: combined
+    # (ML-KEM + ML-DSA) peer identity.
+    #
+    # A peer's identity is BOTH keys together, as ONE fingerprint and
+    # ONE verification state -- never two independent trust states for
+    # the same peer (see crypto/key_manager.py::
+    # fingerprint_combined_identity()'s docstring). The five methods
+    # below are the combined-identity counterparts of
+    # _is_verified_key_mismatch()/_flag_peer_key_changed()/
+    # _record_peer_key_observation()/handle_public_key() above, built
+    # to the same shape and reusing the SAME SecureKeyStore._peers
+    # storage and the SAME record_observed_peer_fingerprint()/
+    # verify_peer_fingerprint() methods -- no new storage schema, no
+    # new independent trust state.
+    #
+    # Deliberately NOT wired into handle_public_key() or any other
+    # existing method, and not connected to any network packet handler
+    # -- the wire protocol does not carry a peer's signing key yet.
+    # observe_peer_identity() is a freestanding entry point, callable
+    # directly (by tests now, and by a future protocol-integration
+    # phase once a packet actually carries both keys).
+    # ----------------------------------------------------------
+
+    def _compute_combined_fingerprint(self, kem_public_key, signing_public_key):
+        """
+        Thin wrapper around crypto.key_manager.
+        fingerprint_combined_identity() -- kept as a method (not called
+        directly by every caller below) so this is the one place that
+        would need to change if this session ever needed to adapt the
+        raw key bytes before fingerprinting them.
+        """
+
+        return fingerprint_combined_identity(kem_public_key, signing_public_key)
+
+    def _is_verified_identity_mismatch(self, username, kem_public_key, signing_public_key):
+        """
+        True only if this user has an existing VERIFIED combined-
+        identity fingerprint for ``username`` AND the (KEM, signing)
+        key pair just observed disagrees with it -- the combined-
+        identity counterpart of _is_verified_key_mismatch().
+
+        False (never a mismatch) whenever there is nothing VERIFIED to
+        compare against: no local key store, no record at all, or an
+        UNVERIFIED one -- a first-contact or still-unverified peer's
+        identity is never blocked here, exactly like the single-key
+        version.
+        """
+
+        if self.key_store is None:
+            return False
+
+        entry = self.key_store.get_peer_verification(username)
+
+        if entry is None or entry["state"] != PEER_STATE_VERIFIED:
+            return False
+
+        return entry["fingerprint"] != self._compute_combined_fingerprint(
+            kem_public_key, signing_public_key
+        )
+
+    def _flag_peer_identity_changed(self, username, kem_public_key, signing_public_key):
+        """
+        Record, session-locally only, that the most recently observed
+        (KEM, signing) identity for ``username`` disagreed with their
+        VERIFIED combined fingerprint -- the combined-identity
+        counterpart of _flag_peer_key_changed(). Never written to
+        SecureKeyStore: this describes a disagreement, not new evidence
+        about what should be trusted, exactly like the single-key
+        version.
+
+        Reuses the SAME _peer_keys_changed/_pending_key_changed_
+        fingerprints/_pending_key_changed_raw_keys bookkeeping the
+        single-key path already uses -- one identity, one set of
+        pending-change state -- and additionally stashes the rejected
+        signing key's raw bytes in _pending_key_changed_signing_raw_
+        keys, since neither of the existing dicts has room for a
+        second key.
+        """
+
+        self._peer_keys_changed.add(username)
+
+        combined_fingerprint = self._compute_combined_fingerprint(
+            kem_public_key, signing_public_key
+        )
+
+        self._pending_key_changed_fingerprints[username] = combined_fingerprint
+        self._pending_key_changed_raw_keys[username] = kem_public_key
+        self._pending_key_changed_signing_raw_keys[username] = signing_public_key
+
+        self.logger.warning(
+            f"SECURITY: combined (KEM + signing) identity received for "
+            f"{username} does not match the previously verified "
+            f"fingerprint -- the new identity was NOT recorded, and the "
+            f"trusted identity already on file (if any) remains in "
+            f"effect. Treating as KEY_CHANGED."
+        )
+
+        self.peer_key_changed.emit(username)
+
+    def _record_peer_identity_observation(self, username, kem_public_key, signing_public_key):
+        """
+        Record this newly observed (KEM, signing) identity's combined
+        fingerprint -- the combined-identity counterpart of
+        _record_peer_key_observation(). Called only when
+        _is_verified_identity_mismatch() has already found no conflict
+        with an existing VERIFIED identity.
+
+        Unconditionally calls SecureKeyStore.
+        record_observed_peer_fingerprint() with the COMBINED
+        fingerprint -- safe to do so unconditionally here for exactly
+        the same reason as the single-key version: that method already
+        refuses, on its own, to touch an existing VERIFIED entry. No
+        new logic is needed here to satisfy "a changed key must not
+        overwrite a VERIFIED identity while VERIFIED" -- that guarantee
+        already lives in SecureKeyStore, reused as-is.
+
+        Never promotes a peer to VERIFIED -- that remains exclusively
+        confirm_peer_verification(), a future explicit user action.
+        """
+
+        self._observed_peer_raw_public_keys[username] = kem_public_key
+        self._observed_peer_signing_public_keys[username] = signing_public_key
+
+        if self.key_store is None:
+            return
+
+        combined_fingerprint = self._compute_combined_fingerprint(
+            kem_public_key, signing_public_key
+        )
+
+        # Message-Level ML-DSA Origin Authentication: the raw signing
+        # key is persisted here too (not just cached in the session-
+        # local dict above), so a later restart's history-loading
+        # verification can still resolve it even if this peer never
+        # comes back online to re-broadcast it -- see
+        # SecureKeyStore.get_peer_signing_public_key()'s own docstring.
+        self.key_store.record_observed_peer_fingerprint(
+            username, combined_fingerprint, signing_public_key=signing_public_key
+        )
+
+        self._peer_keys_changed.discard(username)
+
+        self._pending_key_changed_fingerprints.pop(username, None)
+        self._pending_key_changed_raw_keys.pop(username, None)
+        self._pending_key_changed_signing_raw_keys.pop(username, None)
+
+    def observe_peer_identity(self, username, kem_public_key, signing_public_key):
+        """
+        Top-level entry point for observing a peer's combined (ML-KEM +
+        ML-DSA) identity -- the combined-identity counterpart of
+        handle_public_key()'s decision logic, minus the packet parsing
+        and KeyManager.add_public_key() call (there is no wire packet
+        carrying a signing key yet for this to unpack).
+
+        Fail-closed, exactly like handle_public_key(): if the observed
+        identity disagrees with an existing VERIFIED one, it is flagged
+        as KEY_CHANGED and NOTHING is recorded as the new observed
+        identity -- the previously trusted identity remains in effect
+        and recoverable. Only when there is no such conflict is the
+        observation recorded.
+        """
+
+        if self._is_verified_identity_mismatch(
+            username, kem_public_key, signing_public_key
+        ):
+            self._flag_peer_identity_changed(
+                username, kem_public_key, signing_public_key
+            )
+            return
+
+        self._record_peer_identity_observation(
+            username, kem_public_key, signing_public_key
+        )
+
+    def _currently_observed_peer_identity(self, username):
+        """
+        Returns ``(kem_public_key, signing_public_key)`` raw bytes --
+        the combined-identity counterpart of
+        _currently_observed_peer_public_key(). Either element is None
+        if nothing has ever been observed for that half.
+
+        For a pending KEY_CHANGED, these are the NEW (rejected, never
+        recorded) identity's raw bytes, held in
+        _pending_key_changed_raw_keys / _pending_key_changed_signing_
+        raw_keys -- see _flag_peer_identity_changed(). Otherwise,
+        whatever _observed_peer_raw_public_keys /
+        _observed_peer_signing_public_keys currently hold -- the last
+        identity _record_peer_identity_observation() recorded.
+        """
+
+        if username in self._pending_key_changed_raw_keys:
+            kem_public_key = self._pending_key_changed_raw_keys[username]
+        else:
+            kem_public_key = self._observed_peer_raw_public_keys.get(username)
+
+        if username in self._pending_key_changed_signing_raw_keys:
+            signing_public_key = self._pending_key_changed_signing_raw_keys[username]
+        else:
+            signing_public_key = self._observed_peer_signing_public_keys.get(username)
+
+        return kem_public_key, signing_public_key
+
+    def confirm_combined_peer_verification(self, username, fingerprint):
+        """
+        The combined-identity counterpart of confirm_peer_verification()
+        -- the ONLY method that should ever promote a peer's COMBINED
+        (ML-KEM + ML-DSA) identity to PEER_STATE_VERIFIED. Not yet
+        called from anywhere (no GUI wiring this phase); exists so
+        Phase 9/10's key-change security tests have a real "explicit
+        human verification" action to call, exactly as
+        confirm_peer_verification() already is for the single-key path.
+
+        Same hardening posture as confirm_peer_verification(): never a
+        blind pass-through of ``fingerprint``. Independently re-derives
+        the combined fingerprint from
+        _currently_observed_peer_identity(username) -- the actual,
+        currently cached (or pending KEY_CHANGED) (KEM, signing) pair
+        -- and refuses (PeerVerificationMismatchError) unless the
+        supplied ``fingerprint`` matches that independently-derived
+        value exactly. The value actually persisted below is always
+        the independently-derived one, never the caller-supplied
+        string itself.
+
+        Raises PeerVerificationMismatchError if either half of the
+        identity has never been observed, or if ``fingerprint`` does
+        not match. Raises KeyStoreError if the local key store is
+        unavailable this session.
+        """
+
+        if self.key_store is None:
+            raise KeyStoreError(
+                "The local key store is not available; identity "
+                "verification cannot be saved."
+            )
+
+        kem_public_key, signing_public_key = self._currently_observed_peer_identity(
+            username
+        )
+
+        if kem_public_key is None or signing_public_key is None:
+            raise PeerVerificationMismatchError(
+                f"No observed combined identity for {username}; there "
+                f"is nothing to verify."
+            )
+
+        derived_fingerprint = self._compute_combined_fingerprint(
+            kem_public_key, signing_public_key
+        )
+
+        if derived_fingerprint != fingerprint:
+            raise PeerVerificationMismatchError(
+                "The supplied fingerprint does not match the "
+                "currently observed combined identity; verification "
+                "was refused."
+            )
+
+        # Message-Level ML-DSA Origin Authentication: persisted here
+        # too, for the same reason as _record_peer_identity_
+        # observation() -- so history-loading verification of this
+        # now-VERIFIED peer's messages can still resolve their signing
+        # key after a restart, even if they are not currently online.
+        self.key_store.verify_peer_fingerprint(
+            username, derived_fingerprint, signing_public_key=signing_public_key
+        )
+
+        self._peer_keys_changed.discard(username)
+
+        self._pending_key_changed_fingerprints.pop(username, None)
+        self._pending_key_changed_raw_keys.pop(username, None)
+        self._pending_key_changed_signing_raw_keys.pop(username, None)
 
     # ----------------------------------------------------------
 
@@ -2703,53 +3976,221 @@ class ClientSession(QObject):
         Defaults to 1 for a packet that omits it (none do today, but
         this mirrors every other epoch-aware packet's backward-
         compatible default).
+
+        RSA Direct-Session-Key ML-DSA Origin Authentication (Phase
+        13.6): before this phase, the RSA (non-KYBER) branch below
+        installed ``encrypted_key`` with NO check of any kind on the
+        packet's claimed sender -- RSA-OAEP is true public-key
+        encryption, so ANYONE holding this client's PUBLIC RSA key
+        (broadcast to every connected client by design, exactly like
+        the ML-KEM public key Phase 13 already protected) could
+        encrypt an arbitrary session key of their own choosing and
+        have it installed. Phase 13.5's independent audit proved this
+        empirically. This mirrors Phase 13's handle_group_key_
+        distribution() fix exactly, for the same reason and with the
+        same mandatory installation order (never reordered): receive
+        -> parse/validate structure -> resolve sender identity (and
+        require VERIFIED -- symmetric with the sending side's own
+        pre-existing gate in establish_session_key(), and with
+        handle_group_key_distribution()'s KYBER-mode rule, so there is
+        no algorithm-dependent trust bypass) -> verify ML-DSA signature
+        -> decrypt (RSA private-key operation) -> install -> use. The
+        RSA private-key decryption never runs before the signature is
+        verified -- verifying first, on the ciphertext itself (bound
+        into the signed payload, no decryption needed to check it),
+        avoids spending a private-key operation on unauthenticated
+        network input.
+
+        Phase 13.8A -- KYBER Session-Key Forgery Remediation: the
+        "KYBER branch" below used to decapsulate and install a session
+        key completely unauthenticated, on the theory that it was
+        dead/legacy code -- no production CLIENT ever constructs a
+        "session_key" packet with algorithm="KYBER" (establish_
+        session_key()'s KYBER branch sends group_key_distribution
+        instead, authenticated since Phase 13). That was true and
+        irrelevant: this project's entire threat model is a MALICIOUS
+        SERVER/RELAY, which does not need a legitimate client's
+        cooperation to construct one. Phase 13.8's audit proved this
+        empirically -- an attacker holding nothing but a victim's
+        already-public ML-KEM key could forge exactly this packet
+        shape (no signature needed, since this branch never checked
+        for one) and have an attacker-known session key installed
+        against a completely ordinary, default (KYBER-mode) receiver,
+        for the exact same reason the pre-Phase-13.6 RSA branch was
+        vulnerable: encapsulation is confidentiality, never
+        authenticity.
+
+        Traced exhaustively before this fix (Phase 13.8A, Parts 1-2):
+        create_session_key_packet() has exactly one production caller
+        anywhere in this codebase (establish_session_key()'s RSA
+        branch, which always passes algorithm="RSA") and the server
+        never constructs one server-side, only relays/hardens an
+        already-client-built one -- so a legitimate algorithm="KYBER"
+        session_key packet never exists in production at all. The only
+        two tests that ever construct one operate on raw sockets
+        (tests/test_direct_conversation_relay_resolution.py,
+        tests/test_chat_encryption_integration.py) to exercise SERVER-
+        side relay hardening or raw KEM round-tripping -- neither ever
+        calls this method. Nothing legitimate depends on this branch
+        accepting anything.
+
+        Remediation: unconditional rejection (no decapsulation, no key
+        installation, no state mutation of any kind) rather than
+        retrofitting authentication onto a path with zero legitimate
+        use -- the same choice Part 3 of this phase's task explicitly
+        prefers when a path is genuinely obsolete. No existing
+        SecurityRejectionReason member describes "this operation/
+        algorithm combination is not a supported production path"
+        precisely (WRONG_ALGORITHM already means "the packet's
+        declared algorithm disagrees with mine", which is not this
+        case -- both agree the algorithm is KYBER; what's wrong is
+        using this packet TYPE for it at all) -- OTHER_SECURITY_
+        REJECTION is used rather than inventing a new enum member for
+        one obsolete-protocol-operation case.
+
+        Phase 13.7 -- Key-Establishment Rejection Observability &
+        State Integrity: returns None on success, or the
+        domain.security_rejection_reason.SecurityRejectionReason that
+        caused rejection -- every rejection branch below (including
+        the pre-existing malformed/missing-conversation_id and
+        algorithm-label-mismatch checks, both unrelated to Phase 13.6
+        but folded into the same reporting mechanism for consistency)
+        reports through _report_security_rejection() (log +
+        security_rejection Signal).
         """
 
-        sender = packet["sender"]
-
+        sender = packet.get("sender")
         conversation_id = packet.get("conversation_id")
 
-        if not conversation_id:
-
-            self.logger.error(
-                f"No conversation_id supplied by the server for a "
-                f"session_key packet from {sender} -- this is a "
-                f"protocol/server problem; discarding the packet "
-                f"rather than resolving the conversation locally."
+        if not sender or not conversation_id:
+            self._report_security_rejection(
+                SecurityRejectionReason.MALFORMED_PACKET, sender, conversation_id
             )
+            return SecurityRejectionReason.MALFORMED_PACKET
 
-            return
+        epoch = packet.get("epoch") or 1
 
         self.conversation_store.record_direct_conversation_id(
             sender, conversation_id
         )
 
-        algorithm = packet.get(
-            "algorithm",
-            self.key_manager.algorithm
-        )
+        # Hardening: the server relays this packet and can rewrite any
+        # field in it, including ``algorithm`` -- it must never be the
+        # thing that decides which decrypt routine (KYBER decapsulate
+        # vs. RSA-OAEP decrypt) runs. This client always uses its own
+        # locally configured self.key_manager.algorithm; a packet that
+        # explicitly declares a DIFFERENT one is a mismatch worth
+        # rejecting outright and loudly, rather than silently letting
+        # network input steer which private key material gets used.
+        # (RSA-OAEP decrypt would simply fail closed on the wrong
+        # ciphertext regardless -- but KYBER decapsulation does NOT:
+        # it deterministically returns SOME shared secret for any
+        # well-formed-length ciphertext, never raising, so silently
+        # taking the KYBER branch on forged input could install a
+        # bogus key via store_key() below for an epoch that has not
+        # been established yet. Rejecting on the label mismatch,
+        # before any decrypt/decapsulate call, closes that regardless
+        # of which direction the mismatch runs.)
+        packet_algorithm = packet.get("algorithm")
+
+        if packet_algorithm is not None and packet_algorithm != self.key_manager.algorithm:
+            self._report_security_rejection(
+                SecurityRejectionReason.WRONG_ALGORITHM, sender, conversation_id
+            )
+            return SecurityRejectionReason.WRONG_ALGORITHM
+
+        algorithm = self.key_manager.algorithm
 
         if algorithm == "KYBER":
 
-            session_key = (
-                self.key_manager.decapsulate_session_key(
-                    packet["encrypted_key"]
-                )
+            # Phase 13.8A: no legitimate producer of this packet shape
+            # exists (see this method's own docstring) -- reject
+            # unconditionally, before any decapsulation is attempted,
+            # rather than authenticate a path nothing real ever uses.
+            self._report_security_rejection(
+                SecurityRejectionReason.OTHER_SECURITY_REJECTION, sender, conversation_id
             )
+            return SecurityRejectionReason.OTHER_SECURITY_REJECTION
 
         else:
 
-            encrypted_key = base64.b64decode(
-                packet["encrypted_key"]
-            )
+            if not self._peer_key_is_verified(sender):
+                reason = self._sender_trust_rejection_reason(sender)
+                self._report_security_rejection(reason, sender, conversation_id)
+                return reason
 
-            session_key = (
-                self.key_manager.decrypt_session_key(
-                    encrypted_key
+            signing_public_key = self._resolve_trusted_signing_key(sender)
+
+            signature_b64 = packet.get("session_key_signature")
+
+            if signature_b64 is None:
+                self._report_security_rejection(
+                    SecurityRejectionReason.MISSING_SIGNATURE, sender, conversation_id
                 )
-            )
+                return SecurityRejectionReason.MISSING_SIGNATURE
 
-        epoch = packet.get("epoch") or 1
+            if signing_public_key is None:
+                self._report_security_rejection(
+                    SecurityRejectionReason.UNKNOWN_SENDER, sender, conversation_id
+                )
+                return SecurityRejectionReason.UNKNOWN_SENDER
+
+            try:
+                signature = base64.b64decode(signature_b64, validate=True)
+
+                verified = verify_rsa_session_key_payload(
+                    sender, self.username, conversation_id, algorithm,
+                    packet["encrypted_key"], epoch,
+                    signature, signing_public_key,
+                )
+
+            except (TypeError, ValueError):
+                # Malformed base64, wrong-length signature/key, or a
+                # structurally invalid field -- a data error describing
+                # untrusted network input, never a bug in this
+                # codebase (mirrors crypto/group_key_protocol.py's own
+                # established convention). The exception message
+                # itself is never logged -- it can embed attacker-
+                # controlled bytes (Part 5: no attacker-controlled
+                # payload logged verbatim).
+                self._report_security_rejection(
+                    SecurityRejectionReason.MALFORMED_PACKET, sender, conversation_id
+                )
+                return SecurityRejectionReason.MALFORMED_PACKET
+
+            if not verified:
+                self._report_security_rejection(
+                    SecurityRejectionReason.INVALID_SIGNATURE, sender, conversation_id
+                )
+                return SecurityRejectionReason.INVALID_SIGNATURE
+
+            # Phase 13.7: the packet is now fully authenticated -- see
+            # handle_group_key_distribution()'s identical reasoning.
+            if self.key_manager.has_key(conversation_id, epoch=epoch):
+                self._report_security_rejection(
+                    SecurityRejectionReason.DUPLICATE_OR_STALE_KEY, sender, conversation_id
+                )
+
+            try:
+                encrypted_key = base64.b64decode(
+                    packet["encrypted_key"]
+                )
+
+                session_key = (
+                    self.key_manager.decrypt_session_key(
+                        encrypted_key
+                    )
+                )
+            except (ValueError, TypeError):
+                # Defense in depth only: signature verification above
+                # already guarantees encrypted_key is exactly what the
+                # VERIFIED sender produced, so this should be
+                # unreachable for any real attacker-controlled input --
+                # kept narrow and non-crashing regardless.
+                self._report_security_rejection(
+                    SecurityRejectionReason.DECRYPTION_FAILURE, sender, conversation_id
+                )
+                return SecurityRejectionReason.DECRYPTION_FAILURE
 
         self.key_manager.store_key(
             conversation_id,
@@ -2761,11 +4202,13 @@ class ClientSession(QObject):
             f"Session key established with {sender}"
         )
 
-        self.message_received.emit(
-            "system",
-            "system",
-            f"Secure session established with {sender}."
-        )
+        # UI Finalization Decision (internal message cleanup): session
+        # establishment is an internal protocol event, not a
+        # user-authored message -- no longer surfaced as a chat
+        # bubble. The actual key storage above (key_manager.store_key())
+        # is unchanged; still fully logged for debugging.
+
+        return None
 
     # ----------------------------------------------------------
 
@@ -2893,6 +4336,25 @@ class ClientSession(QObject):
 
                 continue
 
+            # Group-Key-Distribution ML-DSA Origin Authentication:
+            # signed with this client's own persistent ML-DSA signer
+            # (the same one already used for identity announcements and
+            # messages) over the canonical envelope crypto/
+            # group_key_protocol.py defines -- AFTER wrapping already
+            # produced encapsulation/wrapped_key, and BEFORE the packet
+            # is ever sent. The private key never leaves
+            # self.key_manager.ml_dsa; only the resulting signature
+            # bytes are put on the wire.
+            group_key_signature = sign_group_key_payload(
+                self.key_manager.ml_dsa,
+                self.username,
+                conversation_id,
+                member,
+                encapsulation,
+                wrapped_key,
+                epoch,
+            )
+
             packet = create_group_key_distribution_packet(
                 sender=self.username,
                 conversation_id=conversation_id,
@@ -2900,6 +4362,7 @@ class ClientSession(QObject):
                 encapsulation=encapsulation,
                 wrapped_key=wrapped_key,
                 epoch=epoch,
+                group_key_signature=base64.b64encode(group_key_signature).decode("ascii"),
             )
 
             send_message(
@@ -2926,34 +4389,190 @@ class ClientSession(QObject):
     def handle_group_key_distribution(self, packet):
         """
         Recover this client's wrapped copy of a group key -- see
-        crypto/key_manager.py::unwrap_received_key(). Uses only this
-        client's own private key material; nothing from the sender is
-        needed beyond the packet's opaque fields.
+        crypto/key_manager.py::unwrap_received_key().
+
+        Group-Key-Distribution ML-DSA Origin Authentication (Phase 13):
+        before this phase, this method's own docstring said outright
+        "Uses only this client's own private key material; nothing
+        from the sender is needed beyond the packet's opaque fields"
+        -- which was true, and was exactly the vulnerability: ML-KEM-
+        then-DEM (crypto/key_manager.py::wrap_key_for_member()) gives
+        CONFIDENTIALITY (only this client's private key can ever
+        recover the wrapped key) but no AUTHENTICITY at all -- ANYONE
+        holding this client's PUBLIC ML-KEM key (broadcast to every
+        connected client by design) could independently encapsulate a
+        fresh secret and AES-GCM-wrap an arbitrary key of their own
+        choosing, and unwrap_received_key() would happily recover it.
+        A malicious server (this project's entire threat model) did
+        not even need to intercept a real packet -- it could fabricate
+        one from scratch. See this phase's own audit/final report for
+        the full trace.
+
+        Mandatory installation order (never reordered):
+            receive -> parse/validate structure -> resolve sender
+            identity (and require VERIFIED -- see below) -> verify
+            ML-DSA signature -> decrypt/unseal -> install -> use.
+        The group key becomes active (store_key()) ONLY after every
+        prior step succeeds; any failure returns before store_key() is
+        ever reached, so an attacker can never race a real delivery by
+        having their forged one merely arrive first and get installed
+        before rejection catches up.
+
+        VERIFIED, not merely signature-valid: unlike ordinary message
+        authentication (Phase 12B), which accepts a signature from a
+        merely-UNVERIFIED-but-cryptographically-consistent sender,
+        group-key distribution requires the sender to be VERIFIED from
+        THIS receiver's own peer-identity state
+        (_peer_key_is_verified()). This mirrors the SENDING side's own
+        pre-existing rule (_distribute_group_key() already skips any
+        recipient who is not VERIFIED, from the sender's point of
+        view) -- applied symmetrically here to the sender, from the
+        receiver's point of view, since group-key material is higher-
+        stakes than a single message: it seeds trust for an entire
+        conversation's future traffic, not one already-displayed
+        message. _peer_key_is_verified() already returns False for
+        PEER_KEY_STATE_CHANGED (unchanged, existing behavior), so a
+        sender whose identity has changed since this receiver last
+        verified them is rejected here too, automatically -- a new
+        group key is never silently accepted as though it still came
+        from the old, previously-trusted identity.
+
+        The verification key itself is resolved via _resolve_trusted_
+        signing_key() -- this receiver's own already-established peer-
+        identity state -- never from anything inside this packet (it
+        carries no ML-DSA public-key field at all for an attacker to
+        substitute one into).
+
+        Any failure (unverified/unknown sender, missing/malformed
+        signature, or a signature that does not verify) is rejected
+        with a logged warning; the group key is never unwrapped or
+        installed, and this client's currently active key/epoch for
+        the conversation (if any) is left completely untouched.
 
         ``epoch`` (Phase 7 -- Group Membership Management): stored
         under the epoch the packet declares, defaulting to 1 for
         compatibility with a sender that predates this field.
         KeyManager.store_key() never overwrites an existing epoch with
         a different key, so a redundant/duplicate delivery of the same
-        epoch is always safe.
+        epoch is always safe (replay of an identical valid packet is a
+        harmless no-op).
+
+        Phase 13.7 -- Key-Establishment Rejection Observability &
+        State Integrity: returns None on success, or the
+        domain.security_rejection_reason.SecurityRejectionReason that
+        caused rejection -- every rejection branch now also reports
+        through _report_security_rejection() (log + security_rejection
+        Signal), except the very first ("not addressed to me") check,
+        which is ordinary routing noise every member's client sees
+        constantly for a group broadcast to OTHER members, never a
+        security event. No rejection branch below was reordered, and
+        none now does more work than it already did -- this only makes
+        the SAME fail-closed decisions observable, not different ones.
         """
 
         if packet.get("recipient") != self.username:
-            return
+            return None
 
-        conversation_id = packet["conversation_id"]
+        conversation_id = packet.get("conversation_id")
+        sender = packet.get("sender")
+
+        if not conversation_id or not sender:
+            self._report_security_rejection(
+                SecurityRejectionReason.MALFORMED_PACKET, sender, conversation_id
+            )
+            return SecurityRejectionReason.MALFORMED_PACKET
+
         epoch = packet.get("epoch") or 1
+        encapsulation = packet.get("encapsulation")
+        wrapped_key = packet.get("wrapped_key")
 
-        group_key = self.key_manager.unwrap_received_key(
-            packet["encapsulation"], packet["wrapped_key"]
-        )
+        if not self._peer_key_is_verified(sender):
+            reason = self._sender_trust_rejection_reason(sender)
+            self._report_security_rejection(reason, sender, conversation_id)
+            return reason
+
+        signing_public_key = self._resolve_trusted_signing_key(sender)
+
+        signature_b64 = packet.get("group_key_signature")
+
+        if signature_b64 is None:
+            self._report_security_rejection(
+                SecurityRejectionReason.MISSING_SIGNATURE, sender, conversation_id
+            )
+            return SecurityRejectionReason.MISSING_SIGNATURE
+
+        if signing_public_key is None:
+            self._report_security_rejection(
+                SecurityRejectionReason.UNKNOWN_SENDER, sender, conversation_id
+            )
+            return SecurityRejectionReason.UNKNOWN_SENDER
+
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+
+            verified = verify_group_key_payload(
+                sender, conversation_id, self.username, encapsulation,
+                wrapped_key, epoch, signature, signing_public_key,
+            )
+
+        except (TypeError, ValueError):
+            # Malformed base64, wrong-length signature/key, or a
+            # structurally invalid field -- a data error describing
+            # untrusted network input, never a bug in this codebase
+            # (mirrors crypto/identity_protocol.py's/crypto/
+            # message_protocol.py's own established convention). The
+            # exception message itself is never logged here -- it can
+            # embed attacker-controlled bytes (Part 5: no attacker-
+            # controlled payload logged verbatim); the reason label
+            # alone is enough to act on.
+            self._report_security_rejection(
+                SecurityRejectionReason.MALFORMED_PACKET, sender, conversation_id
+            )
+            return SecurityRejectionReason.MALFORMED_PACKET
+
+        if not verified:
+            self._report_security_rejection(
+                SecurityRejectionReason.INVALID_SIGNATURE, sender, conversation_id
+            )
+            return SecurityRejectionReason.INVALID_SIGNATURE
+
+        # Phase 13.7: the packet is now fully authenticated. A key
+        # already on file for this exact epoch means store_key() below
+        # is about to be a harmless no-op (KeyManager.store_key()'s
+        # pre-existing no-overwrite guarantee, unmodified) -- reported
+        # as DUPLICATE_OR_STALE_KEY rather than silently treated the
+        # same as a fresh installation, so a redundant/stale-but-
+        # authentic redelivery is observably distinct from a genuinely
+        # new key taking effect. Not a security violation -- the
+        # authenticated sender genuinely sent this -- just not new.
+        if self.key_manager.has_key(conversation_id, epoch=epoch):
+            self._report_security_rejection(
+                SecurityRejectionReason.DUPLICATE_OR_STALE_KEY, sender, conversation_id
+            )
+
+        try:
+            group_key = self.key_manager.unwrap_received_key(
+                encapsulation, wrapped_key
+            )
+        except (ValueError, TypeError):
+            # Defense in depth only: signature verification above
+            # already guarantees encapsulation/wrapped_key are exactly
+            # what the VERIFIED sender produced, so this should be
+            # unreachable for any real attacker-controlled input --
+            # kept narrow and non-crashing regardless.
+            self._report_security_rejection(
+                SecurityRejectionReason.DECRYPTION_FAILURE, sender, conversation_id
+            )
+            return SecurityRejectionReason.DECRYPTION_FAILURE
 
         self.key_manager.store_key(conversation_id, group_key, epoch=epoch)
 
         self.logger.info(
             f"Group key established for conversation {conversation_id} "
-            f"(epoch {epoch})"
+            f"(epoch {epoch}), authenticated from {sender}"
         )
+
+        return None
 
     def handle_group_member_left(self, packet):
         """
@@ -3220,11 +4839,17 @@ class ClientSession(QObject):
         thread (set_current_chat(), below) -- send_request() would
         deadlock if ever called from the receiver thread.
 
-        Caches the result via ConversationStore.
-        record_direct_conversation_id() (DB-free) -- the same caching
-        step ensure_direct_conversation_id() itself still performs for
-        its own remaining caller, so both paths leave the sidebar in
-        an identical state.
+        Deliberately does NOT cache the result into ConversationStore.
+        Opening a chat is not activity -- see conversation_store.py's
+        docstring -- so resolving/creating the id here must not make
+        an empty conversation sidebar-visible. The caller
+        (set_current_chat()) keeps the id on self.current_conversation_id
+        for addressing/key-manager purposes regardless; the store only
+        learns about this conversation if a message actually gets
+        sent (send_chat_message() -> _send_encrypted_payload() passes
+        this same id to ConversationStore.record_message() on first
+        send) or received (handle_chat()/handle_session_key() already
+        cache it themselves, from real incoming activity).
 
         Raises ValueError (matching ensure_direct_conversation_id()'s
         existing contract exactly) if the server reports the username
@@ -3240,13 +4865,7 @@ class ClientSession(QObject):
         if error:
             raise ValueError(error)
 
-        conversation_id = response.get("conversation_id")
-
-        self.conversation_store.record_direct_conversation_id(
-            username, conversation_id
-        )
-
-        return conversation_id
+        return response.get("conversation_id")
 
     def set_current_chat(self, summary):
         """
@@ -3294,6 +4913,21 @@ class ClientSession(QObject):
         """
         self.unread_counts[username] = self.unread_counts.get(username, 0) + 1
         return self.unread_counts[username]
+
+    def set_unread_count(self, key, count):
+        """
+        Set the absolute unread count for a conversation (BUG --
+        Offline Unread/Notification).
+
+        Unlike increment_unread() -- which reacts to one live message
+        arriving -- this sets a count already known in full, from
+        load_conversations()'s server-reported unread_count per
+        conversation. ``key`` is the same addressing identity
+        increment_unread()/clear_unread()/get_unread_count() already
+        use (ConversationSummary.key: conversation_id for a group,
+        username for a direct conversation).
+        """
+        self.unread_counts[key] = count
 
     def clear_unread(self, username):
         """
