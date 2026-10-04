@@ -4,9 +4,16 @@ Conversation membership model.
 Links a user to a conversation. The same shape serves both a direct
 conversation's two members today and a group conversation's members
 once Group Chat is implemented -- no schema change is expected when
-that phase lands. ``role`` is included now for that reason but carries
-no behavior in Phase 1: every membership created today is TYPE_DIRECT
-and gets the default ROLE_MEMBER.
+that phase lands. ``role`` was added early but carried no behavior
+until Phase 19.13 -- Group Admin: the user who creates a group is now
+recorded as ROLE_ADMIN on that same row (see
+ConversationRepository.create_group_conversation()); every other
+member, and both sides of every direct conversation, still get the
+unchanged default ROLE_MEMBER. Authorization checks that read this
+column (removing another member, approving a member-add request) live
+server-side in server/client_handler.py -- this column is the only
+place that state is persisted, so a client can never spoof admin
+status by only changing its own UI.
 """
 
 import uuid
@@ -30,6 +37,7 @@ class ConversationMember(Base):
     """Represents one user's membership in one conversation."""
 
     ROLE_MEMBER = "member"
+    ROLE_ADMIN = "admin"
 
     __tablename__ = "conversation_members"
     __table_args__ = (

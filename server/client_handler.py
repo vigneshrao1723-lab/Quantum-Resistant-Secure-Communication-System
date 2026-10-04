@@ -4,6 +4,7 @@ Client Handler Module
 Handles communication with individual clients.
 """
 
+import base64
 import uuid
 from datetime import datetime, timezone
 
@@ -15,7 +16,11 @@ from config import (
 )
 from database.connection import SessionLocal
 from database.models.conversation import Conversation
+from database.models.inbox_notification import TYPE_GROUP_ADD_REQUEST, TYPE_VERIFICATION_REQUEST
+from database.models.user import User
+from database.repositories.blocked_user_repository import BlockedUserRepository
 from database.repositories.conversation_repository import ConversationRepository
+from database.repositories.inbox_repository import InboxRepository
 from database.repositories.message_repository import MessageRepository
 from database.repositories.user_repository import UserRepository
 from domain.message_delivery_status import MessageDeliveryStatus
@@ -32,12 +37,23 @@ from server.broadcaster import (
     distribute_public_keys,
     send_to_client,
 )
+from server.device_handler import (
+    handle_device_authorize,
+    handle_device_enroll_request,
+    handle_device_key_sync,
+    handle_device_list_request,
+    handle_device_revoke,
+    handle_device_session_bind,
+    is_device_bound_and_authorized,
+)
 from storage import encrypted_blob_store
 from utils.network import receive_message
 from utils.protocol import (
     create_auth_result_packet,
     create_blob_download_result_packet,
     create_conversation_list_result_packet,
+    create_block_user_result_packet,
+    create_blocked_users_list_result_packet,
     create_delivery_failure_packet,
     create_direct_conversation_result_packet,
     create_direct_key_recovery_available_packet,
@@ -45,16 +61,35 @@ from utils.protocol import (
     create_epoch_reservation_result_packet,
     create_group_create_result_packet,
     create_group_key_rotation_required_packet,
+    create_change_password_result_packet,
+    create_change_username_result_packet,
     create_group_member_left_packet,
     create_group_members_added_packet,
+    create_group_remove_member_result_packet,
+    create_inbox_list_result_packet,
+    create_inbox_notification_packet,
+    create_inbox_response_result_packet,
+    create_unblock_user_result_packet,
     create_join_packet,
+    create_bio_result_packet,
+    create_change_bio_result_packet,
     create_leave_packet,
     create_login_result_packet,
     create_logout_result_packet,
+    create_message_delivered_packet,
+    create_message_deleted_notification_packet,
+    create_last_seen_result_packet,
+    create_message_edited_notification_packet,
     create_message_history_result_packet,
+    create_message_pinned_notification_packet,
     create_message_queued_packet,
+    create_message_unpinned_notification_packet,
+    create_reaction_updated_notification_packet,
+    create_profile_picture_result_packet,
+    create_profile_picture_upload_result_packet,
     create_read_receipt_notification_packet,
     create_register_result_packet,
+    create_typing_indicator_notification_packet,
     create_user_lookup_result_packet,
     parse_packet,
 )
@@ -177,7 +212,25 @@ def persist_message(sender_id, receiver_id, algorithm, packet, conversation_id=N
             blob_ref = None
             ciphertext = envelope.ciphertext
 
-        message = message_repo.save_message(
+        # Phase 19.24 -- Message Lifecycle Events. reply_to_message_id
+        # is a client-supplied field, but a FOREIGN KEY to messages.id
+        # -- an attacker naming a message_id from a conversation they
+        # are not even a member of gains nothing (the reply is still
+        # only ever relayed to THIS conversation's own members, exactly
+        # like every other field on this packet; rendering the quoted
+        # preview is a client-side, best-effort convenience, never an
+        # access grant). A malformed/unparseable value is dropped
+        # rather than raising -- a reply reference is enrichment, not
+        # something that should ever fail an otherwise-valid send.
+        reply_to_message_id = packet.get("reply_to_message_id")
+        try:
+            reply_to_message_id = (
+                uuid.UUID(reply_to_message_id) if reply_to_message_id else None
+            )
+        except (ValueError, AttributeError, TypeError):
+            reply_to_message_id = None
+
+        message, was_duplicate = message_repo.save_message_idempotent(
             sender_id=sender_id,
             receiver_id=receiver_id,
             conversation_id=conversation_id,
@@ -188,7 +241,34 @@ def persist_message(sender_id, receiver_id, algorithm, packet, conversation_id=N
             algorithm=algorithm or KEY_EXCHANGE_ALGORITHM,
             timestamp=_parse_message_timestamp(packet.get("timestamp")),
             epoch=packet.get("epoch") or 1,
+            # Message-Level ML-DSA Origin Authentication: carried into
+            # offline storage unchanged, opaque to the server -- see
+            # client/session.py::_decrypt_history_message() for where
+            # it is verified on read. None for any packet with no
+            # signature at all (there is no legacy unsigned path for
+            # messages -- see handle_chat()'s own docstring).
+            message_signature=packet.get("message_signature"),
+            reply_to_message_id=reply_to_message_id,
+            client_message_id=packet.get("client_message_id") or None,
         )
+
+        if was_duplicate:
+            # A retried send whose ORIGINAL attempt already succeeded
+            # (same client_message_id) -- nothing new was inserted.
+            # Still committed, not rolled back: SessionLocal expires
+            # every tracked object on rollback regardless of
+            # expire_on_commit=False, which would turn this function's
+            # own return value into a DetachedInstanceError the moment
+            # a caller reads message.id after db.close() below. Nothing
+            # uncommitted here is unsafe to commit -- get_or_create_
+            # direct_conversation() above is itself idempotent, and no
+            # new Message row was created. Any blob this retry just
+            # wrote via store_blob() is an orphan; deliberately left
+            # for existing blob-cleanup/retention tooling rather than
+            # deleted here (it already exists on disk independently of
+            # this DB transaction).
+            db.commit()
+            return message
 
         db.commit()
 
@@ -430,12 +510,39 @@ def handle_group_chat_delivery(state, client_socket, user, conversation_id, pack
         packet=packet,
     )
 
+    # Phase 18.5 -- Step 6 (History Deduplication): same rationale as
+    # the direct-chat relay's identical addition -- the stable id
+    # message_history_result already reports for this row once
+    # persisted, added here additively so a client that already
+    # rendered this live group message can recognize it again later via
+    # history and skip re-rendering it. Not part of any ML-DSA-signed
+    # payload, so this changes nothing about what was already signed.
+    packet["message_id"] = str(message.id)
+
     member_id_strings = {str(member_id) for member_id in member_ids}
     connected_member_ids = []
 
     for sock, client in list(state.clients.items()):
 
         if sock == client_socket:
+            continue
+
+        # Phase 19.18 -- L-1 closure, group side: same per-socket
+        # revoked-device skip as the direct-chat relay above -- a
+        # revoked member's device is excluded from this fan-out (and
+        # therefore from connected_member_ids/DELIVERED promotion)
+        # without affecting any of their OTHER, non-revoked devices,
+        # or any other member.
+        if (
+            client.get("user_id") in member_id_strings
+            and is_device_bound_and_authorized(state, sock) is False
+        ):
+
+            state.logger.warning(
+                f"Dropped group chat relay in {conversation_id}: "
+                f"a recipient's bound device is not AUTHORIZED"
+            )
+
             continue
 
         # Only actually-successful sends count as "connected" here --
@@ -488,6 +595,7 @@ def handle_group_create(state, client_socket, user, packet):
 
         member_ids = [user.id]
         resolved_usernames = [user.username]
+        blocked_repo = BlockedUserRepository(db)
 
         for username in member_usernames:
 
@@ -499,11 +607,22 @@ def handle_group_create(state, client_socket, user, packet):
             if member is None:
                 continue
 
+            # Phase 19.24 -- Block User: a block in EITHER direction
+            # between the creator and a candidate member silently
+            # excludes them from this BRAND NEW group -- same silent-
+            # skip pattern as "member is None" above (never a
+            # distinguishable error). Does not touch any EXISTING
+            # group's membership -- see database/models/blocked_
+            # user.py's own docstring for why a 1:1 block never
+            # retroactively affects a shared group thread.
+            if blocked_repo.is_blocked(member.id, user.id) or blocked_repo.is_blocked(user.id, member.id):
+                continue
+
             member_ids.append(member.id)
             resolved_usernames.append(member.username)
 
         conversation = conversation_repo.create_group_conversation(
-            member_ids=member_ids, name=name
+            member_ids=member_ids, name=name, creator_id=user.id,
         )
 
         conversation_repo.commit()
@@ -731,6 +850,838 @@ def handle_group_leave(state, client_socket, user, packet):
     _dispatch_pending_rotation_if_needed(state, conversation_id)
 
 
+def handle_group_remove_member(state, client_socket, user, packet):
+    """
+    Remove ANOTHER member from a group conversation (Phase 19.13 --
+    Group Admin). Unlike handle_group_leave() (self-service, any
+    member), this is admin-only: the caller's role is always
+    re-derived server-side from ConversationRepository.
+    get_admin_user_id(), never trusted from the packet or from
+    whether the requesting client's own UI happened to show a Remove
+    Member button. A non-admin caller (including an admin trying to
+    remove themselves through this path, or a group with no recorded
+    admin) is rejected with a friendly error, no membership change,
+    no crash -- mirrors every other group-authorization rejection in
+    this file.
+
+    Reuses leave_conversation() + reserve_next_epoch() +
+    _dispatch_pending_rotation_if_needed() exactly as handle_group_
+    leave() does -- the removed member must lose access to future
+    messages the same way a self-departed member does, which requires
+    the same key rotation, not a different one.
+    """
+
+    conversation_id = packet.get("conversation_id")
+    target_username = packet.get("target_username")
+    request_id = packet.get("request_id")
+
+    if not conversation_id or not target_username:
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        user_repo = UserRepository(db)
+        conversation_uuid = uuid.UUID(conversation_id)
+
+        admin_id = conversation_repo.get_admin_user_id(conversation_uuid)
+
+        if admin_id is None or admin_id != user.id:
+
+            state.logger.warning(
+                f"Rejected group_remove_member: {user.username} is not the "
+                f"admin of {conversation_id}"
+            )
+
+            send_to_client(client_socket, create_group_remove_member_result_packet(
+                request_id=request_id, success=False,
+                error="Only the group admin can remove members.",
+            ))
+
+            return
+
+        target = user_repo.get_by_username(target_username)
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+        if target is None or target.id not in member_ids:
+            send_to_client(client_socket, create_group_remove_member_result_packet(
+                request_id=request_id, success=False,
+                error=f"{target_username} is not a member of this group.",
+            ))
+            return
+
+        if target.id == admin_id:
+            send_to_client(client_socket, create_group_remove_member_result_packet(
+                request_id=request_id, success=False,
+                error="The group admin cannot be removed.",
+            ))
+            return
+
+        conversation_repo.leave_conversation(conversation_uuid, target.id)
+        conversation_repo.reserve_next_epoch(conversation_uuid)
+
+        conversation_repo.commit()
+
+        remaining_ids = [m for m in member_ids if m != target.id]
+        remaining_usernames = _usernames_for(db, remaining_ids)
+    finally:
+        db.close()
+
+    member_left_packet = create_group_member_left_packet(
+        conversation_id=conversation_id,
+        username=target_username,
+        members=remaining_usernames,
+    )
+
+    all_former_id_strings = {str(m) for m in member_ids}
+
+    for sock, client in list(state.clients.items()):
+
+        if client.get("user_id") in all_former_id_strings:
+            send_to_client(sock, member_left_packet)
+
+    send_to_client(client_socket, create_group_remove_member_result_packet(
+        request_id=request_id, success=True,
+    ))
+
+    state.logger.info(
+        f"{user.username} (admin) removed {target_username} from group "
+        f"{conversation_id} (remaining: {remaining_usernames})"
+    )
+
+    if remaining_ids:
+        _dispatch_pending_rotation_if_needed(state, conversation_id)
+
+
+# ------------------------------------------------------------------
+# Inbox: verification requests + group member-add approval
+# (Phase 19.13 -- User Manual Feedback Implementation)
+# ------------------------------------------------------------------
+
+
+def _push_inbox_notification(state, recipient_user_id, notification_dict, *, is_response=False):
+    """
+    Best-effort live delivery of one inbox notification to
+    ``recipient_user_id`` if they are currently connected -- a no-op
+    if not; they will see it next time their client sends
+    inbox_list_request (login, or opening the Inbox screen). Mirrors
+    every other "push if online, otherwise it waits" pattern already
+    in this file (e.g. group_key_rotation_required).
+
+    ``is_response`` selects the packet shape: True for "here is the
+    outcome of YOUR earlier request" (create_inbox_response_result_
+    packet, sent to the original requester), False for "here is a
+    brand-new request for YOU to act on" (create_inbox_notification_
+    packet, sent to the recipient).
+    """
+
+    recipient_id_string = str(recipient_user_id)
+
+    for sock, client in list(state.clients.items()):
+
+        if client.get("user_id") == recipient_id_string:
+
+            packet = (
+                create_inbox_response_result_packet(notification_dict)
+                if is_response
+                else create_inbox_notification_packet(notification_dict)
+            )
+
+            send_to_client(sock, packet)
+
+            return
+
+
+def _serialize_verification_notification(notification, requester_username, recipient_username=None):
+    return {
+        "notification_id": str(notification.id),
+        "type": TYPE_VERIFICATION_REQUEST,
+        "status": notification.status,
+        "requester_username": requester_username,
+        "recipient_username": recipient_username,
+        "created_at": notification.created_at.isoformat(),
+    }
+
+
+def _serialize_group_add_notification(notification, requester_username, candidate_username, group_name=None):
+    return {
+        "notification_id": str(notification.id),
+        "type": TYPE_GROUP_ADD_REQUEST,
+        "status": notification.status,
+        "requester_username": requester_username,
+        "candidate_username": candidate_username,
+        "conversation_id": str(notification.conversation_id),
+        "group_name": group_name,
+        "created_at": notification.created_at.isoformat(),
+    }
+
+
+def handle_verification_request(state, client_socket, user, packet):
+    """
+    USER A (the authenticated caller) asks the server to notify
+    USER B (``target_username``) that A wants B to verify A's
+    identity (Phase 19.13 -- Inbox + Verification Request Workflow).
+
+    This handler NEVER performs or influences cryptographic
+    verification itself -- it only records who asked whom
+    (InboxRepository.create_verification_request(), with duplicate
+    protection built in) and, if B is online, pushes a live
+    notification. The actual trust decision happens entirely on B's
+    own client when B approves (see handle_inbox_response()'s own
+    docstring) -- exactly ClientSession.confirm_combined_peer_
+    verification(), called locally with B's own already-observed
+    fingerprint, unchanged and unweakened.
+    """
+
+    target_username = packet.get("target_username")
+
+    if not target_username or target_username == user.username:
+        return
+
+    db = SessionLocal()
+
+    try:
+        user_repo = UserRepository(db)
+        inbox_repo = InboxRepository(db)
+
+        target = user_repo.get_by_username(target_username)
+
+        if target is None:
+            return
+
+        # Phase 19.24 -- Block User: a block in EITHER direction
+        # refuses the request silently, the same as an unknown
+        # username above -- never a distinguishable error, so a
+        # blocked requester cannot use this to confirm they've been
+        # blocked.
+        blocked_repo = BlockedUserRepository(db)
+        if blocked_repo.is_blocked(target.id, user.id) or blocked_repo.is_blocked(user.id, target.id):
+            return
+
+        notification = inbox_repo.create_verification_request(
+            requester_id=user.id, recipient_id=target.id,
+        )
+        inbox_repo.commit()
+
+        notification_dict = _serialize_verification_notification(notification, user.username)
+        recipient_id = target.id
+    finally:
+        db.close()
+
+    _push_inbox_notification(state, recipient_id, notification_dict)
+
+    state.logger.info(
+        f"{user.username} requested verification from {target_username}"
+    )
+
+
+def handle_inbox_list_request(state, client_socket, user, packet):
+    """
+    Return every inbox notification (pending or resolved) where the
+    authenticated caller is either the recipient or the original
+    requester (InboxRepository.get_for_user()) -- mirrors
+    handle_conversation_list_request()'s identical "identity comes
+    from the authenticated socket, request carries no fields" shape.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        inbox_repo = InboxRepository(db)
+        user_repo = UserRepository(db)
+
+        notifications = []
+
+        for notification in inbox_repo.get_for_user(user.id):
+
+            requester = user_repo.get_by_id(notification.requester_user_id)
+            requester_username = requester.username if requester is not None else None
+
+            if notification.type == TYPE_VERIFICATION_REQUEST:
+                notifications.append(
+                    _serialize_verification_notification(notification, requester_username)
+                )
+            else:
+                candidate = user_repo.get_by_id(notification.candidate_user_id)
+                candidate_username = candidate.username if candidate is not None else None
+                conversation = db.get(Conversation, notification.conversation_id)
+                group_name = conversation.name if conversation is not None else None
+                notifications.append(
+                    _serialize_group_add_notification(
+                        notification, requester_username, candidate_username, group_name,
+                    )
+                )
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_inbox_list_result_packet(
+        request_id=request_id, notifications=notifications,
+    ))
+
+
+def handle_inbox_response(state, client_socket, user, packet):
+    """
+    The authenticated caller (the notification's RECIPIENT) approves
+    or denies one pending inbox notification (InboxRepository.
+    resolve() -- pending-only, so a second response to an
+    already-resolved notification is a safe no-op: duplicate-
+    processing protection). Security: which notification and whose
+    decision is always re-derived from the authenticated socket +
+    the notification's own stored recipient_user_id, never trusted
+    from anything else in the packet -- a caller who is not the
+    recipient gets exactly the same "not found" outcome as a bogus
+    notification_id, never a hint that a different notification_id
+    would have worked.
+
+    verification_request: approving here does NOT itself verify
+    anything cryptographically -- see handle_verification_request()'s
+    docstring. This handler only records the outcome and notifies the
+    original requester; the recipient's own client is responsible for
+    having already called confirm_combined_peer_verification() BEFORE
+    sending an approve=True inbox_response (see mobile/app.py's
+    Inbox screen wiring) -- exactly as it would from the existing
+    Verify Identity dialog.
+
+    group_add_request: approving here runs the real membership change
+    through _perform_group_add_members() -- the exact same path an
+    admin's own direct add uses -- rather than re-implementing it.
+    """
+
+    notification_id = packet.get("notification_id")
+    approve = bool(packet.get("approve"))
+
+    if not notification_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        inbox_repo = InboxRepository(db)
+        user_repo = UserRepository(db)
+
+        notification = inbox_repo.get_by_id(uuid.UUID(notification_id))
+
+        if notification is None or notification.recipient_user_id != user.id:
+
+            state.logger.warning(
+                f"Rejected inbox_response: {user.username} is not the "
+                f"recipient of notification {notification_id}"
+            )
+
+            return
+
+        notification_type = notification.type
+        requester_id = notification.requester_user_id
+        conversation_id = notification.conversation_id
+        candidate_id = notification.candidate_user_id
+
+        resolved = inbox_repo.resolve(uuid.UUID(notification_id), approve)
+
+        if resolved is None:
+            # Already resolved (duplicate Approve/Deny) -- no-op.
+            return
+
+        inbox_repo.commit()
+
+        requester = user_repo.get_by_id(requester_id)
+        requester_username = requester.username if requester is not None else None
+
+        if notification_type == TYPE_VERIFICATION_REQUEST:
+            notification_dict = _serialize_verification_notification(
+                resolved, requester_username, recipient_username=user.username,
+            )
+        else:
+            candidate = user_repo.get_by_id(candidate_id)
+            candidate_username = candidate.username if candidate is not None else None
+            conversation = db.get(Conversation, conversation_id)
+            group_name = conversation.name if conversation is not None else None
+            notification_dict = _serialize_group_add_notification(
+                resolved, requester_username, candidate_username, group_name,
+            )
+
+        should_add_member = (
+            notification_type == TYPE_GROUP_ADD_REQUEST and approve
+            and candidate_id not in set(
+                ConversationRepository(db).get_member_user_ids(conversation_id)
+            )
+        )
+        conversation_id_str = str(conversation_id) if conversation_id else None
+        candidate_id_value = candidate_id
+    finally:
+        db.close()
+
+    _push_inbox_notification(state, requester_id, notification_dict, is_response=True)
+
+    state.logger.info(
+        f"{user.username} {'approved' if approve else 'denied'} "
+        f"{notification_type} {notification_id} from {requester_username}"
+    )
+
+    if should_add_member:
+        _perform_group_add_members(
+            state, conversation_id_str, [candidate_id_value], user.username,
+        )
+
+
+# ------------------------------------------------------------------
+# Settings (Phase 19.14): change username/password, profile picture
+# upload/fetch.
+# ------------------------------------------------------------------
+
+# Deliberately smaller than MAX_ATTACHMENT_CIPHERTEXT_BYTES (chat
+# attachments already stream in over the existing, size-tested blob
+# pipeline) -- a profile picture arrives as one single packet, not
+# chunked, so this cap keeps that packet a reasonable size on the
+# wire rather than reusing the much larger attachment limit.
+_MAX_PROFILE_PICTURE_BYTES = 2 * 1024 * 1024
+
+
+def handle_change_username_request(state, client_socket, user, packet):
+    """
+    Rename the authenticated connection's own account (Phase 19.14 --
+    Settings). Identity to change is always ``user`` -- the
+    authenticated socket -- never anything else in the packet.
+
+    Updates this connection's own in-memory state.clients[...]
+    ["username"] immediately on success, so every routing check that
+    reads it (message delivery, group broadcasts, user-list) reflects
+    the new name for the REST OF THIS CONNECTION without requiring a
+    reconnect. Known, disclosed limitation (see Phase 19.14's own
+    final report): other already-open conversations on OTHER clients
+    still reference the OLD username in their own local state until
+    they independently reload it (e.g. a fresh conversation_list_
+    request) -- there is no broadcast-a-rename-to-every-peer packet in
+    this phase's scope.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    new_username = packet.get("new_username")
+
+    db = SessionLocal()
+
+    try:
+        result = AuthenticationService(db).change_username(user.id, new_username)
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_change_username_result_packet(
+        request_id=request_id, success=result["success"], error=result["error"],
+    ))
+
+    if result["success"]:
+        old_username = user.username
+        client = state.get_client(client_socket)
+        if client is not None:
+            client["username"] = new_username
+        user.username = new_username
+        state.logger.info(f"{old_username} changed their username to {new_username}")
+
+
+def handle_change_password_request(state, client_socket, user, packet):
+    """
+    Change the authenticated connection's own account password (Phase
+    19.14 -- Settings). Requires the current password (see
+    AuthenticationService.change_password()'s own docstring for why).
+    Neither the current nor the new password is ever logged -- only
+    the outcome (see AuthenticationService's own _log_auth_event calls).
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    current_password = packet.get("current_password") or ""
+    new_password = packet.get("new_password") or ""
+    confirm_password = packet.get("confirm_password") or ""
+
+    db = SessionLocal()
+
+    try:
+        result = AuthenticationService(db).change_password(
+            user.id, current_password, new_password, confirm_password,
+        )
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_change_password_result_packet(
+        request_id=request_id, success=result["success"], error=result["error"],
+    ))
+
+    if result["success"]:
+        state.logger.info(f"{user.username} changed their password")
+
+
+def handle_block_user_request(state, client_socket, user, packet):
+    """
+    Block ``target_username`` on behalf of the authenticated connection
+    (Phase 19.24 -- Block User). Server-side and persisted (database/
+    models/blocked_user.py), unlike Mute/Archive's local-only
+    preferences -- this must be enforced for every authorized device
+    of both accounts, not just this one connection, and must survive
+    logout/reinstall.
+
+    Directional: only ``user`` (the caller) blocks ``target_username``
+    -- the reverse relationship, if any, is untouched. Blocking
+    yourself, or a username that does not resolve, fails cleanly with
+    an error rather than silently succeeding at nothing.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    target_username = packet.get("target_username")
+
+    db = SessionLocal()
+
+    try:
+        if not target_username:
+            success, error = False, "A username is required."
+        elif target_username == user.username:
+            success, error = False, "You cannot block yourself."
+        else:
+            target = UserRepository(db).get_by_username(target_username)
+            if target is None:
+                success, error = False, "No such user."
+            else:
+                BlockedUserRepository(db).block(user.id, target.id)
+                db.commit()
+                success, error = True, None
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_block_user_result_packet(
+        request_id=request_id, success=success, error=error,
+    ))
+
+    if success:
+        state.logger.info(f"{user.username} blocked {target_username}")
+        # Presence hides each blocked party from the other immediately,
+        # not just from the next unrelated connect/disconnect trigger.
+        broadcast_user_list(state)
+
+
+def handle_unblock_user_request(state, client_socket, user, packet):
+    """Reverse of handle_block_user_request() -- see its own
+    docstring. Unblocking a username that was never blocked, or that
+    does not resolve, is treated as a harmless success (the end state
+    the caller wants -- "not blocked" -- is already true)."""
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    target_username = packet.get("target_username")
+
+    db = SessionLocal()
+
+    try:
+        if not target_username:
+            success, error = False, "A username is required."
+        else:
+            target = UserRepository(db).get_by_username(target_username)
+            if target is not None:
+                BlockedUserRepository(db).unblock(user.id, target.id)
+                db.commit()
+            success, error = True, None
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_unblock_user_result_packet(
+        request_id=request_id, success=success, error=error,
+    ))
+
+    if success:
+        state.logger.info(f"{user.username} unblocked {target_username}")
+        broadcast_user_list(state)
+
+
+def handle_blocked_users_list_request(state, client_socket, user, packet):
+    """Return every username the authenticated connection's own
+    account currently has blocked (Phase 19.24 -- Block User) -- never
+    the reverse direction (who has blocked THIS account), which is
+    never revealed to anyone, mirroring every mainstream messaging
+    app's own privacy model."""
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+        blocked_ids = BlockedUserRepository(db).get_blocked_user_ids(user.id)
+        usernames = sorted(_usernames_for(db, blocked_ids))
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_blocked_users_list_result_packet(
+        request_id=request_id, usernames=usernames,
+    ))
+
+
+def handle_profile_picture_upload_request(state, client_socket, user, packet):
+    """
+    Store a new profile picture for the authenticated connection's own
+    account (Phase 19.14 -- Settings). Reuses storage.encrypted_
+    blob_store.store_blob()/delete_blob() unchanged -- the same
+    generic, payload-agnostic on-disk blob backend chat attachments
+    already use -- rather than a second storage mechanism. Unlike a
+    chat attachment, this is intentionally NOT end-to-end encrypted:
+    a profile picture is meant to be visible to any other user who
+    looks this account up (see create_profile_picture_upload_request_
+    packet()'s own docstring); store_blob() itself has no opinion on
+    that either way, it only ever persists whatever bytes it is given.
+
+    The previous picture's blob (if any) is deleted after the new one
+    is safely stored and committed -- never before, so a failure
+    partway through never leaves the account with no picture at all.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    image_base64 = packet.get("image_base64")
+
+    if not image_base64:
+        send_to_client(client_socket, create_profile_picture_upload_result_packet(
+            request_id=request_id, success=False, error="No image data received.",
+        ))
+        return
+
+    try:
+        image_bytes = base64.b64decode(image_base64, validate=True)
+    except (TypeError, ValueError):
+        send_to_client(client_socket, create_profile_picture_upload_result_packet(
+            request_id=request_id, success=False, error="Malformed image data.",
+        ))
+        return
+
+    if not image_bytes or len(image_bytes) > _MAX_PROFILE_PICTURE_BYTES:
+        send_to_client(client_socket, create_profile_picture_upload_result_packet(
+            request_id=request_id, success=False,
+            error=f"Image must be under {_MAX_PROFILE_PICTURE_BYTES // (1024 * 1024)} MB.",
+        ))
+        return
+
+    old_reference = user.profile_picture
+
+    db = SessionLocal()
+
+    try:
+        new_reference = encrypted_blob_store.store_blob(image_bytes)
+
+        user_repo = UserRepository(db)
+        db_user = user_repo.get_by_id(user.id)
+        user_repo.update_profile_picture(db_user, new_reference, datetime.now(timezone.utc).replace(tzinfo=None))
+        user_repo.commit()
+    finally:
+        db.close()
+
+    user.profile_picture = new_reference
+
+    if old_reference:
+        encrypted_blob_store.delete_blob(old_reference)
+
+    send_to_client(client_socket, create_profile_picture_upload_result_packet(
+        request_id=request_id, success=True,
+    ))
+
+    state.logger.info(f"{user.username} updated their profile picture")
+
+
+def handle_profile_picture_request(state, client_socket, user, packet):
+    """
+    Return another (or this same) account's current profile picture,
+    by username, to the authenticated caller (Phase 19.14 -- Settings/
+    Profile Viewer). ``found=False`` (no image data) for an account
+    with none set, or one that does not exist -- deliberately the
+    SAME response either way, so this cannot be used to enumerate
+    usernames by whether a picture comes back.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    target_username = packet.get("username")
+
+    db = SessionLocal()
+
+    try:
+        target = UserRepository(db).get_by_username(target_username) if target_username else None
+        reference = target.profile_picture if target is not None else None
+    finally:
+        db.close()
+
+    if not reference:
+        send_to_client(client_socket, create_profile_picture_result_packet(
+            request_id=request_id, found=False,
+        ))
+        return
+
+    try:
+        image_bytes = encrypted_blob_store.load_blob(reference)
+    except (encrypted_blob_store.InvalidBlobReference, FileNotFoundError, OSError):
+        send_to_client(client_socket, create_profile_picture_result_packet(
+            request_id=request_id, found=False,
+        ))
+        return
+
+    send_to_client(client_socket, create_profile_picture_result_packet(
+        request_id=request_id, found=True,
+        image_base64=base64.b64encode(image_bytes).decode("ascii"),
+    ))
+
+
+_MAX_BIO_CHARS = 256
+
+
+def handle_change_bio_request(state, client_socket, user, packet):
+    """
+    Set/replace the authenticated connection's own bio (Phase 19.22 --
+    Settings). The User.bio column has existed since the initial
+    migration but had no handler at all until now -- follows
+    handle_change_username_request()'s exact shape: identity to change
+    is always ``user``, this connection's own in-memory copy is
+    updated immediately so it reflects everywhere for the rest of this
+    connection without requiring a reconnect.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    bio = (packet.get("bio") or "").strip()
+
+    if len(bio) > _MAX_BIO_CHARS:
+        send_to_client(client_socket, create_change_bio_result_packet(
+            request_id=request_id, success=False,
+            error=f"Bio must be under {_MAX_BIO_CHARS} characters.",
+        ))
+        return
+
+    db = SessionLocal()
+
+    try:
+        user_repo = UserRepository(db)
+        db_user = user_repo.get_by_id(user.id)
+        user_repo.update_bio(db_user, bio, datetime.now(timezone.utc).replace(tzinfo=None))
+        user_repo.commit()
+    finally:
+        db.close()
+
+    user.bio = bio
+
+    send_to_client(client_socket, create_change_bio_result_packet(
+        request_id=request_id, success=True,
+    ))
+
+    state.logger.info(f"{user.username} updated their bio")
+
+
+def handle_bio_request(state, client_socket, user, packet):
+    """
+    Return another (or this same) account's current bio, by username
+    (Phase 19.22 -- Settings). ``found=False`` for an account with no
+    bio set or one that does not exist -- same account-enumeration
+    guard as handle_profile_picture_request()'s identical choice.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    target_username = packet.get("username")
+
+    db = SessionLocal()
+
+    try:
+        target = UserRepository(db).get_by_username(target_username) if target_username else None
+        bio = target.bio if target is not None else None
+    finally:
+        db.close()
+
+    if not bio:
+        send_to_client(client_socket, create_bio_result_packet(
+            request_id=request_id, found=False,
+        ))
+        return
+
+    send_to_client(client_socket, create_bio_result_packet(
+        request_id=request_id, found=True, bio=bio,
+    ))
+
+
+def handle_last_seen_request(state, client_socket, user, packet):
+    """
+    Phase 19.24 -- Presence/Last Seen. Return another account's last-
+    seen timestamp, by username. Security: ``found=False`` (hiding
+    last_seen_at entirely) whenever the requester has blocked the
+    target OR the target has blocked the requester -- the SAME "hide
+    presence in either direction" rule broadcast_user_list() already
+    enforces for the online/offline signal itself (server/
+    broadcaster.py); last_seen_at is just presence's persisted
+    complement, so it gets the identical privacy treatment, not a
+    weaker one. Also found=False for an unknown username, same
+    account-enumeration guard as handle_bio_request()'s identical
+    choice -- a blocked-vs-nonexistent target must be indistinguishable
+    to the requester.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    target_username = packet.get("username")
+
+    db = SessionLocal()
+
+    try:
+        target = UserRepository(db).get_by_username(target_username) if target_username else None
+
+        if target is None:
+            found = False
+            last_seen_at = None
+        else:
+            blocked_repo = BlockedUserRepository(db)
+            hidden = (
+                blocked_repo.is_blocked(user.id, target.id)
+                or blocked_repo.is_blocked(target.id, user.id)
+            )
+            found = not hidden
+            last_seen_at = (
+                target.last_seen_at.isoformat()
+                if (found and target.last_seen_at) else None
+            )
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_last_seen_result_packet(
+        request_id=request_id, found=found, last_seen_at=last_seen_at,
+    ))
+
+
 def handle_group_key_rotation_complete(state, client_socket, user, packet):
     """
     A rotation initiator has finished attempting distribution of an
@@ -854,6 +1805,25 @@ def handle_group_key_distribution(state, client_socket, user, packet):
     nothing forwarded -- unchanged from the original inline behavior.
     """
 
+    # Phase 16B -- Device State Enforcement (Step 4): a sender whose
+    # OWN connection is bound to a device that has since been REVOKED
+    # must not be able to distribute new key material at all -- checked
+    # first, before anything else, so a revoked device gets no partial
+    # processing. None (never bound a device on this connection --
+    # every pre-Phase-16 client, and every existing test) is
+    # deliberately NOT a rejection -- see is_device_bound_and_authorized()'s
+    # own docstring for why.
+    sender_device_state = is_device_bound_and_authorized(state, client_socket)
+
+    if sender_device_state is False:
+
+        state.logger.warning(
+            f"Rejected group_key_distribution from {user.username}: "
+            f"sender's bound device is not AUTHORIZED"
+        )
+
+        return
+
     conversation_id = packet.get("conversation_id")
     recipient = packet.get("recipient")
 
@@ -959,6 +1929,24 @@ def handle_group_key_distribution(state, client_socket, user, packet):
 
             return
 
+        # Phase 16B -- Device State Enforcement (Step 4): a recipient
+        # whose bound device has been REVOKED must not receive newly
+        # distributed key material either, even though the packet
+        # already reached the server -- this is the server-side half
+        # of "REVOKED cannot receive new cryptographic material"; the
+        # receiving ClientSession's own independent peer-verification
+        # state was in any case never told to trust a revoked device
+        # (defense in depth, see docs/architecture/
+        # multi_device_identity.md).
+        if is_device_bound_and_authorized(state, sock) is False:
+
+            state.logger.warning(
+                f"Dropped group_key_distribution to {recipient}: "
+                f"recipient's bound device is not AUTHORIZED"
+            )
+
+            return
+
         if send_to_client(sock, packet):
 
             state.logger.info(
@@ -978,20 +1966,18 @@ def handle_group_key_distribution(state, client_socket, user, packet):
         return
 
 
-def handle_group_add_members(state, client_socket, user, packet):
+def _perform_group_add_members(state, conversation_id, new_user_ids, acting_username):
     """
-    Add one or more users to an existing group conversation
-    (real-application bug fix, Issue 2 -- Add Members After Group
-    Creation).
-
-    Security: who is requesting the add is derived entirely from the
-    authenticated socket (``user``), never trusted from the packet --
-    mirrors handle_group_leave()'s pattern exactly. Any active member
-    may add members: this app has no owner/role concept (Phase 7's own
-    "any active member" rotation-initiator selection already
-    established that trust model; this reuses it, not a new one). A
-    non-member requester is rejected silently, same as every other
-    group-authorization check in this file.
+    The actual membership-change side of adding members to a group --
+    factored out of handle_group_add_members() (Phase 19.13 -- Group
+    Admin) so both the admin's own direct add and an approved
+    group_add_request (handle_inbox_response()) run through exactly
+    one implementation, never two copies that could drift apart.
+    ``new_user_ids`` must already be filtered to real, not-yet-member
+    user ids -- this function performs no further authorization check
+    of its own (both callers have already established the acting user
+    is allowed to do this, by different means: direct admin identity,
+    or a resolved admin-approved inbox notification).
 
     Deliberately reuses the exact epoch-rotation machinery a leave
     already uses, rather than a new key-distribution path:
@@ -999,50 +1985,13 @@ def handle_group_add_members(state, client_socket, user, packet):
     for a leave, and the unchanged _dispatch_pending_rotation_if_needed()
     picks a currently-connected active member to generate/redistribute
     that new epoch's key to every current member, old and new alike.
-    Consequence (intentional, not a side effect): a newly added member
-    receives only the new epoch's key -- they cannot decrypt group
-    history from before they joined -- while existing members keep
-    their old epoch key (their own history stays readable) and also
-    receive the new one, so everyone can keep talking.
     """
-
-    conversation_id = packet.get("conversation_id")
-    member_usernames = packet.get("members") or []
-
-    if not conversation_id or not member_usernames:
-        return
 
     db = SessionLocal()
 
     try:
         conversation_repo = ConversationRepository(db)
-        user_repo = UserRepository(db)
-        conversation_uuid = uuid.UUID(conversation_id)
-
-        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
-
-        if user.id not in member_ids:
-
-            state.logger.warning(
-                f"Rejected group_add_members: {user.username} is not a "
-                f"member of {conversation_id}"
-            )
-
-            return
-
-        new_user_ids = []
-
-        for username in member_usernames:
-
-            candidate = user_repo.get_by_username(username)
-
-            if candidate is None or candidate.id in member_ids:
-                continue
-
-            new_user_ids.append(candidate.id)
-
-        if not new_user_ids:
-            return
+        conversation_uuid = uuid.UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
 
         affected = conversation_repo.add_members(conversation_uuid, new_user_ids)
 
@@ -1062,7 +2011,7 @@ def handle_group_add_members(state, client_socket, user, packet):
         db.close()
 
     members_added_packet = create_group_members_added_packet(
-        conversation_id=conversation_id,
+        conversation_id=str(conversation_uuid),
         name=name,
         members=all_usernames,
     )
@@ -1075,8 +2024,125 @@ def handle_group_add_members(state, client_socket, user, packet):
             send_to_client(sock, members_added_packet)
 
     state.logger.info(
-        f"{user.username} added members to group {conversation_id} "
+        f"{acting_username} added members to group {conversation_id} "
         f"(now: {all_usernames})"
+    )
+
+    _dispatch_pending_rotation_if_needed(state, str(conversation_uuid))
+
+
+def handle_group_add_members(state, client_socket, user, packet):
+    """
+    Add one or more users to an existing group conversation
+    (real-application bug fix, Issue 2 -- Add Members After Group
+    Creation).
+
+    Security: who is requesting the add is derived entirely from the
+    authenticated socket (``user``), never trusted from the packet --
+    mirrors handle_group_leave()'s pattern exactly. A non-member
+    requester is rejected silently, same as every other group-
+    authorization check in this file.
+
+    Phase 19.13 -- Group Admin: this app used to have no owner/role
+    concept at all, and any active member could add members directly.
+    Now the group's admin (ConversationRepository.get_admin_user_id(),
+    recorded at creation -- see create_group_conversation()) can still
+    add directly, through _perform_group_add_members() below -- but a
+    NON-admin member's request creates a pending group_add_request
+    inbox notification addressed to the admin instead of performing
+    the add immediately; nothing about group membership changes until
+    the admin approves it (handle_inbox_response()). A group with no
+    recorded admin at all (created before this phase existed) keeps
+    the old "any member" behavior unchanged -- there is no admin to
+    route a request to.
+    """
+
+    conversation_id = packet.get("conversation_id")
+    member_usernames = packet.get("members") or []
+
+    if not conversation_id or not member_usernames:
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        user_repo = UserRepository(db)
+        inbox_repo = InboxRepository(db)
+        conversation_uuid = uuid.UUID(conversation_id)
+
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+        if user.id not in member_ids:
+
+            state.logger.warning(
+                f"Rejected group_add_members: {user.username} is not a "
+                f"member of {conversation_id}"
+            )
+
+            return
+
+        candidates = []
+        blocked_repo = BlockedUserRepository(db)
+
+        for username in member_usernames:
+
+            candidate = user_repo.get_by_username(username)
+
+            if candidate is None or candidate.id in member_ids:
+                continue
+
+            # Phase 19.24 -- Block User: mirrors handle_group_create()'s
+            # own identical exclusion -- a block in either direction
+            # between the requester and a candidate silently excludes
+            # them from being added, never a distinguishable error.
+            if blocked_repo.is_blocked(candidate.id, user.id) or blocked_repo.is_blocked(user.id, candidate.id):
+                continue
+
+            candidates.append(candidate)
+
+        if not candidates:
+            return
+
+        admin_id = conversation_repo.get_admin_user_id(conversation_uuid)
+
+        if admin_id is not None and admin_id != user.id:
+
+            # Non-admin request -- create a pending approval instead
+            # of adding anyone yet.
+            notifications = []
+
+            for candidate in candidates:
+                notification = inbox_repo.create_group_add_request(
+                    requester_id=user.id, admin_id=admin_id,
+                    conversation_id=conversation_uuid, candidate_id=candidate.id,
+                )
+                notifications.append((notification, candidate))
+
+            inbox_repo.commit()
+
+            admin_user = db.get(User, admin_id)
+            admin_username = admin_user.username if admin_user is not None else None
+        else:
+            new_user_ids = [candidate.id for candidate in candidates]
+            notifications = None
+    finally:
+        db.close()
+
+    if notifications is None:
+        _perform_group_add_members(state, conversation_id, new_user_ids, user.username)
+        return
+
+    for notification, candidate in notifications:
+
+        _push_inbox_notification(
+            state, admin_id,
+            _serialize_group_add_notification(notification, user.username, candidate.username),
+        )
+
+    state.logger.info(
+        f"{user.username} requested adding {[c.username for _, c in notifications]} "
+        f"to group {conversation_id} -- awaiting approval from {admin_username}"
     )
 
     _dispatch_pending_rotation_if_needed(state, conversation_id)
@@ -1158,6 +2224,705 @@ def handle_read_receipt(state, client_socket, user, packet):
         f"{user.username} read {len(newly_read_message_ids)} message(s) "
         f"in conversation {conversation_id}"
     )
+
+
+def handle_typing_indicator(state, client_socket, user, packet):
+    """
+    Relay a live "is typing" / "stopped typing" hint to the other
+    currently-active member(s) of a conversation (Phase 19.24 --
+    Typing Indicator).
+
+    Security: the actor is always ``user.id`` -- create_typing_
+    indicator_packet() carries no sender field at all, mirroring
+    handle_read_receipt()'s identical pattern; membership is
+    re-derived from the database (get_member_user_ids(), the same
+    check every other conversation-scoped handler in this file uses),
+    so a non-member's packet is silently ignored, never trusted to
+    announce typing in a conversation the sender cannot even see.
+
+    Deliberately NOT persisted anywhere, and never replayed through
+    message_history_request -- purely a live, ephemeral hint, exactly
+    like create_typing_indicator_packet()'s own docstring states.
+
+    Unlike read receipts (and edit/delete/reaction, which broadcast
+    back to the actor too so their OWN other devices/UI can react),
+    the sender's own socket is explicitly excluded from the relay
+    here: there is no reason for a client to be told about its own
+    typing state, and echoing it back would only cost bandwidth for
+    something the sender already knows.
+    """
+
+    conversation_id = packet.get("conversation_id")
+
+    if not conversation_id:
+        return
+
+    is_typing = bool(packet.get("is_typing"))
+
+    db = SessionLocal()
+
+    try:
+        try:
+            conversation_uuid = uuid.UUID(conversation_id)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        conversation_repo = ConversationRepository(db)
+
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+
+        if user.id not in member_ids:
+
+            state.logger.warning(
+                f"Rejected typing_indicator: {user.username} is not a "
+                f"member of conversation {conversation_id}"
+            )
+
+            return
+
+        recipient_id_strings = {
+            str(member_id) for member_id in member_ids if member_id != user.id
+        }
+
+        # Phase 19.24 -- Block User: a DIRECT conversation is always
+        # exactly two members -- if either has blocked the other, ANY
+        # live hint about the sender's typing must not reach them
+        # (mirrors the "chat" packet's own block enforcement). Groups
+        # are deliberately excluded (member_ids has more than two
+        # members) -- see database/models/blocked_user.py's own
+        # docstring for why a 1:1 block never reaches into a shared
+        # group thread.
+        if len(member_ids) == 2:
+            blocked_repo = BlockedUserRepository(db)
+            other_id = next((m for m in member_ids if m != user.id), None)
+            if other_id is not None and (
+                blocked_repo.is_blocked(other_id, user.id)
+                or blocked_repo.is_blocked(user.id, other_id)
+            ):
+                recipient_id_strings = set()
+    finally:
+        db.close()
+
+    notification = create_typing_indicator_notification_packet(
+        conversation_id=conversation_id,
+        username=user.username,
+        is_typing=is_typing,
+    )
+
+    for sock, client in list(state.clients.items()):
+
+        if sock is client_socket:
+            continue
+
+        if client.get("user_id") in recipient_id_strings:
+            send_to_client(sock, notification)
+
+
+# ======================================================================
+# Phase 19.24 -- Message Lifecycle Events (edit/delete/reactions).
+#
+# Every handler below shares the SAME authorization shape: the actor
+# is ALWAYS user.id (the authenticated socket, from dispatch's own
+# lookup -- see the module-level note at the "chat" branch: "the
+# client-supplied sender field is never trustworthy"), NEVER a
+# client-supplied field, and a target message's authorization fact
+# (its sender_id, or its conversation membership) is ALWAYS re-derived
+# from the database, never trusted from the packet. A request that
+# fails either check is silently rejected (logged, not error-reported
+# to the sender) -- mirrors handle_read_receipt()'s own fail-closed,
+# no-op-on-rejection behavior.
+# ======================================================================
+
+
+def _broadcast_to_conversation_members(state, packet, member_id_strings, exclude_socket=None):
+    """
+    Send ``packet`` to every currently-connected socket belonging to
+    any of ``member_id_strings`` (a set of str(user.id)) -- the shared
+    fan-out shape handle_read_receipt() already established, factored
+    out because Phase 19.24 adds five more handlers that need the
+    identical broadcast, now including the ACTOR's own other
+    authorized devices (multi-device sync -- unlike read receipts,
+    which have no reason to tell a user about their own read action,
+    an edit/delete/reaction must reach every one of the actor's own
+    other logged-in devices too, so ``member_id_strings`` is expected
+    to include the actor here, not exclude them).
+
+    L-1 -- Device Revocation: a socket whose bound device has since
+    been revoked is skipped, exactly like handle_chat()'s own
+    direct-relay loop already does -- an already-connected revoked
+    device must not continue receiving ordinary protected chat
+    traffic, and an edit/delete/reaction notification carries exactly
+    that (re-encrypted content, or the fact that protected content was
+    removed).
+
+    ``exclude_socket``, when given, is skipped regardless of whose
+    device it is -- used to avoid echoing a notification back to the
+    exact socket that just sent the request it resulted from (that
+    client already knows; it applied the change locally the moment its
+    own request was accepted).
+    """
+
+    for sock, client in list(state.clients.items()):
+
+        if sock is exclude_socket:
+            continue
+
+        if client.get("user_id") not in member_id_strings:
+            continue
+
+        if is_device_bound_and_authorized(state, sock) is False:
+            continue
+
+        send_to_client(sock, packet)
+
+
+def handle_message_edit(state, client_socket, user, packet):
+    """
+    Re-encrypt an existing message's content in place (Phase 19.24).
+
+    Security: authorization is "the authenticated socket IS this
+    message's ORIGINAL sender" -- re-derived from the stored row
+    (message.sender_id), never from anything in the packet. No other
+    actor (not a group admin, not any other member) may ever edit
+    someone else's message; this is deliberately narrower than the
+    admin-authorized delete-for-everyone policy could have been,
+    because an edit changes the APPARENT AUTHOR'S OWN WORDS, which no
+    one but that author should ever be able to produce.
+
+    Out-of-order/replay protection: expected_edit_version must match
+    the row's CURRENT edit_version exactly (0 for a never-edited
+    message) -- a stale or duplicate/replayed message_edit packet
+    (naming a version this row has already moved past) is rejected,
+    never silently applied and never silently ignored without telling
+    the sender their edit did not take effect.
+    """
+
+    message_id_raw = packet.get("message_id")
+
+    if not message_id_raw:
+        return
+
+    db = SessionLocal()
+
+    try:
+        try:
+            message_uuid = uuid.UUID(message_id_raw)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        message_repo = MessageRepository(db)
+        message = message_repo.get_message(message_uuid)
+
+        if message is None:
+            state.logger.warning(
+                f"Rejected message_edit: {user.username} referenced "
+                f"unknown message {message_id_raw}"
+            )
+            return
+
+        if message.sender_id != user.id:
+            state.logger.warning(
+                f"Rejected message_edit: {user.username} is not the "
+                f"sender of message {message_id_raw}"
+            )
+            return
+
+        if message.deleted_at is not None:
+            state.logger.warning(
+                f"Rejected message_edit: message {message_id_raw} was "
+                f"already deleted"
+            )
+            return
+
+        expected_edit_version = packet.get("expected_edit_version")
+
+        if expected_edit_version is None or int(expected_edit_version) != message.edit_version:
+            state.logger.warning(
+                f"Rejected message_edit: stale edit_version for "
+                f"message {message_id_raw} (expected "
+                f"{message.edit_version}, client sent {expected_edit_version!r})"
+            )
+            return
+
+        ciphertext = packet.get("ciphertext")
+
+        if not ciphertext:
+            return
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(message.conversation_id)
+
+        message_repo.apply_edit(
+            message,
+            ciphertext=ciphertext,
+            content_metadata=packet.get("content_metadata"),
+            epoch=packet.get("epoch") or 1,
+            message_signature=packet.get("message_signature"),
+        )
+
+        db.commit()
+
+        conversation_id = str(message.conversation_id) if message.conversation_id else None
+        edited_at = message.edited_at.isoformat() if message.edited_at else None
+        edit_version = message.edit_version
+        response_ciphertext = message.ciphertext
+        response_content_metadata = message.content_metadata
+        response_epoch = message.epoch
+        response_signature = message.message_signature
+        member_id_strings = {str(member_id) for member_id in member_ids}
+    finally:
+        db.close()
+
+    notification = create_message_edited_notification_packet(
+        message_id=message_id_raw,
+        conversation_id=conversation_id,
+        ciphertext=response_ciphertext,
+        content_metadata=response_content_metadata,
+        epoch=response_epoch,
+        message_signature=response_signature,
+        editor=user.username,
+        edited_at=edited_at,
+        edit_version=edit_version,
+    )
+
+    _broadcast_to_conversation_members(state, notification, member_id_strings)
+
+    state.logger.info(f"{user.username} edited message {message_id_raw}")
+
+
+def handle_message_delete_for_me(state, client_socket, user, packet):
+    """
+    Hide a message for the requesting user only (Phase 19.24). No
+    broadcast at all -- this is a per-viewer preference, invisible to
+    every other participant, by design (see database/models/
+    message_hidden_for_user.py's own docstring). The ONLY reason this
+    is a server-side row at all (rather than pure client-local state)
+    is so it synchronizes to the requesting user's OWN other
+    authorized devices -- handled by simply being read back on their
+    next history request, not by a live notification.
+    """
+
+    message_id_raw = packet.get("message_id")
+
+    if not message_id_raw:
+        return
+
+    db = SessionLocal()
+
+    try:
+        try:
+            message_uuid = uuid.UUID(message_id_raw)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        message_repo = MessageRepository(db)
+        message = message_repo.get_message(message_uuid)
+
+        if message is None:
+            return
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(message.conversation_id)
+
+        if user.id not in member_ids:
+            state.logger.warning(
+                f"Rejected message_delete_for_me: {user.username} is not "
+                f"a member of the conversation containing {message_id_raw}"
+            )
+            return
+
+        message_repo.hide_for_user(message_uuid, user.id)
+
+        db.commit()
+    finally:
+        db.close()
+
+    state.logger.info(f"{user.username} hid message {message_id_raw} for themself")
+
+
+def handle_message_delete_for_everyone(state, client_socket, user, packet):
+    """
+    Real, authorized global deletion (Phase 19.24). Security:
+    authorization is "the authenticated socket IS this message's
+    ORIGINAL sender", re-derived from the stored row, exactly like
+    handle_message_edit() -- no client-supplied actor field, no
+    broader "any admin can delete" policy (see database/models/
+    message.py::deleted_by's own docstring for why).
+
+    Deletion is REAL: MessageRepository.apply_delete_for_everyone()
+    nulls ciphertext/content_metadata/message_signature/blob_ref on
+    this row in the same transaction this handler commits, and (for a
+    blob-stored FILE/IMAGE payload) the referenced encrypted_blob_
+    store file is removed too, best-effort, AFTER the commit succeeds
+    (so a blob-deletion failure can never leave the database row
+    half-updated). What is left server-side afterward is exactly:
+    message_id, sender_id, conversation_id, timestamp, deleted_at,
+    deleted_by -- enough to render "Message deleted" in the right
+    place in history, nothing that could reconstruct the original
+    content.
+    """
+
+    message_id_raw = packet.get("message_id")
+
+    if not message_id_raw:
+        return
+
+    db = SessionLocal()
+
+    try:
+        try:
+            message_uuid = uuid.UUID(message_id_raw)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        message_repo = MessageRepository(db)
+        message = message_repo.get_message(message_uuid)
+
+        if message is None:
+            return
+
+        if message.sender_id != user.id:
+            state.logger.warning(
+                f"Rejected message_delete_for_everyone: {user.username} "
+                f"is not the sender of message {message_id_raw}"
+            )
+            return
+
+        if message.deleted_at is not None:
+            # Already deleted -- idempotent no-op, not an error (a
+            # retried/duplicate delete request must not fail or
+            # re-broadcast).
+            return
+
+        blob_ref_to_remove = message.blob_ref
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(message.conversation_id)
+
+        message_repo.apply_delete_for_everyone(message, deleted_by_user_id=user.id)
+
+        db.commit()
+
+        conversation_id = str(message.conversation_id) if message.conversation_id else None
+        deleted_at = message.deleted_at.isoformat() if message.deleted_at else None
+        member_id_strings = {str(member_id) for member_id in member_ids}
+    finally:
+        db.close()
+
+    if blob_ref_to_remove:
+        try:
+            encrypted_blob_store.delete_blob(blob_ref_to_remove)
+        except Exception as error:  # noqa: BLE001
+            # The database row is ALREADY committed as deleted at this
+            # point -- a blob-cleanup failure here is a storage-hygiene
+            # issue to log, never a reason to tell the sender their
+            # deletion failed (it did not).
+            state.logger.warning(
+                f"Could not remove blob {blob_ref_to_remove} for deleted "
+                f"message {message_id_raw}: {error}"
+            )
+
+    notification = create_message_deleted_notification_packet(
+        message_id=message_id_raw,
+        conversation_id=conversation_id,
+        deleted_by=user.username,
+        deleted_at=deleted_at,
+    )
+
+    _broadcast_to_conversation_members(state, notification, member_id_strings)
+
+    state.logger.info(f"{user.username} deleted message {message_id_raw} for everyone")
+
+
+def handle_message_pin(state, client_socket, user, packet):
+    """
+    Pin a message for every member of its conversation (Phase 19.24 --
+    Pinned Messages).
+
+    Trust model: pin/unpin carries no content of its own -- unlike
+    reaction_add/message_edit, there is no ciphertext to encrypt,
+    relay, or independently verify via ML-DSA. What this handler
+    protects is authorization (who may pin), and that rests on the
+    SAME trust boundary every other conversation-scoped action in this
+    file already relies on: the authenticated TLS connection itself.
+    ``pinned_by`` in the resulting notification is always user.username
+    (server-derived), never a client-supplied field -- a malicious
+    client cannot forge who performed the pin, exactly like deleted_by
+    on delete-for-everyone.
+
+    Authorization is "currently an ACTIVE member of the message's
+    conversation" -- deliberately broader than edit/delete's sender-
+    only rule (see database/models/message.py::pinned_at's own
+    docstring): any participant may pin/unpin any message, matching
+    ordinary messenger conventions (WhatsApp/Telegram/Signal all allow
+    any participant to pin in a direct chat; this project does not
+    special-case group admin-only pinning, since the mandate's own
+    phrasing -- "group admin behavior if applicable" -- does not
+    require it, and adding a bespoke admin-only restriction here would
+    be an unrequested extra rule, not a security fix).
+
+    Idempotent-ish: re-pinning an already-pinned message simply
+    updates pinned_at/pinned_by to reflect the latest pin action, and
+    still broadcasts (a re-pin is a real, useful event -- e.g. "bumping"
+    a pin back to the top of a pinned-messages view).
+    """
+
+    message_id_raw = packet.get("message_id")
+
+    if not message_id_raw:
+        return
+
+    db = SessionLocal()
+
+    try:
+        try:
+            message_uuid = uuid.UUID(message_id_raw)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        message_repo = MessageRepository(db)
+        message = message_repo.get_message(message_uuid)
+
+        if message is None:
+            return
+
+        if message.deleted_at is not None:
+            state.logger.warning(
+                f"Rejected message_pin: message {message_id_raw} was "
+                f"already deleted"
+            )
+            return
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(message.conversation_id)
+
+        if user.id not in member_ids:
+            state.logger.warning(
+                f"Rejected message_pin: {user.username} is not a "
+                f"member of the conversation containing {message_id_raw}"
+            )
+            return
+
+        message_repo.pin_message(message_uuid, user.id)
+
+        db.commit()
+
+        conversation_id = str(message.conversation_id) if message.conversation_id else None
+        pinned_at = message.pinned_at.isoformat() if message.pinned_at else None
+        member_id_strings = {str(member_id) for member_id in member_ids}
+    finally:
+        db.close()
+
+    notification = create_message_pinned_notification_packet(
+        message_id=message_id_raw,
+        conversation_id=conversation_id,
+        pinned_by=user.username,
+        pinned_at=pinned_at,
+    )
+
+    _broadcast_to_conversation_members(state, notification, member_id_strings)
+
+    state.logger.info(f"{user.username} pinned message {message_id_raw}")
+
+
+def handle_message_unpin(state, client_socket, user, packet):
+    """
+    Unpin a message (Phase 19.24 -- Pinned Messages). Same membership-
+    based authorization as handle_message_pin() -- any active member
+    may unpin, not only whoever originally pinned it. Idempotent: an
+    already-unpinned message is a silent no-op, no broadcast (there is
+    nothing new for other members to learn).
+    """
+
+    message_id_raw = packet.get("message_id")
+
+    if not message_id_raw:
+        return
+
+    db = SessionLocal()
+
+    try:
+        try:
+            message_uuid = uuid.UUID(message_id_raw)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        message_repo = MessageRepository(db)
+        message = message_repo.get_message(message_uuid)
+
+        if message is None:
+            return
+
+        if message.pinned_at is None:
+            return
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(message.conversation_id)
+
+        if user.id not in member_ids:
+            state.logger.warning(
+                f"Rejected message_unpin: {user.username} is not a "
+                f"member of the conversation containing {message_id_raw}"
+            )
+            return
+
+        message_repo.unpin_message(message_uuid)
+
+        db.commit()
+
+        conversation_id = str(message.conversation_id) if message.conversation_id else None
+        member_id_strings = {str(member_id) for member_id in member_ids}
+    finally:
+        db.close()
+
+    notification = create_message_unpinned_notification_packet(
+        message_id=message_id_raw,
+        conversation_id=conversation_id,
+        unpinned_by=user.username,
+    )
+
+    _broadcast_to_conversation_members(state, notification, member_id_strings)
+
+    state.logger.info(f"{user.username} unpinned message {message_id_raw}")
+
+
+def handle_reaction_add(state, client_socket, user, packet):
+    """
+    Set/replace the authenticated user's reaction on a message (Phase
+    19.24). Security: the actor is always user.id; authorization is
+    "currently an active member of the message's conversation" -- any
+    member may react (unlike edit/delete, which are sender-only),
+    matching the general chat-participation model every other
+    conversation-scoped action in this file already uses (e.g.
+    handle_read_receipt()'s identical membership check).
+
+    ``ciphertext`` is opaque to the server -- the AES-256-GCM-encrypted
+    reaction string (payload/reaction_adapter.py), under the
+    conversation's current epoch key. The server persists it and
+    relays it; it never decrypts or inspects it.
+    """
+
+    message_id_raw = packet.get("message_id")
+    ciphertext = packet.get("ciphertext")
+
+    if not message_id_raw or not ciphertext:
+        return
+
+    db = SessionLocal()
+
+    try:
+        try:
+            message_uuid = uuid.UUID(message_id_raw)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        message_repo = MessageRepository(db)
+        message = message_repo.get_message(message_uuid)
+
+        if message is None or message.deleted_at is not None:
+            return
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(message.conversation_id)
+
+        if user.id not in member_ids:
+            state.logger.warning(
+                f"Rejected reaction_add: {user.username} is not a member "
+                f"of the conversation containing {message_id_raw}"
+            )
+            return
+
+        epoch = packet.get("epoch") or 1
+        message_signature = packet.get("message_signature")
+
+        message_repo.upsert_reaction(
+            message_uuid, user.id, ciphertext=ciphertext, epoch=epoch,
+            message_signature=message_signature,
+        )
+
+        db.commit()
+
+        conversation_id = str(message.conversation_id) if message.conversation_id else None
+        member_id_strings = {str(member_id) for member_id in member_ids}
+    finally:
+        db.close()
+
+    notification = create_reaction_updated_notification_packet(
+        message_id=message_id_raw,
+        conversation_id=conversation_id,
+        actor=user.username,
+        action="add",
+        ciphertext=ciphertext,
+        message_signature=message_signature,
+        epoch=epoch,
+    )
+
+    _broadcast_to_conversation_members(state, notification, member_id_strings)
+
+    state.logger.info(f"{user.username} reacted to message {message_id_raw}")
+
+
+def handle_reaction_remove(state, client_socket, user, packet):
+    """
+    Remove the authenticated user's reaction from a message, if any
+    (Phase 19.24). Same membership authorization as handle_reaction_
+    add(); idempotent -- removing a reaction that does not exist is a
+    silent no-op, not an error, and triggers no broadcast (there is
+    nothing for other members to newly learn).
+    """
+
+    message_id_raw = packet.get("message_id")
+
+    if not message_id_raw:
+        return
+
+    db = SessionLocal()
+
+    try:
+        try:
+            message_uuid = uuid.UUID(message_id_raw)
+        except (ValueError, AttributeError, TypeError):
+            return
+
+        message_repo = MessageRepository(db)
+        message = message_repo.get_message(message_uuid)
+
+        if message is None:
+            return
+
+        conversation_repo = ConversationRepository(db)
+        member_ids = conversation_repo.get_member_user_ids(message.conversation_id)
+
+        if user.id not in member_ids:
+            state.logger.warning(
+                f"Rejected reaction_remove: {user.username} is not a "
+                f"member of the conversation containing {message_id_raw}"
+            )
+            return
+
+        removed = message_repo.remove_reaction(message_uuid, user.id)
+
+        if not removed:
+            db.rollback()
+            return
+
+        db.commit()
+
+        conversation_id = str(message.conversation_id) if message.conversation_id else None
+        member_id_strings = {str(member_id) for member_id in member_ids}
+    finally:
+        db.close()
+
+    notification = create_reaction_updated_notification_packet(
+        message_id=message_id_raw,
+        conversation_id=conversation_id,
+        actor=user.username,
+        action="remove",
+    )
+
+    _broadcast_to_conversation_members(state, notification, member_id_strings)
+
+    state.logger.info(f"{user.username} removed their reaction on message {message_id_raw}")
 
 
 def handle_user_lookup(state, client_socket, user, packet):
@@ -1251,6 +3016,16 @@ def handle_user_lookup(state, client_socket, user, packet):
             try:
                 found = user_repo.get_by_id(uuid.UUID(identifier))
             except (TypeError, ValueError, AttributeError):
+                found = None
+
+        # Phase 19.24 -- Block User: a block in EITHER direction makes
+        # this lookup report "not found", the exact same response a
+        # well-formed-but-nonexistent search already produces -- never
+        # a distinguishable "found but blocked" result, matching this
+        # handler's own stated privacy contract for a malformed guess.
+        if found is not None:
+            blocked_repo = BlockedUserRepository(db)
+            if blocked_repo.is_blocked(found.id, user.id) or blocked_repo.is_blocked(user.id, found.id):
                 found = None
     finally:
         db.close()
@@ -1719,8 +3494,10 @@ def handle_register_request(state, client_socket, packet):
 
 def handle_login_request(state, client_socket, packet):
     """
-    Authenticate a not-yet-authenticated connection via username/email
-    + password (D2 -- Server-Side API / Authentication Migration; final
+    Authenticate a not-yet-authenticated connection via phone number
+    + password (UI Finalization -- Login Identifier: username/email are
+    no longer accepted here -- see AuthenticationService.
+    authenticate_user()) (D2 -- Server-Side API / Authentication Migration; final
     slice, migrating gui/main_window.py's and client/client.py's
     previous direct, local AuthenticationService.authenticate_user()
     call off the client). Runs from authenticate_connection(), before
@@ -2037,18 +3814,23 @@ def handle_conversation_list_request(state, client_socket, user, packet):
     place.
 
     Reuses ConversationRepository.get_conversation_previews_for_user()
-    completely unchanged. Each row is serialized into a plain dict --
-    conversation_id, is_group, group_name, participants (usernames),
-    and an optional latest_message (payload_type, ciphertext, epoch,
-    timestamp, content_metadata) -- mirroring exactly what
-    ClientSession.load_conversations()/_build_latest_message_preview()
-    used to read directly off the ORM rows. ``ciphertext`` is only
-    ever this already-encrypted, opaque value -- decryption stays
-    entirely client-side; the server does not decrypt, inspect, or
-    alter it. A FILE/IMAGE latest_message's ciphertext is None here
-    exactly as it is in the database (see persist_message()) --
-    previews never need blob content, only payload_type/
-    content_metadata (e.g. filename) to render.
+    -- now additionally returning unread_count (BUG -- Offline Unread/
+    Notification) alongside its previously unchanged fields. Each row
+    is serialized into a plain dict -- conversation_id, is_group,
+    group_name, participants (usernames), an optional latest_message
+    (payload_type, ciphertext, epoch, timestamp, content_metadata),
+    and unread_count -- mirroring exactly what ClientSession.
+    load_conversations()/_build_latest_message_preview() used to read
+    directly off the ORM rows. ``ciphertext`` is only ever this
+    already-encrypted, opaque value -- decryption stays entirely
+    client-side; the server does not decrypt, inspect, or alter it. A
+    FILE/IMAGE latest_message's ciphertext is None here exactly as it
+    is in the database (see persist_message()) -- previews never need
+    blob content, only payload_type/content_metadata (e.g. filename)
+    to render. unread_count is a plain integer derived from this
+    user's own MessageRecipient.status rows (see _get_unread_counts())
+    -- message-state metadata only, never message content or key
+    material.
 
     A missing request_id is silently ignored, mirroring every other
     D2/D3/D4 handler's identical guard.
@@ -2084,14 +3866,36 @@ def handle_conversation_list_request(state, client_socket, user, packet):
                     "content_metadata": preview.latest_message.content_metadata or {},
                 }
 
+            admin_username = None
+
+            if is_group:
+                # Phase 19.13 -- Group Admin: so a client can show/
+                # hide admin-only controls (Remove Member) the moment
+                # a group appears in the sidebar, not only right after
+                # creating it. Server-enforced regardless (see
+                # handle_group_remove_member()) -- this is purely a UI
+                # convenience, never trusted as the actual check.
+                admin_id = conversation_repo.get_admin_user_id(preview.conversation.id)
+                if admin_id is not None:
+                    admin_user = db.get(User, admin_id)
+                    admin_username = admin_user.username if admin_user is not None else None
+
             conversations.append({
                 "conversation_id": str(preview.conversation.id),
                 "is_group": is_group,
                 "group_name": preview.conversation.name,
+                "admin_username": admin_username,
                 "participants": [
                     participant.username for participant in preview.participants
                 ],
                 "latest_message": latest_message,
+                # BUG -- Offline Unread/Notification: additive field,
+                # the server-authoritative count of this user's own
+                # not-yet-READ MessageRecipient rows in this
+                # conversation (ConversationRepository.
+                # _get_unread_counts()) -- message-state metadata
+                # only, never message content or key material.
+                "unread_count": preview.unread_count,
             })
     finally:
         db.close()
@@ -2136,6 +3940,61 @@ def _read_status_for_own_message(message_repo, message, is_group, member_ids):
         return False
 
     return all(row.status == MessageDeliveryStatus.READ for row in relevant_rows)
+
+
+def _delivery_status_for_own_message(message_repo, message, is_group, member_ids):
+    """
+    Phase 19.23 -- Issue 3/5 (tri-state ticks survive history reload):
+    additive companion to _read_status_for_own_message() above, which
+    deliberately only ever returns True/False/None and therefore
+    cannot distinguish QUEUED from DELIVERED (both are simply "not
+    every relevant row is READ"). That flattening is exactly right for
+    ``read_status``'s own existing bool/None contract (left byte-for-
+    byte unchanged here, including for every test asserting `is True`/
+    `is False`/`is None` against it) but is exactly wrong for a client
+    that wants to render a genuine three-state SENT/DELIVERED/READ
+    tick that survives reconnect/history-reload -- Phase 19.14's live
+    "message_delivered" packet only ever reaches a client that is
+    connected at the moment delivery happens, so a client who was
+    offline then and reconnects later has no other way to recover it.
+
+    Returns the MessageDeliveryStatus string value ("queued" /
+    "delivered" / "read") for the worst-case (least-delivered) row
+    among the relevant recipients, or None when there is nothing to
+    report -- no recipient rows at all (a legacy message, mirroring
+    _read_status_for_own_message()'s own None case exactly), or (group
+    case) no currently-relevant row. "Worst case" mirrors the existing
+    all()-based READ computation above: a group message only counts as
+    READ once EVERY active recipient has read it, so it only counts as
+    DELIVERED once every active recipient has at least received it,
+    and remains QUEUED while even one still has not.
+    """
+
+    recipient_rows = message_repo.get_recipients_for_message(message.id)
+
+    if not recipient_rows:
+        return None
+
+    if is_group:
+        relevant_rows = [
+            row for row in recipient_rows if row.recipient_id in member_ids
+        ]
+    else:
+        relevant_rows = recipient_rows
+
+    if not relevant_rows:
+        return None
+
+    if all(row.status == MessageDeliveryStatus.READ for row in relevant_rows):
+        return MessageDeliveryStatus.READ.value
+
+    if all(
+        row.status in (MessageDeliveryStatus.DELIVERED, MessageDeliveryStatus.READ)
+        for row in relevant_rows
+    ):
+        return MessageDeliveryStatus.DELIVERED.value
+
+    return MessageDeliveryStatus.QUEUED.value
 
 
 def handle_message_history_request(state, client_socket, user, packet):
@@ -2244,6 +4103,28 @@ def handle_message_history_request(state, client_socket, user, packet):
                     if member is not None:
                         usernames_by_id[member_id] = member.username
 
+                # Phase 19.24 -- Issue: Delete For Me. Filtered out
+                # BEFORE building the payload, not merely marked --
+                # this user asked for these to disappear from their
+                # own history entirely, on every one of their own
+                # devices (that is the whole point of this being a
+                # server-side row rather than client-local state; see
+                # database/models/message_hidden_for_user.py).
+                hidden_message_ids = message_repo.get_hidden_message_ids_for_user(
+                    user.id, [message.id for message in messages]
+                )
+                messages = [
+                    message for message in messages
+                    if message.id not in hidden_message_ids
+                ]
+
+                # Phase 19.24 -- reactions, batched in one query rather
+                # than one per message (Message Lifecycle Events'
+                # "history recovery" requirement for reactions).
+                reactions_by_message = message_repo.get_reactions_for_messages(
+                    [message.id for message in messages]
+                )
+
                 messages_payload = []
 
                 for message in messages:
@@ -2258,9 +4139,33 @@ def handle_message_history_request(state, client_socket, user, packet):
                         else None
                     )
 
+                    delivery_status = (
+                        _delivery_status_for_own_message(
+                            message_repo, message, is_group, member_ids
+                        )
+                        if is_own
+                        else None
+                    )
+
                     messages_payload.append({
                         "message_id": str(message.id),
                         "sender": usernames_by_id.get(message.sender_id, "Unknown"),
+                        # Message-Level ML-DSA Origin Authentication:
+                        # exactly the addressing fields the ORIGINAL
+                        # sender signed over on the live "chat" packet
+                        # (create_payload_packet()) -- one of the two
+                        # is always None, mirroring that packet shape,
+                        # so the receiver's canonical reconstruction
+                        # (client/session.py::load_conversation_history())
+                        # agrees byte-for-byte with what was signed.
+                        "receiver": (
+                            None if is_group
+                            else usernames_by_id.get(message.receiver_id)
+                        ),
+                        "conversation_id": (
+                            str(conversation_uuid) if is_group else None
+                        ),
+                        "message_signature": message.message_signature,
                         "timestamp": message.timestamp.isoformat(),
                         "is_own": is_own,
                         "payload_type": message.payload_type,
@@ -2269,6 +4174,70 @@ def handle_message_history_request(state, client_socket, user, packet):
                         "blob_ref": message.blob_ref,
                         "content_metadata": message.content_metadata or {},
                         "read_status": read_status,
+                        # Phase 19.23 -- additive only (see
+                        # _delivery_status_for_own_message()'s
+                        # docstring): a client that does not know this
+                        # key simply never reads it, exactly like any
+                        # other dict key it has never heard of; nothing
+                        # about read_status's own existing bool/None
+                        # contract changes.
+                        "delivery_status": delivery_status,
+                        # Phase 19.24 -- Message Lifecycle Events, all
+                        # additive. reply_to_message_id: None for an
+                        # ordinary message. edited_at/edit_version:
+                        # None/0 for a never-edited message. deleted_at/
+                        # deleted_by set together, at which point
+                        # ciphertext/content_metadata/message_signature/
+                        # blob_ref above are ALREADY None (real deletion
+                        # -- see handle_message_delete_for_everyone()) --
+                        # this flag is what tells the client to render
+                        # "Message deleted" instead of attempting to
+                        # decrypt null ciphertext. reactions: a list of
+                        # {user, ciphertext, epoch} -- the server never
+                        # decrypts them; the client resolves `user` to a
+                        # username the same way `sender` above already
+                        # is.
+                        "reply_to_message_id": (
+                            str(message.reply_to_message_id)
+                            if message.reply_to_message_id else None
+                        ),
+                        "edited_at": (
+                            message.edited_at.isoformat() if message.edited_at else None
+                        ),
+                        "edit_version": message.edit_version,
+                        "deleted_at": (
+                            message.deleted_at.isoformat() if message.deleted_at else None
+                        ),
+                        "deleted_by": (
+                            usernames_by_id.get(message.deleted_by, "Unknown")
+                            if message.deleted_by else None
+                        ),
+                        "client_message_id": message.client_message_id,
+                        # Phase 19.24 -- Pinned Messages: recovered on
+                        # every history load exactly like edit/delete/
+                        # reaction state above -- a client that missed a
+                        # live message_pinned/message_unpinned
+                        # notification (offline, or a newly-authorized
+                        # device with no prior live traffic at all)
+                        # still ends up with the CURRENT pin state, not
+                        # a stale or missing one.
+                        "pinned_at": (
+                            message.pinned_at.isoformat() if message.pinned_at else None
+                        ),
+                        "pinned_by": (
+                            usernames_by_id.get(message.pinned_by, "Unknown")
+                            if message.pinned_by else None
+                        ),
+                        "reactions": [
+                            {
+                                "user": usernames_by_id.get(reactor_id, "Unknown"),
+                                "ciphertext": ciphertext,
+                                "epoch": epoch,
+                                "message_signature": reaction_signature,
+                            }
+                            for reactor_id, ciphertext, epoch, reaction_signature in
+                            reactions_by_message.get(message.id, [])
+                        ],
                     })
         finally:
             db.close()
@@ -2552,7 +4521,10 @@ def handle_client(state, client_socket, client_address):
             state.set_public_key(
                 client_socket,
                 key_packet["algorithm"],
-                key_packet["public_key"]
+                key_packet["public_key"],
+                signing_public_key=key_packet.get("signing_public_key"),
+                identity_signature=key_packet.get("identity_signature"),
+                device_id=key_packet.get("device_id"),
             )
 
             state.logger.info(
@@ -2652,6 +4624,33 @@ def handle_client(state, client_socket, client_address):
             if packet.get("type") == "chat":
                 packet["sender"] = username
 
+                # Phase 19.18 -- L-1 closure: revocation was previously
+                # enforced only on the group-key-distribution and
+                # device-key-sync relay paths (is_device_bound_and_
+                # authorized()'s own two pre-existing call sites), not
+                # on ordinary chat -- a device revoked mid-connection
+                # could keep sending/receiving with key material it
+                # already held. Checked here, once, before the
+                # direct/group branch below, so both paths are covered
+                # by one check -- mirrors handle_group_key_distribution()
+                # 's own sender check exactly, including the same
+                # False-only (never None) rejection semantics: None
+                # means this connection never bound a device at all
+                # (every pre-Phase-16 client, and every client that
+                # simply never opted into per-device identity) and is
+                # deliberately NOT a rejection -- only a live, current
+                # REVOKED state blocks anything. Silent drop, no error
+                # sent back, same as every other security rejection in
+                # this file.
+                if is_device_bound_and_authorized(state, client_socket) is False:
+
+                    state.logger.warning(
+                        f"Rejected chat from {username}: sender's bound "
+                        f"device is not AUTHORIZED"
+                    )
+
+                    continue
+
             # D3.1 -- Conversation Operations Migration: the identical
             # hardening for a direct session_key packet's sender field,
             # not previously overwritten here. Needed now because the
@@ -2689,286 +4688,350 @@ def handle_client(state, client_socket, client_address):
 
                 receiver = packet.get("receiver")
 
-                for sock, client in list(state.clients.items()):
+                # Phase 18.5 -- Same-Account Multi-Device Routing audit:
+                # the receiver is resolved ONCE, up front, regardless of
+                # whether they are currently connected -- both the
+                # live-relay and offline-persistence paths below need
+                # the identical User row. Unifies what used to be two
+                # separate lookups (an online path keyed off
+                # state.clients, an offline path keyed off
+                # UserRepository) into one, removing the duplicated
+                # persist-or-queue logic that used to live only in the
+                # offline branch.
+                db = SessionLocal()
+                try:
+                    receiver_user = UserRepository(db).get_by_username(receiver)
+                    # Phase 19.24 -- Block User: checked in the SAME
+                    # session as the lookup above, before persistence
+                    # or relay -- a block in EITHER direction refuses
+                    # the send entirely (mirrors every mainstream
+                    # messaging app: blocking stops messages both ways,
+                    # not just the direction the blocker initiated).
+                    # Reuses create_delivery_failure_packet() rather
+                    # than inventing a new rejection type -- every
+                    # client already handles this packet correctly.
+                    blocked = receiver_user is not None and (
+                        BlockedUserRepository(db).is_blocked(receiver_user.id, user.id)
+                        or BlockedUserRepository(db).is_blocked(user.id, receiver_user.id)
+                    )
+                finally:
+                    db.close()
 
-                    if client["username"] == receiver:
+                if receiver_user is None:
 
-                        print(
-                            f"{username} -> {receiver}: "
-                            f"[Encrypted Message]"
-                        )
+                    # Genuine failure: no such account at all. Nothing
+                    # to persist, nothing to relay.
+                    state.logger.info(
+                        f"Delivery failed: {username} -> {receiver} "
+                        f"(unknown recipient)"
+                    )
 
-                        state.logger.info(
-                            f"{username} -> {receiver}: "
-                            f"[Encrypted Message]"
-                        )
+                    send_to_client(
+                        client_socket,
+                        create_delivery_failure_packet(receiver)
+                    )
 
-                        # D3.1 -- Conversation Operations Migration:
-                        # resolved here, before relay, so the receiving
-                        # client can read it straight off the packet
-                        # instead of resolving/creating it itself via a
-                        # direct database call. Deliberately a NEW
-                        # field, never "conversation_id" -- the
-                        # receiving client's handle_chat() derives
-                        # is_group from that field's mere presence
-                        # (group packets set it, direct ones never
-                        # did), so reusing it here would misclassify
-                        # every direct message as a group one the
-                        # moment a client is updated to read it.
-                        direct_conversation_id = _resolve_direct_conversation_id(
-                            user.id, client["user_id"]
-                        )
-                        packet["direct_conversation_id"] = direct_conversation_id
+                elif blocked:
 
-                        sender_client = state.get_client(client_socket)
+                    state.logger.info(
+                        f"Delivery failed: {username} -> {receiver} "
+                        f"(blocked)"
+                    )
 
-                        receiver_uuid = uuid.UUID(client["user_id"])
-
-                        # BUG 2 -- persist the message AND its QUEUED
-                        # recipient row BEFORE relaying, so the row a
-                        # read receipt must update always exists by the
-                        # time the recipient could send one. Relaying
-                        # first left a window in which the recipient
-                        # held the message, read it, and had the
-                        # receipt silently discarded because
-                        # mark_conversation_read() matched nothing.
-                        #
-                        # Wrapped so a persistence failure cannot cost
-                        # the user their live delivery: the relay below
-                        # still runs either way, exactly as it did when
-                        # it came first. Only the read-receipt
-                        # bookkeeping is at risk, never the message.
-                        message = None
-
-                        try:
-                            message = persist_message(
-                                sender_id=user.id,
-                                receiver_id=client["user_id"],
-                                algorithm=(sender_client or {}).get("algorithm"),
-                                packet=packet,
-                                conversation_id=direct_conversation_id,
-                            )
-
-                            _record_direct_recipient(message, receiver_uuid)
-
-                        except Exception as error:  # noqa: BLE001
-
-                            # Intentionally broad and scoped to
-                            # persistence alone -- see the offline
-                            # branch's identical guard for why no
-                            # single specific except would cover
-                            # persist_message()'s failure modes. The
-                            # failure is always logged, never silently
-                            # swallowed.
-                            print(f"[ERROR] {error}")
-
-                            state.logger.error(str(error))
-
-                        delivered = send_to_client(
-                            sock,
-                            packet
-                        )
-
-                        # C2 -- Read Receipts: DELIVERED only if the
-                        # live relay above actually succeeded -- a
-                        # send_to_client() failure (dead socket,
-                        # aborted connection) must not be recorded as
-                        # delivered; QUEUED is exactly the correct,
-                        # already-existing status for "persisted but
-                        # not yet confirmed delivered" (the same status
-                        # the offline branch below uses).
-                        #
-                        # BUG 2: this promotion only ever moves
-                        # QUEUED -> DELIVERED. If the recipient read
-                        # the message in the gap between the row being
-                        # written above and this line, the row is
-                        # already READ and mark_delivered() leaves it
-                        # alone -- READ is terminal with respect to
-                        # delivery status.
-                        try:
-                            if delivered and message is not None:
-                                _mark_recipients_delivered(
-                                    message.id,
-                                    [receiver_uuid],
-                                )
-                        except Exception as error:  # noqa: BLE001
-
-                            # Intentionally broad and scoped to this
-                            # bookkeeping call alone -- the message was
-                            # already relayed and persisted above, so a
-                            # failure here (e.g. a transient DB error
-                            # writing the MessageRecipient row) must
-                            # never undo or interrupt a delivery that
-                            # already succeeded; only read-receipt
-                            # status tracking is at risk, not the
-                            # message itself. Reuses the same logging
-                            # as the OFFLINE branch's equivalent guard
-                            # below -- the failure is always visible,
-                            # never silently swallowed.
-                            print(f"[ERROR] {error}")
-
-                            state.logger.error(str(error))
-
-                        break
+                    send_to_client(
+                        client_socket,
+                        create_delivery_failure_packet(receiver)
+                    )
 
                 else:
 
-                    # Loop completed without finding a matching
-                    # connected recipient. The message is still
-                    # persisted (real-application bug fix, C1 --
-                    # Offline Direct-Message Persistence) exactly like
-                    # a group message already is regardless of which
-                    # members are connected (see persist_group_message()).
-                    #
-                    # BUG 4 -- Fix A: the sender is answered
-                    # message_queued for this case, not
-                    # delivery_failure. delivery_failure now means what
-                    # its name says and nothing softer -- the message
-                    # was NOT stored (unknown recipient, or persistence
-                    # raised) -- while a real user who is merely
-                    # offline gets an explicit "accepted, not yet
-                    # delivered". The recipient row stays QUEUED either
-                    # way; only what the sender is told changed.
-                    #
-                    # A receiver that doesn't resolve to any real user
-                    # at all (typo, never registered) is unaffected --
-                    # persist_message() requires a real receiver_id
-                    # foreign key, so there is nothing to persist
-                    # under, exactly as before this fix.
-                    db = SessionLocal()
+                    # D3.1 -- Conversation Operations Migration:
+                    # resolved here, before relay, so the receiving
+                    # client can read it straight off the packet
+                    # instead of resolving/creating it itself via a
+                    # direct database call. Deliberately a NEW field,
+                    # never "conversation_id" -- the receiving client's
+                    # handle_chat() derives is_group from that field's
+                    # mere presence (group packets set it, direct ones
+                    # never did), so reusing it here would misclassify
+                    # every direct message as a group one the moment a
+                    # client is updated to read it.
+                    direct_conversation_id = _resolve_direct_conversation_id(
+                        user.id, receiver_user.id
+                    )
+                    packet["direct_conversation_id"] = direct_conversation_id
+
+                    sender_client = state.get_client(client_socket)
+
+                    # BUG 2 -- persist the message AND its QUEUED
+                    # recipient row BEFORE relaying, so the row a read
+                    # receipt must update always exists by the time the
+                    # recipient could send one. Persisted EXACTLY ONCE
+                    # here, regardless of how many of the recipient's
+                    # own currently-connected devices end up matching
+                    # below (Phase 18.5 -- Same-Account Multi-Device
+                    # Routing: this relay used to stop at the FIRST
+                    # matching socket for `receiver` it happened to
+                    # find in state.clients -- an unconditional `break`
+                    # -- silently skipping every OTHER simultaneously-
+                    # connected device of that same account. This now
+                    # mirrors handle_group_chat_delivery()'s own,
+                    # already-correct, already-precedented per-socket
+                    # fan-out below -- not a new routing mechanism, the
+                    # SAME one group messaging already shipped with).
+                    message = None
 
                     try:
-                        offline_user = UserRepository(db).get_by_username(receiver)
-                    finally:
-                        db.close()
-
-                    # BUG 4 -- Fix A: what the sender is told now
-                    # follows whether the message was PERSISTED, not
-                    # whether it happened to be relayed live. Set only
-                    # by the successful path below, so every failure
-                    # mode -- unknown recipient, or a persist that
-                    # raised -- still falls through to the unchanged
-                    # delivery_failure response.
-                    queued_message = None
-
-                    if offline_user is not None:
-
-                        try:
-                            sender_client = state.get_client(client_socket)
-
-                            # D3.1 -- Conversation Operations Migration:
-                            # resolved the same way as the online branch
-                            # above, even though nothing is relayed live
-                            # here -- persist_message() still needs it,
-                            # and a later reconnect's history/list
-                            # request (a future slice) must see the same
-                            # conversation an online delivery would have
-                            # used.
-                            direct_conversation_id = _resolve_direct_conversation_id(
-                                user.id, offline_user.id
-                            )
-
-                            message = persist_message(
-                                sender_id=user.id,
-                                receiver_id=offline_user.id,
-                                algorithm=(sender_client or {}).get("algorithm"),
-                                packet=packet,
-                                conversation_id=direct_conversation_id,
-                            )
-
-                            # C2 -- Read Receipts: nobody was
-                            # connected to relay to, above -- QUEUED,
-                            # not DELIVERED.
-                            _record_direct_recipient(
-                                message,
-                                offline_user.id,
-                            )
-
-                            # Both the message row and its QUEUED
-                            # recipient row are committed by this
-                            # point, so -- and only so -- the sender
-                            # can be told the message is safely
-                            # stored. Deliberately after
-                            # _record_direct_recipient(), not between
-                            # it and persist_message(): a message
-                            # persisted without the delivery-state row
-                            # that later drives key recovery is not a
-                            # complete success and must not be
-                            # reported as one.
-                            queued_message = message
-
-                        except Exception as error:  # noqa: BLE001
-
-                            # Intentionally broad, not an oversight:
-                            # persist_message() can fail for reasons
-                            # spanning unrelated exception hierarchies
-                            # -- SQLAlchemyError from db.commit()/the
-                            # conversation lookup, OSError from
-                            # encrypted_blob_store's filesystem write
-                            # (FILE/IMAGE payloads), or AttributeError/
-                            # TypeError from a malformed packet -- and
-                            # no single specific except would isolate
-                            # all of them. This failure must be
-                            # isolated here so delivery_failure (below)
-                            # is still returned to the sender no matter
-                            # what went wrong; letting it propagate
-                            # would skip that response entirely. Reuses
-                            # the exact logging this file's own outer
-                            # exception handler already uses -- the
-                            # failure is always visible, never silently
-                            # swallowed, and nothing here ever reports
-                            # the message as successfully persisted.
-                            print(f"[ERROR] {error}")
-
-                            state.logger.error(str(error))
-
-                    # BUG 4 -- Fix A: a real registered user who is
-                    # simply not connected is NOT a delivery failure.
-                    # The ciphertext is stored and its recipient row
-                    # is QUEUED, so the honest answer to the sender is
-                    # "accepted, not yet delivered" -- previously this
-                    # branch answered delivery_failure unconditionally,
-                    # which made the sender's GUI show an error for a
-                    # message that had just been saved correctly.
-                    #
-                    # QUEUED is not upgraded to DELIVERED here: nothing
-                    # was relayed to anybody. Only the live-relay path
-                    # above records DELIVERED.
-                    if queued_message is not None:
-
-                        state.logger.info(
-                            f"Queued: {username} -> {receiver} "
-                            f"(recipient not connected, message persisted)"
+                        message = persist_message(
+                            sender_id=user.id,
+                            receiver_id=receiver_user.id,
+                            algorithm=(sender_client or {}).get("algorithm"),
+                            packet=packet,
+                            conversation_id=direct_conversation_id,
                         )
 
-                        send_to_client(
-                            client_socket,
-                            create_message_queued_packet(
-                                receiver=receiver,
-                                message_id=str(queued_message.id),
-                                conversation_id=(
-                                    str(queued_message.conversation_id)
-                                    if queued_message.conversation_id
-                                    else None
-                                ),
-                            )
-                        )
+                        _record_direct_recipient(message, receiver_user.id)
 
-                    else:
+                    except Exception as error:  # noqa: BLE001
 
-                        # Genuine failure, with its original meaning
-                        # intact: either the recipient does not exist
-                        # at all, or persistence raised above. Nothing
-                        # is stored, so nothing must be claimed.
+                        # Intentionally broad, not an oversight:
+                        # persist_message() can fail for reasons
+                        # spanning unrelated exception hierarchies --
+                        # SQLAlchemyError from db.commit()/the
+                        # conversation lookup, OSError from
+                        # encrypted_blob_store's filesystem write
+                        # (FILE/IMAGE payloads), or AttributeError/
+                        # TypeError from a malformed packet -- and no
+                        # single specific except would isolate all of
+                        # them. The failure is always logged, never
+                        # silently swallowed.
+                        print(f"[ERROR] {error}")
+
+                        state.logger.error(str(error))
+
+                    if message is None:
+
+                        # Genuine failure: the recipient exists, but
+                        # persistence raised above. Nothing was stored,
+                        # so nothing must be claimed.
                         state.logger.info(
                             f"Delivery failed: {username} -> {receiver} "
-                            f"(recipient not connected)"
+                            f"(message could not be persisted)"
                         )
 
                         send_to_client(
                             client_socket,
                             create_delivery_failure_packet(receiver)
                         )
+
+                    else:
+
+                        # Phase 18.5 -- Step 6 (History Deduplication):
+                        # the SAME stable id message_history_result
+                        # already reports for this row once persisted
+                        # (server/client_handler.py::
+                        # handle_message_history_request()) -- added
+                        # here, additively, so a client that already
+                        # rendered this live message can recognize it
+                        # again later via history and skip re-rendering
+                        # it, without needing a second identifier
+                        # scheme. Not part of any ML-DSA-signed payload
+                        # (canonical_message_payload() never included
+                        # it, on either side), so adding it here changes
+                        # nothing about what was already signed or how
+                        # it verifies.
+                        packet["message_id"] = str(message.id)
+
+                        delivered_to_any_device = False
+
+                        for sock, client in list(state.clients.items()):
+
+                            if sock == client_socket:
+                                continue
+
+                            if client["username"] != receiver:
+                                continue
+
+                            # Phase 19.18 -- L-1 closure, recipient side:
+                            # skip only THIS specific revoked device's
+                            # socket -- the message is already persisted
+                            # above regardless (still reaches the
+                            # account via history / any other,
+                            # non-revoked, currently-connected device of
+                            # theirs in this same loop), mirroring
+                            # handle_group_key_distribution()'s own
+                            # per-recipient-socket check exactly.
+                            if is_device_bound_and_authorized(state, sock) is False:
+
+                                state.logger.warning(
+                                    f"Dropped chat relay to {receiver}: "
+                                    f"recipient's bound device is not AUTHORIZED"
+                                )
+
+                                continue
+
+                            print(
+                                f"{username} -> {receiver}: "
+                                f"[Encrypted Message]"
+                            )
+
+                            state.logger.info(
+                                f"{username} -> {receiver}: "
+                                f"[Encrypted Message]"
+                            )
+
+                            if send_to_client(sock, packet):
+                                delivered_to_any_device = True
+
+                        # C2 -- Read Receipts: DELIVERED only if the
+                        # live relay above actually reached at least
+                        # one of the recipient's currently-connected
+                        # devices -- a send_to_client() failure on
+                        # every match must not be recorded as
+                        # delivered; QUEUED is exactly the correct,
+                        # already-existing status for "persisted but
+                        # not yet confirmed delivered". Reaching TWO (or
+                        # more) of the recipient's own devices still
+                        # only ever promotes the ONE MessageRecipient
+                        # row (receiver_user.id) -- there is one
+                        # recipient row per ACCOUNT, not per device,
+                        # exactly like read receipts are already
+                        # account-level, never device-level (see
+                        # handle_read_receipt()/mark_conversation_read(),
+                        # unchanged by this phase).
+                        #
+                        # BUG 2: this promotion only ever moves
+                        # QUEUED -> DELIVERED. If the recipient read the
+                        # message in the gap between the row being
+                        # written above and this line, the row is
+                        # already READ and mark_delivered() leaves it
+                        # alone -- READ is terminal with respect to
+                        # delivery status.
+                        if delivered_to_any_device:
+
+                            try:
+                                _mark_recipients_delivered(
+                                    message.id,
+                                    [receiver_user.id],
+                                )
+                            except Exception as error:  # noqa: BLE001
+
+                                # Intentionally broad and scoped to this
+                                # bookkeeping call alone -- the message
+                                # was already relayed and persisted
+                                # above, so a failure here (e.g. a
+                                # transient DB error writing the
+                                # MessageRecipient row) must never undo
+                                # or interrupt a delivery that already
+                                # succeeded; only read-receipt status
+                                # tracking is at risk, not the message
+                                # itself.
+                                print(f"[ERROR] {error}")
+
+                                state.logger.error(str(error))
+
+                            # Phase 19.14 -- Message Status Ticks: tell
+                            # the SENDER this happened at all -- see
+                            # create_message_delivered_packet()'s own
+                            # docstring for why this was previously
+                            # entirely missing. Sent even if the
+                            # MessageRecipient bookkeeping above just
+                            # failed: the live relay itself (send_to_
+                            # client() returning True) is the actual
+                            # fact being reported, not that row.
+                            send_to_client(
+                                client_socket,
+                                create_message_delivered_packet(
+                                    receiver=receiver,
+                                    message_id=str(message.id),
+                                    conversation_id=(
+                                        str(message.conversation_id)
+                                        if message.conversation_id
+                                        else None
+                                    ),
+                                )
+                            )
+
+                        else:
+
+                            # BUG 4 -- Fix A: a real registered user who
+                            # is simply not connected on ANY device
+                            # right now is NOT a delivery failure. The
+                            # ciphertext is stored and its recipient row
+                            # is QUEUED, so the honest answer to the
+                            # sender is "accepted, not yet delivered" --
+                            # answering delivery_failure here would make
+                            # the sender's GUI show an error for a
+                            # message that had just been saved
+                            # correctly.
+                            #
+                            # QUEUED is not upgraded to DELIVERED here:
+                            # nothing was relayed to anybody. Only the
+                            # live-relay path above records DELIVERED.
+                            state.logger.info(
+                                f"Queued: {username} -> {receiver} "
+                                f"(recipient not connected, message persisted)"
+                            )
+
+                            send_to_client(
+                                client_socket,
+                                create_message_queued_packet(
+                                    receiver=receiver,
+                                    message_id=str(message.id),
+                                    conversation_id=(
+                                        str(message.conversation_id)
+                                        if message.conversation_id
+                                        else None
+                                    ),
+                                )
+                            )
+
+            # -----------------------------
+            # Public Key Re-broadcast (Phase 16D -- Device-Aware Peer
+            # Identity)
+            #
+            # The bootstrap read earlier in this file (see this
+            # function's own "Received {algorithm} public key" log
+            # line) only ever fires ONCE, as part of connection setup
+            # -- before this phase, no legitimate client ever sent a
+            # SECOND "key_exchange"/"public_key" packet later in the
+            # same connection, so nothing needed to handle one here.
+            # ClientSession.enroll_device() (client/session.py) now
+            # does exactly that: it re-sends this client's identity,
+            # this time carrying device_id, the moment self.device_id
+            # first becomes known (enroll_device() is an explicit,
+            # later, app-level action -- normally well after the
+            # bootstrap broadcast already fired with device_id still
+            # unset). Without this branch that second packet would
+            # silently fall through every elif below and never reach
+            # any peer, exactly as observed before this branch existed.
+            #
+            # Reuses state.set_public_key()/distribute_public_keys()
+            # completely unchanged -- the same storage and the same
+            # relay-to-everyone-else fan-out the bootstrap path already
+            # uses, just invoked a second time. The server still never
+            # inspects, validates, or trusts device_id for anything of
+            # its own; it is stored and relayed exactly like signing_
+            # public_key/identity_signature already are, and every
+            # receiving client's own _handle_signed_public_key() still
+            # requires a valid ML-DSA signature before trusting any of
+            # it.
+            # -----------------------------
+            elif (
+                packet.get("type") == "key_exchange"
+                and packet.get("operation") == "public_key"
+            ):
+
+                state.set_public_key(
+                    client_socket,
+                    packet["algorithm"],
+                    packet["public_key"],
+                    signing_public_key=packet.get("signing_public_key"),
+                    identity_signature=packet.get("identity_signature"),
+                    device_id=packet.get("device_id"),
+                )
+
+                distribute_public_keys(state, client_socket)
 
             # -----------------------------
             # Session Key Exchange Packet
@@ -3056,11 +5119,112 @@ def handle_client(state, client_socket, client_address):
                 handle_group_add_members(state, client_socket, user, packet)
 
             # -----------------------------
+            # Group Remove Member + Inbox (Phase 19.13)
+            # -----------------------------
+            elif packet.get("type") == "group_remove_member":
+
+                handle_group_remove_member(state, client_socket, user, packet)
+
+            elif packet.get("type") == "verification_request":
+
+                handle_verification_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "inbox_list_request":
+
+                handle_inbox_list_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "inbox_response":
+
+                handle_inbox_response(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Settings (Phase 19.14)
+            # -----------------------------
+            elif packet.get("type") == "change_username_request":
+
+                handle_change_username_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "change_password_request":
+
+                handle_change_password_request(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Block User (Phase 19.24)
+            # -----------------------------
+            elif packet.get("type") == "block_user_request":
+
+                handle_block_user_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "unblock_user_request":
+
+                handle_unblock_user_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "blocked_users_list_request":
+
+                handle_blocked_users_list_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "profile_picture_upload_request":
+
+                handle_profile_picture_upload_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "profile_picture_request":
+
+                handle_profile_picture_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "change_bio_request":
+
+                handle_change_bio_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "bio_request":
+
+                handle_bio_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "last_seen_request":
+
+                handle_last_seen_request(state, client_socket, user, packet)
+
+            # -----------------------------
             # Read Receipt Packet (C2)
             # -----------------------------
             elif packet.get("type") == "read_receipt":
 
                 handle_read_receipt(state, client_socket, user, packet)
+
+            # Phase 19.24 -- Message Lifecycle Events.
+            elif packet.get("type") == "message_edit":
+
+                handle_message_edit(state, client_socket, user, packet)
+
+            elif packet.get("type") == "message_delete_for_me":
+
+                handle_message_delete_for_me(state, client_socket, user, packet)
+
+            elif packet.get("type") == "message_delete_for_everyone":
+
+                handle_message_delete_for_everyone(state, client_socket, user, packet)
+
+            elif packet.get("type") == "reaction_add":
+
+                handle_reaction_add(state, client_socket, user, packet)
+
+            elif packet.get("type") == "reaction_remove":
+
+                handle_reaction_remove(state, client_socket, user, packet)
+
+            elif packet.get("type") == "message_pin":
+
+                handle_message_pin(state, client_socket, user, packet)
+
+            elif packet.get("type") == "message_unpin":
+
+                handle_message_unpin(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Typing Indicator (Phase 19.24)
+            # -----------------------------
+            elif packet.get("type") == "typing_indicator":
+
+                handle_typing_indicator(state, client_socket, user, packet)
 
             # -----------------------------
             # User Lookup Request (D2)
@@ -3082,6 +5246,33 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "direct_conversation_request":
 
                 handle_direct_conversation_request(state, client_socket, user, packet)
+
+            # -----------------------------
+            # Multi-Device Identity (Phase 16)
+            # -----------------------------
+            elif packet.get("type") == "device_enroll_request":
+
+                handle_device_enroll_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "device_list_request":
+
+                handle_device_list_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "device_authorize":
+
+                handle_device_authorize(state, client_socket, user, packet)
+
+            elif packet.get("type") == "device_revoke":
+
+                handle_device_revoke(state, client_socket, user, packet)
+
+            elif packet.get("type") == "device_session_bind":
+
+                handle_device_session_bind(state, client_socket, user, packet)
+
+            elif packet.get("type") == "device_key_sync":
+
+                handle_device_key_sync(state, client_socket, user, packet)
 
             # -----------------------------
             # Epoch Reservation Request (D4.1)
@@ -3123,6 +5314,26 @@ def handle_client(state, client_socket, client_address):
         if client:
 
             username = client["username"]
+
+            # Phase 19.24 -- Presence/Last Seen: recorded here, not on
+            # every message, so it reflects "when this connection
+            # actually ended" -- a single overwritten timestamp (see
+            # database/models/user.py::last_seen_at's own docstring),
+            # best-effort (a DB error here must never prevent the rest
+            # of this cleanup -- the client is disconnecting either
+            # way).
+            user_id = client.get("user_id")
+            if user_id:
+                db = SessionLocal()
+                try:
+                    user_row = UserRepository(db).get_by_id(user_id)
+                    if user_row is not None:
+                        UserRepository(db).update_last_seen(user_row, datetime.now(timezone.utc).replace(tzinfo=None))
+                        db.commit()
+                except Exception as error:  # noqa: BLE001
+                    state.logger.warning(f"Could not record last_seen_at for {username}: {error}")
+                finally:
+                    db.close()
 
             leave_packet = create_leave_packet(username)
 

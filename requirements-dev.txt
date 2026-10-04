@@ -15,3 +15,15 @@ colorama==0.4.6
 iniconfig==2.3.0
 pluggy==1.6.0
 Pygments==2.21.0
+
+# --- Web client crypto interop tests (Phase 15) ---
+# A real, embeddable JS engine used ONLY to execute web/client/*.js
+# for testing (tests/web_crypto_test_support.py) -- no Node.js/browser
+# is required to run this test suite. Not used by any production code.
+quickjs==1.19.4
+
+# --- Real browser end-to-end test (Phase 15B) ---
+# Drives the system's already-installed Google Chrome (channel="chrome")
+# for tests/test_web_browser_e2e.py -- no Playwright-managed browser
+# download is used or required. Not used by any production code.
+playwright==1.62.0

@@ -23,6 +23,7 @@ Run with:
     pytest tests/test_file_image_transfer_integration.py -v
 """
 
+import base64
 import json
 import socket
 import struct
@@ -37,6 +38,8 @@ from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
 from crypto.aes import AESCipher
+from crypto.message_protocol import sign_message_payload
+from crypto.ml_dsa import MLDSASigner
 from database.connection import SessionLocal
 from database.models.message_recipient import MessageRecipient
 from database.models.message import Message
@@ -54,6 +57,7 @@ from tests.tls_test_support import (
 )
 from utils.protocol import (
     create_auth_packet,
+    create_chat_packet,
     create_group_create_packet,
     create_payload_packet,
     create_public_key_packet,
@@ -149,7 +153,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -628,6 +632,21 @@ def test_history_reload_retrieves_original_file_bytes(
         PayloadType.FILE, original_bytes, content_metadata, session_key
     )
 
+    # Message-Level ML-DSA Origin Authentication: this raw-socket
+    # "sender" has no real ClientSession/identity of its own, so it is
+    # given one here, signing the packet exactly as ClientSession.
+    # _send_encrypted_payload() would -- required for recipient_view's
+    # real load_conversation_history() (below) to accept and decrypt
+    # it at all; a message with no valid signature is rejected before
+    # decryption is ever attempted (see handle_chat()'s/
+    # _verify_history_message_signature()'s own docstrings).
+    sender_signer = MLDSASigner()
+    sender_signer.generate_keys()
+    message_signature = sign_message_payload(
+        sender_signer, sender_name, recipient_name, None,
+        envelope.payload_type, envelope.ciphertext, envelope.content_metadata, None,
+    )
+
     _send(
         sender_sock,
         create_payload_packet(
@@ -635,6 +654,7 @@ def test_history_reload_retrieves_original_file_bytes(
             receiver=recipient_name,
             envelope=envelope,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            message_signature=base64.b64encode(message_signature).decode("ascii"),
         ),
     )
     _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
@@ -656,6 +676,13 @@ def test_history_reload_retrieves_original_file_bytes(
             _open_direct_chat(recipient_view, sender_name)
             recipient_view.key_manager.store_key(
                 recipient_view.current_conversation_id, session_key
+            )
+            # Manually seeds the sender's ML-DSA identity too, mirroring
+            # the manual session-key seed immediately above -- this raw-
+            # socket sender never went through a real signed public-key
+            # exchange for recipient_view to have observed it through.
+            recipient_view._observed_peer_signing_public_keys[sender_name] = (
+                sender_signer.export_public_key()
             )
 
             history = recipient_view.load_conversation_history(sender_name)
@@ -736,6 +763,97 @@ def test_oversized_attachment_rejected_before_send(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="exceeds the maximum attachment size"):
         session.send_attachment(str(oversized))
+
+
+def test_oversized_attachment_bypassing_the_client_is_rejected_server_side_and_server_stays_responsive(
+    sender_and_recipient, monkeypatch
+):
+    """Phase 19.19 -- L-4 closure's missing integration proof.
+    server/client_handler.py::persist_message() already enforces
+    MAX_ATTACHMENT_CIPHERTEXT_BYTES server-side (tests/test_
+    attachment_hardening.py proves the guard itself, at the unit
+    level) -- what had no test was a REAL modified client that skips
+    ClientSession.send_attachment()'s own pre-flight check entirely,
+    over a real socket, and whether the connection/server survive it.
+
+    Uses this file's own raw-socket sender_and_recipient fixture
+    (below ClientSession, so there is no client-side guard to bypass
+    in the first place) with MAX_ATTACHMENT_CIPHERTEXT_BYTES
+    monkeypatched down to a small value -- proving the boundary
+    without actually moving tens of megabytes over a local test
+    socket, exactly like test_attachment_hardening.py's own unit
+    tests already do for the same reason.
+    """
+    from server import client_handler
+
+    monkeypatch.setattr(client_handler, "MAX_ATTACHMENT_CIPHERTEXT_BYTES", 1000)
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    session_key = b"K" * 32
+    oversized_envelope = _encrypt_attachment(
+        PayloadType.FILE, b"x" * 5000, {"filename": "huge.bin", "mime_type": "application/octet-stream"}, session_key
+    )
+    assert len(oversized_envelope.ciphertext) > 1000
+
+    _send(
+        sender_sock,
+        create_payload_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            envelope=oversized_envelope,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    # The sender gets a clear, structured failure -- not a hang, not a
+    # dropped connection, not a generic error.
+    failure = _recv_until(sender_sock, lambda p: p.get("type") == "delivery_failure")
+    assert failure is not None
+    assert failure.get("receiver") == recipient_name
+
+    # The recipient never receives a "chat" packet for the rejected
+    # message -- confirmed by actively waiting and finding none, not
+    # merely by not having looked. A short attempt budget on the same
+    # _recv_until() helper every other assertion in this file uses
+    # (rather than a single blind _recv()) tolerates other, unrelated
+    # legitimate traffic on this socket (e.g. a key_exchange/public_key
+    # re-broadcast from the recipient's own connection setup) without
+    # mistaking it for a leaked copy of the rejected message.
+    leaked = _recv_until(recipient_sock, lambda p: p.get("type") == "chat", attempts=5, per_attempt_timeout=0.3)
+    assert leaked is None, f"recipient received a chat packet for a rejected oversized attachment: {leaked}"
+
+    # Nothing was persisted for it. _wait_for_direct_message() itself
+    # raises (a diagnostic-carrying AssertionError) rather than
+    # returning None once its attempts are exhausted -- useful for
+    # every OTHER test in this file asserting presence, wrong for
+    # asserting absence -- so this calls the single-shot lookup it
+    # wraps directly instead. No retry/sleep is needed here at all:
+    # by the time the delivery_failure packet above was received, the
+    # (synchronous) persistence attempt had already run and failed.
+    assert _get_direct_conversation(uuid.UUID(sender_id), uuid.UUID(recipient_id)) == []
+
+    # The server -- and this exact same connection -- are still fully
+    # functional immediately afterward: an ordinary text message on
+    # the SAME sockets goes through normally. A plain placeholder
+    # ciphertext string is sufficient here (mirrors test_message_
+    # persistence_integration.py's own routing-only pattern) -- this
+    # assertion is only about the connection/relay staying alive, not
+    # about re-proving real AES-GCM round-tripping, which is already
+    # covered extensively elsewhere.
+    _send(
+        sender_sock,
+        create_chat_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            message="still-alive-after-rejection",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    delivered = _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+    assert delivered is not None, "the server did not stay responsive after rejecting an oversized attachment"
+    assert delivered["message"] == "still-alive-after-rejection"
 
 
 def test_attachment_within_limit_is_not_rejected_by_size_check(tmp_path, monkeypatch):

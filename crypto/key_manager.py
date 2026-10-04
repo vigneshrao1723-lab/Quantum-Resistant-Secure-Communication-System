@@ -5,6 +5,7 @@ import threading
 from config import KEY_EXCHANGE_ALGORITHM
 from crypto.aes import AESCipher
 from crypto.kyber import KyberKEM
+from crypto.ml_dsa import MLDSASigner
 from crypto.rsa import RSAEncryption
 
 
@@ -44,9 +45,93 @@ def fingerprint_public_key(public_key_bytes):
             f"{type(public_key_bytes).__name__}."
         )
 
-    digest = hashlib.sha256(bytes(public_key_bytes)).hexdigest().upper()
+    return _format_fingerprint(bytes(public_key_bytes))
+
+
+def _format_fingerprint(raw_bytes):
+    """
+    SHA-256 of ``raw_bytes``, formatted as uppercase hex grouped into
+    4-character blocks -- the shared hash-and-format tail of
+    fingerprint_public_key() and fingerprint_combined_identity(), so
+    both produce output in the exact same convention from one place,
+    never two independently-maintained copies of the same formatting
+    logic. ``raw_bytes`` must already be exactly the bytes to hash --
+    this function performs no canonicalization, type coercion, or
+    concatenation of its own.
+    """
+
+    digest = hashlib.sha256(raw_bytes).hexdigest().upper()
 
     return " ".join(digest[i:i + 4] for i in range(0, len(digest), 4))
+
+
+def fingerprint_combined_identity(kem_public_key_bytes, signing_public_key_bytes):
+    """
+    Deterministic combined-identity fingerprint of a peer's ML-KEM
+    public key AND ML-DSA public key together (Server-Untrusted
+    Identity Verification -- ML-DSA identity foundation), as ONE
+    fingerprint representing ONE identity -- never two independent
+    fingerprints for the same peer. Reuses fingerprint_public_key()'s
+    exact hash-and-format convention (via _format_fingerprint()), so
+    the output is visually and structurally identical to the existing,
+    already-approved single-key fingerprint format -- same length, same
+    grouping, same uppercase-hex representation -- just computed over
+    both keys' bytes instead of one.
+
+    Canonical representation: each key's raw bytes, prefixed with its
+    own length as a 4-byte unsigned big-endian integer, concatenated in
+    a FIXED order (KEM first, then signing) --
+
+        pack(">I", len(kem_public_key_bytes)) + kem_public_key_bytes
+      + pack(">I", len(signing_public_key_bytes)) + signing_public_key_bytes
+
+    The length prefixes make this concatenation unambiguous by
+    construction: two different (kem, signing) pairs can never collide
+    into the same byte sequence merely because one key is a prefix of
+    the other, or because the split point between the two keys is
+    otherwise inferrable from context. Deliberately NOT canonical JSON,
+    str(), or repr() -- none of those give the same length-prefixed,
+    binary-safe, encoding-independent guarantee (see this feature's own
+    design report, Phase 9, for the full comparison).
+
+    Only ever computed from PUBLIC key bytes -- there is no code path
+    in this function, or in any caller, that could feed it private key
+    material; it has no parameter through which a private key could
+    even be passed.
+
+    Accepts str or bytes-like for either argument, exactly like
+    fingerprint_public_key() -- both KyberKEM's and MLDSASigner's raw
+    public-key exports are already bytes, but this stays permissive at
+    the boundary the same way the existing function already is.
+    """
+
+    if isinstance(kem_public_key_bytes, str):
+        kem_public_key_bytes = kem_public_key_bytes.encode("utf-8")
+
+    if isinstance(signing_public_key_bytes, str):
+        signing_public_key_bytes = signing_public_key_bytes.encode("utf-8")
+
+    if not isinstance(kem_public_key_bytes, (bytes, bytearray)):
+        raise TypeError(
+            f"KEM public key must be bytes-like or str, not "
+            f"{type(kem_public_key_bytes).__name__}."
+        )
+
+    if not isinstance(signing_public_key_bytes, (bytes, bytearray)):
+        raise TypeError(
+            f"Signing public key must be bytes-like or str, not "
+            f"{type(signing_public_key_bytes).__name__}."
+        )
+
+    kem_public_key_bytes = bytes(kem_public_key_bytes)
+    signing_public_key_bytes = bytes(signing_public_key_bytes)
+
+    canonical = (
+        len(kem_public_key_bytes).to_bytes(4, "big") + kem_public_key_bytes
+        + len(signing_public_key_bytes).to_bytes(4, "big") + signing_public_key_bytes
+    )
+
+    return _format_fingerprint(canonical)
 
 
 class KeyManager:
@@ -76,6 +161,22 @@ class KeyManager:
 
         self.rsa = RSAEncryption()
         self.rsa.generate_keys()
+
+        # ---------------------------------
+        # ML-DSA (post-quantum signing identity)
+        # ---------------------------------
+        #
+        # Unlike self.kyber/self.rsa above, this is NOT gated on
+        # self.algorithm: a signing identity authenticates the origin
+        # of key-distribution packets regardless of which KEM
+        # algorithm produced the key material being distributed, so
+        # both KYBER and RSA comparison modes need one. Ephemeral
+        # here, exactly like self.kyber/self.rsa are before
+        # load_or_create_signing_keypair() runs -- see that method for
+        # how this becomes the persisted, stable identity across
+        # restarts.
+        self.ml_dsa = MLDSASigner()
+        self.ml_dsa.generate_keys()
 
         # Export own public key for whichever algorithm is active
         self.public_key = self._export_own_public_key()
@@ -200,6 +301,71 @@ class KeyManager:
             )
 
         self.public_key = self._export_own_public_key()
+
+    def load_or_create_signing_keypair(self, key_store):
+        """
+        Make this local user's ML-DSA-65 signing keypair the one
+        persisted in ``key_store``, instead of the ephemeral one
+        __init__() always generates (ML-DSA identity/key-persistence
+        foundation phase).
+
+        Mirrors load_or_create_kyber_keypair()'s resolution shape
+        exactly -- called once, from ClientSession._unlock_key_store()
+        right after the store unlocks, resolving __init__()'s ephemeral
+        keypair against whatever key_store already holds:
+
+        * ``key_store`` already holds a persisted signing keypair
+          (every login after the first): it REPLACES __init__()'s
+          keypair via import_private_key(), which also re-derives the
+          public key from the loaded seed.
+
+        * ``key_store`` holds none yet (first login ever): __init__()'s
+          keypair becomes the permanent one, persisted here.
+
+        Unlike load_or_create_kyber_keypair(), this is UNCONDITIONAL --
+        not gated on self.algorithm. A signing identity is orthogonal
+        to which KEM algorithm (KYBER or RSA) is currently active; both
+        need one persisted signing identity.
+
+        Integrity check: when a persisted keypair is loaded, the
+        public key re-derived from the loaded private seed is compared
+        against the separately-persisted public key. A mismatch means
+        the persisted identity record is internally inconsistent --
+        e.g. truncated/corrupted storage, or a manually edited file --
+        and this fails closed with ValueError rather than silently
+        proceeding with a keypair whose halves don't actually match
+        (which would make every future signature this session produces
+        fail to verify against the public key this session's peers
+        already trust). Deliberately a plain ValueError, not
+        storage.secure_key_store.KeyStoreError: crypto/key_manager.py
+        does not otherwise import from storage/, and this failure is
+        precisely a "the value is invalid" condition, not a storage
+        I/O condition.
+
+        Raises:
+            ValueError -- the persisted public key does not match the
+                          public key derived from the persisted private
+                          seed.
+        """
+
+        persisted = key_store.get_own_signing_keypair()
+
+        if persisted is not None:
+            persisted_public_key, persisted_private_seed = persisted
+
+            self.ml_dsa.import_private_key(persisted_private_seed)
+
+            if self.ml_dsa.export_public_key() != persisted_public_key:
+                raise ValueError(
+                    "Persisted ML-DSA public key does not match the "
+                    "public key derived from the persisted private "
+                    "seed; the signing identity record is corrupted."
+                )
+        else:
+            key_store.save_own_signing_keypair(
+                self.ml_dsa.export_public_key(),
+                self.ml_dsa.export_private_key(),
+            )
 
     # =====================================================
     # Public Key Management

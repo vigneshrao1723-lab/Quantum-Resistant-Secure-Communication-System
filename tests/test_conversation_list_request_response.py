@@ -140,7 +140,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -288,6 +288,20 @@ def test_conversation_list_request_returns_only_own_conversations(running_server
     )
     _create_direct_conversation(carol_payload["user_id"], dave_payload["user_id"])
 
+    # UI Finalization Decision 1: a messageless direct conversation is
+    # excluded entirely (see get_conversation_previews_for_user()'s
+    # docstring). This test's actual point is the OWNERSHIP scoping
+    # (alice sees her own conversation, never carol/dave's), which
+    # needs alice's conversation to be visible at all to prove
+    # anything -- a real message is the minimum required for that.
+    _insert_message(
+        alice_bob_id,
+        sender_id=alice_payload["user_id"],
+        receiver_id=bob_payload["user_id"],
+        ciphertext="irrelevant-ciphertext",
+        timestamp=_utc_now(),
+    )
+
     sock, _alice_name = _connect_and_authenticate(port, alice_payload)
 
     try:
@@ -353,6 +367,14 @@ def test_conversation_list_request_ignores_client_supplied_user_id(running_serve
 
 
 def test_conversation_list_request_direct_conversation_shape_is_correct(running_server):
+    """UI Finalization Decision 1: a messageless direct conversation is
+    excluded from this response entirely (see
+    get_conversation_previews_for_user()'s docstring), so the
+    "latest_message is None" shape this test used to exercise for a
+    direct conversation can no longer occur here at all -- only a
+    group can still be listed with no message (see the sibling test
+    just below). This test now checks both halves: the exclusion
+    itself, and the entry's shape once it legitimately qualifies."""
     _state, port = running_server
     alice_payload = _register_user("shape_a_")
     bob_payload = _register_user("shape_b_")
@@ -364,6 +386,17 @@ def test_conversation_list_request_direct_conversation_shape_is_correct(running_
     sock, _alice_name = _connect_and_authenticate(port, alice_payload)
 
     try:
+        before = _request_conversation_list(sock)
+        assert before["conversations"] == []
+
+        _insert_message(
+            conversation_id,
+            sender_id=bob_payload["user_id"],
+            receiver_id=alice_payload["user_id"],
+            ciphertext="irrelevant-ciphertext",
+            timestamp=_utc_now(),
+        )
+
         response = _request_conversation_list(sock)
         assert len(response["conversations"]) == 1
 
@@ -371,7 +404,7 @@ def test_conversation_list_request_direct_conversation_shape_is_correct(running_
         assert entry["conversation_id"] == conversation_id
         assert entry["is_group"] is False
         assert entry["participants"] == [bob_payload["username"]]
-        assert entry["latest_message"] is None
+        assert entry["latest_message"] is not None
     finally:
         sock.close()
         _delete_user(alice_payload["username"])
@@ -567,7 +600,23 @@ def test_load_conversations_uses_request_response_not_database(running_server, m
     alice_payload = _register_user("nodb_a_")
     bob_payload = _register_user("nodb_b_")
 
-    _create_direct_conversation(alice_payload["user_id"], bob_payload["user_id"])
+    direct_conversation_id = _create_direct_conversation(
+        alice_payload["user_id"], bob_payload["user_id"]
+    )
+    # UI Finalization Decision 1: get_conversation_previews_for_user()
+    # now excludes a messageless direct conversation, so this test
+    # (whose actual purpose is proving the request/response path is
+    # used, not the empty-vs-active distinction) needs a real message
+    # for its one conversation to be included at all -- otherwise
+    # summaries below would come back empty regardless of which code
+    # path load_conversations() took.
+    _insert_message(
+        direct_conversation_id,
+        sender_id=bob_payload["user_id"],
+        receiver_id=alice_payload["user_id"],
+        ciphertext="irrelevant-ciphertext",
+        timestamp=_utc_now(),
+    )
 
     session = _make_connected_session(alice_payload)
 
@@ -586,6 +635,62 @@ def test_load_conversations_uses_request_response_not_database(running_server, m
         summaries = session.conversation_store.get_all()
         assert len(summaries) == 1
         assert summaries[0].username == bob_payload["username"]
+    finally:
+        session.disconnect()
+        _delete_user(alice_payload["username"])
+        _delete_user(bob_payload["username"])
+
+
+def test_sidebar_preview_never_shows_the_undecryptable_placeholder_text(running_server, monkeypatch):
+    """Manual-acceptance defect fix: a real physical-device test found
+    _UNDECRYPTABLE_PLACEHOLDER ("Message unavailable (encrypted in a
+    previous session)") leaking into the sidebar's latest-message
+    preview when this client has no cached session key for a stored
+    message (e.g. a fresh install, or a message from before this
+    device's current key). That text is legitimate for an OPENED
+    conversation's own message list (test_message_persistence_
+    integration.py::test_load_conversation_history_returns_
+    placeholder_without_session_key already proves that, unchanged) --
+    it must never reach the conversation-list row itself, where it
+    visually collided with the unread indicator.
+    """
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
+    alice_payload = _register_user("nokeypreview_a_")
+    bob_payload = _register_user("nokeypreview_b_")
+
+    conversation_id = _create_direct_conversation(
+        alice_payload["user_id"], bob_payload["user_id"]
+    )
+    # Direct DB insertion (mirrors test_conversation_list_request_
+    # preserves_latest_message_data above) -- this session never
+    # established a session key with bob, exactly like a fresh
+    # install or a message left over from a previous device/session.
+    _insert_message(
+        conversation_id,
+        sender_id=bob_payload["user_id"],
+        receiver_id=alice_payload["user_id"],
+        ciphertext="opaque-ciphertext-no-real-key",
+        timestamp=_utc_now(),
+    )
+
+    session = _make_connected_session(alice_payload)
+
+    try:
+        session.load_conversations()
+
+        summaries = session.conversation_store.get_all()
+        assert len(summaries) == 1
+
+        rendered_preview = summaries[0].latest_message.render()
+
+        assert "Message unavailable" not in rendered_preview
+        assert "previous session" not in rendered_preview
+        # The neutral state this now falls through to: an empty
+        # preview string (MessagePreview.render()'s own "self.text or
+        # ''"), not a fabricated new piece of UI text.
+        assert rendered_preview == ""
     finally:
         session.disconnect()
         _delete_user(alice_payload["username"])
@@ -657,3 +762,157 @@ def test_load_conversations_populates_summaries_compatibly(running_server, monke
         _delete_user(alice_payload["username"])
         _delete_user(bob_payload["username"])
         _delete_user(carol_payload["username"])
+
+
+def test_opening_a_found_user_does_not_make_them_appear_in_the_list(
+    running_server, monkeypatch
+):
+    """UI Finalization -- Initial Chat State: finding a user (Find
+    User / an online-but-never-messaged user) and opening a chat with
+    them must not, by itself, put them in the conversation list --
+    only an actual exchanged message does (Decision 1).
+
+    ConversationSummary(conversation_id=None, ...) is exactly the
+    shape gui/chat_window.py::handle_find_user() builds from a search
+    result, and set_current_chat() is exactly what
+    gui/chat_window.py::open_conversation() calls with it -- reproduced
+    directly here (no GUI construction needed) since that one call is
+    the entire client-side effect of "the user clicked a found
+    person". set_current_chat() resolves/creates the conversation
+    server-side either way (existing, unchanged Phase 5 / D3.3
+    behavior -- see its docstring) -- what this test actually proves
+    is that doing so does not leak into a subsequent conversation_list
+    request/ConversationStore population, mirroring
+    test_preview_excludes_direct_conversation_with_no_messages in
+    tests/test_conversation_repository.py at the client/protocol
+    layer instead of the repository layer.
+    """
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
+    alice_payload = _register_user("search_a_")
+    bob_payload = _register_user("search_b_")
+
+    session = _make_connected_session(alice_payload)
+
+    try:
+        from domain.conversation_summary import ConversationSummary
+
+        found_summary = ConversationSummary(
+            conversation_id=None,
+            username=bob_payload["username"],
+            is_online=True,
+            latest_message=None,
+        )
+
+        session.set_current_chat(found_summary)
+        # The conversation now genuinely exists server-side (Phase 5 /
+        # D3.3's get_or_create semantics) -- the point being tested is
+        # what happens next, not that this call itself is a no-op.
+        assert session.current_conversation_id is not None
+
+        session.load_conversations()
+
+        assert session.conversation_store.get(bob_payload["username"]) is None
+        assert session.conversation_store.get_all() == []
+    finally:
+        session.disconnect()
+        _delete_user(alice_payload["username"])
+        _delete_user(bob_payload["username"])
+
+
+# ----------------------------------------------------------------------
+# BUG -- Offline Unread/Notification
+# ----------------------------------------------------------------------
+
+
+def _insert_message_with_recipient(
+    conversation_id, sender_id, receiver_id, ciphertext, timestamp=None
+):
+    """Like _insert_message(), but also records the MessageRecipient
+    row unread_count is actually computed from (C2 -- Read Receipts) --
+    _insert_message() deliberately does not, since most of this file's
+    tests have no need for delivery/read state at all."""
+    db = SessionLocal()
+    try:
+        message_repo = MessageRepository(db)
+        message = message_repo.save_message(
+            sender_id=uuid.UUID(sender_id),
+            receiver_id=uuid.UUID(receiver_id),
+            conversation_id=uuid.UUID(conversation_id),
+            ciphertext=ciphertext,
+            algorithm="KYBER",
+            timestamp=timestamp or _utc_now(),
+        )
+        message_repo.record_recipients(
+            message.id, recipient_ids=[uuid.UUID(receiver_id)], delivered_recipient_ids=[]
+        )
+        message_repo.commit()
+        return message.id
+    finally:
+        db.close()
+
+
+def test_conversation_list_result_carries_unread_count(running_server):
+    """Server-side protocol proof, raw socket: the response includes
+    unread_count, computed from real MessageRecipient state."""
+    _state, port = running_server
+    alice_payload = _register_user("unread_a_")
+    bob_payload = _register_user("unread_b_")
+
+    direct_conversation_id = _create_direct_conversation(
+        alice_payload["user_id"], bob_payload["user_id"]
+    )
+
+    for index in range(3):
+        _insert_message_with_recipient(
+            direct_conversation_id,
+            sender_id=alice_payload["user_id"],
+            receiver_id=bob_payload["user_id"],
+            ciphertext=f"queued while bob was offline {index}",
+        )
+
+    sock, _bob_name = _connect_and_authenticate(port, bob_payload)
+
+    try:
+        response = _request_conversation_list(sock)
+        assert len(response["conversations"]) == 1
+        assert response["conversations"][0]["unread_count"] == 3
+    finally:
+        sock.close()
+        _delete_user(alice_payload["username"])
+        _delete_user(bob_payload["username"])
+
+
+def test_load_conversations_seeds_unread_counts_from_server(running_server, monkeypatch):
+    """Client-consumption proof: a real ClientSession's
+    load_conversations() -- with no receiver thread ever having seen a
+    live message -- ends up with the correct unread count anyway."""
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
+    alice_payload = _register_user("seed_a_")
+    bob_payload = _register_user("seed_b_")
+
+    direct_conversation_id = _create_direct_conversation(
+        alice_payload["user_id"], bob_payload["user_id"]
+    )
+
+    for index in range(2):
+        _insert_message_with_recipient(
+            direct_conversation_id,
+            sender_id=alice_payload["user_id"],
+            receiver_id=bob_payload["user_id"],
+            ciphertext=f"missed while offline {index}",
+        )
+
+    session = _make_connected_session(bob_payload)
+
+    try:
+        session.load_conversations()
+
+        assert session.get_unread_count(alice_payload["username"]) == 2
+    finally:
+        session.disconnect()
+        _delete_user(alice_payload["username"])
+        _delete_user(bob_payload["username"])

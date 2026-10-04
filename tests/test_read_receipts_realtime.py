@@ -39,6 +39,7 @@ from database.repositories.user_repository import UserRepository
 from domain.conversation_summary import ConversationSummary
 from domain.message_delivery_status import MessageDeliveryStatus
 from gui.message_widget import MessageWidget
+from gui.styles import COLOR_READ_RECEIPT
 from storage.secure_key_store import SecureKeyStore
 from tests.tls_test_support import start_test_server
 
@@ -87,7 +88,7 @@ def _token(payload):
     db = SessionLocal()
     try:
         result = AuthenticationService(db).authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -160,6 +161,13 @@ def connect(running_server, monkeypatch, tmp_path):
         )
         session.key_store.unlock(payload["password"])
         session.key_manager.load_or_create_kyber_keypair(session.key_store)
+        # Protocol-Level ML-DSA Origin Authentication: persists the
+        # signing keypair too -- send_public_key() now always attaches
+        # an ML-DSA signature, so a reconnecting session whose signing
+        # key was left ephemeral would look like a KEY_CHANGED to an
+        # already-verified peer even with its KEM key correctly
+        # persisted.
+        session.key_manager.load_or_create_signing_keypair(session.key_store)
         session.send_public_key()
         session.start_receiver()
         opened.append(session)
@@ -209,10 +217,16 @@ def _send_and_receive(alice, bob, alice_name, bob_name, text):
     # Server-Untrusted Identity Verification, Stage 3:
     # establish_session_key() (called inside send_chat_message()
     # below) now requires Alice to have explicitly verified Bob before
-    # wrapping a session key for him. Only Alice ever sends in this
-    # file's tests, so only this one direction is needed.
+    # wrapping a session key for him.
     alice.key_store.verify_peer_fingerprint(
         bob_name, fingerprint_public_key(bob.key_manager.public_key)
+    )
+    # Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    # bob is also the RECEIVER of the live group_key_distribution
+    # packet send_chat_message() below triggers, which now separately
+    # requires bob to have alice already VERIFIED too.
+    bob.key_store.verify_peer_fingerprint(
+        alice_name, fingerprint_public_key(alice.key_manager.public_key)
     )
 
     _open_direct(alice, bob_name)
@@ -271,6 +285,82 @@ def test_sender_is_notified_immediately_without_reconnecting(connect, accounts):
 
     # Alice is still on her original connection -- no reconnect anywhere.
     assert alice.is_connected()
+
+
+def test_sender_is_notified_of_live_delivery_before_any_read(connect, accounts):
+    """Phase 19.23 -- Issue 3: server/client_handler.py has sent a real
+    message_delivered packet since Phase 19.14; this test is the first
+    one to prove ClientSession.handle_message_delivered() actually
+    consumes it and emits message_delivered_updated, since the
+    connection between them was only added in this phase."""
+
+    alice_payload = accounts("alice_")
+    bob_payload = accounts("bob_")
+
+    alice = connect(alice_payload)
+    bob = connect(bob_payload)
+
+    emissions = []
+    alice.message_delivered_updated.connect(
+        lambda cid, receiver: emissions.append((cid, receiver))
+    )
+
+    conversation_id = _send_and_receive(
+        alice, bob, alice_payload["username"], bob_payload["username"],
+        "watch for the delivered signal",
+    )
+
+    assert _wait_for(lambda: len(emissions) == 1), "sender was never told about live delivery"
+    assert emissions[0] == (str(conversation_id), bob_payload["username"])
+
+    # Not read yet -- message_delivered fires the moment the relay
+    # reaches Bob, well before he has opened the conversation at all.
+    assert _statuses(conversation_id) == [MessageDeliveryStatus.DELIVERED]
+
+
+def test_live_sent_bubble_flips_to_delivered_not_read(connect, accounts):
+    """The GUI-facing half of the delivered signal: a bubble added
+    exactly as gui/chat_window.py::send_message() adds it for a live
+    send, updated via ChatWindow.handle_message_delivered_updated() ->
+    MessageWidget.mark_oldest_undelivered_sent() -- grey ✓✓, not the
+    blue read one, and never a fabricated read."""
+
+    alice_payload = accounts("alice_")
+    bob_payload = accounts("bob_")
+
+    alice = connect(alice_payload)
+    bob = connect(bob_payload)
+
+    messages = MessageWidget()
+
+    delivered_events = []
+    alice.message_delivered_updated.connect(
+        lambda cid, receiver: delivered_events.append((cid, receiver))
+    )
+
+    _send_and_receive(
+        alice, bob, alice_payload["username"], bob_payload["username"],
+        "watch this tick go grey",
+    )
+    messages.add_sent_message("watch this tick go grey", read_status=False)
+
+    bubble = next(iter(messages._sent_bubbles_by_message_id.values()))
+    assert "✓✓" not in bubble.time_label.text()
+
+    assert _wait_for(lambda: len(delivered_events) == 1)
+
+    # ChatWindow.handle_message_delivered_updated() gates on
+    # conversation_id/current_chat_is_group before calling this same
+    # method -- exercised separately by the gating itself being simple
+    # equality/boolean checks; here it's confirmed to be for THIS
+    # (the only) direct conversation.
+    assert delivered_events[0][0] == str(alice.current_conversation_id)
+    assert not alice.current_chat_is_group
+
+    messages.mark_oldest_undelivered_sent()
+
+    assert "✓✓" in bubble.time_label.text(), "bubble never flipped to delivered"
+    assert COLOR_READ_RECEIPT not in bubble.time_label.text(), "delivered must not render as read"
 
 
 def test_read_state_is_persisted_when_the_receipt_is_processed(connect, accounts):

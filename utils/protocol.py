@@ -44,7 +44,11 @@ def create_payload_packet(
     timestamp=None,
     receiver=None,
     conversation_id=None,
-    epoch=None
+    epoch=None,
+    message_signature=None,
+    sender_device_id=None,
+    reply_to_message_id=None,
+    client_message_id=None,
 ):
     """
     Wrap an already-encrypted PayloadEnvelope for the wire.
@@ -70,9 +74,27 @@ def create_payload_packet(
     it gets `epoch: None` on the wire, which persist_message() and
     handle_chat() both already treat as 1, identical to today's
     behavior.
+
+    `message_signature` (Message-Level ML-DSA Origin Authentication):
+    base64-encoded ML-DSA signature over crypto/message_protocol.py::
+    canonical_message_payload(sender, receiver, conversation_id,
+    envelope.payload_type, envelope.ciphertext,
+    envelope.content_metadata, epoch) -- see that module for the
+    canonical construction, and client/session.py::
+    _send_encrypted_payload()/handle_chat() for where it is produced
+    and verified. Optional and additive, exactly like Phase 11's
+    signing_public_key/identity_signature fields on the identity
+    packet: omitted (None) by any caller built before this phase
+    existed. handle_chat() rejects a "chat" packet with no
+    message_signature at all -- there is no legacy unsigned message
+    path, unlike the identity packet's (see this phase's own audit of
+    why an unsigned identity-establishment path was allowed to remain
+    for defense-in-depth reasons that do not apply here: a message
+    packet never establishes trust, so there is nothing for an unsigned
+    one to legitimately do).
     """
 
-    return {
+    packet = {
         "type": "chat",
         "sender": sender,
         "receiver": receiver,
@@ -84,12 +106,52 @@ def create_payload_packet(
         "epoch": epoch
     }
 
+    if message_signature is not None:
+        packet["message_signature"] = message_signature
+
+    # Phase 16D -- Device-Aware Peer Identity: optional, additive,
+    # transport-level ONLY -- deliberately not part of
+    # crypto/message_protocol.py::canonical_message_payload()'s signed
+    # fields, so no cryptographic primitive changes at all. Tells a
+    # device-aware receiver WHICH of the sender's devices signed this
+    # message, so it can resolve the matching (username, device_id)
+    # trust-state slot (see client/session.py::_peer_identity_key())
+    # instead of the single account-level slot. Since this field is
+    # never itself trusted -- the ML-DSA signature is still verified
+    # against whatever key gets resolved -- an attacker tampering with
+    # it in transit can only ever cause a fail-closed rejection
+    # (resolving the wrong/no key), never a false acceptance. Omitted
+    # by every pre-existing caller.
+    if sender_device_id is not None:
+        packet["sender_device_id"] = sender_device_id
+
+    # Phase 19.24 -- Message Lifecycle Events: REPLY. The logical
+    # message this one replies to -- addressed by message_id alone
+    # (never a client-claimed conversation_id/receiver pairing), the
+    # same "resolve message_id -> conversation_id -> membership
+    # server-side" pattern create_blob_download_request_packet()
+    # already established. Optional and additive; every pre-existing
+    # caller omits it.
+    if reply_to_message_id is not None:
+        packet["reply_to_message_id"] = reply_to_message_id
+
+    # Phase 19.24 -- Message Lifecycle Events: RETRY idempotency. An
+    # optional client-generated UUID a sender attaches so persist_
+    # message() can recognize a retried send as the SAME message
+    # rather than creating a duplicate (see database/models/message.py
+    # ::client_message_id's own docstring). Optional and additive.
+    if client_message_id is not None:
+        packet["client_message_id"] = client_message_id
+
+    return packet
+
 
 def create_chat_packet(
     sender,
     receiver,
     message,
-    timestamp=None
+    timestamp=None,
+    message_signature=None,
 ):
     """
     Create a private chat message packet.
@@ -101,6 +163,11 @@ def create_chat_packet(
     handed to the generic builder. New payload types, and group
     messaging, call create_payload_packet() directly instead of
     extending this function.
+
+    `message_signature` (Message-Level ML-DSA Origin Authentication):
+    passed straight through to create_payload_packet() -- see its own
+    docstring. Optional and additive, exactly like every other
+    parameter this wrapper already forwards.
     """
 
     envelope = PayloadEnvelope(
@@ -109,7 +176,10 @@ def create_chat_packet(
         content_metadata={},
     )
 
-    return create_payload_packet(sender, envelope, timestamp, receiver=receiver)
+    return create_payload_packet(
+        sender, envelope, timestamp, receiver=receiver,
+        message_signature=message_signature,
+    )
 
 
 def create_group_create_packet(
@@ -158,7 +228,8 @@ def create_group_key_distribution_packet(
     recipient,
     encapsulation,
     wrapped_key,
-    epoch=1
+    epoch=1,
+    group_key_signature=None,
 ):
     """
     Deliver one member's wrapped copy of a group key
@@ -183,9 +254,25 @@ def create_group_key_distribution_packet(
     site (initial group creation) passes it explicitly, since epoch 1
     is exactly what that flow has always produced; a rotation
     (post-leave) passes the new epoch number instead.
+
+    `group_key_signature` (Group-Key-Distribution ML-DSA Origin
+    Authentication): base64-encoded ML-DSA signature over crypto/
+    group_key_protocol.py::canonical_group_key_payload(sender,
+    conversation_id, recipient, encapsulation, wrapped_key, epoch) --
+    see that module for the canonical construction, and client/
+    session.py::_distribute_group_key()/handle_group_key_distribution()
+    for where it is produced and verified. Optional and additive,
+    exactly like Phase 11's identity-packet fields and Phase 12B's
+    message_signature field. handle_group_key_distribution() rejects a
+    packet with no group_key_signature at all -- there is no legacy
+    unsigned path for group-key material, for the same reason Phase
+    12B gave ordinary messages none: this packet only ever installs
+    trust, it never itself needs a defense-in-depth mismatch-detection
+    fallback the way the identity-announcement packet's legacy branch
+    does.
     """
 
-    return {
+    packet = {
         "type": "group_key_distribution",
         "sender": sender,
         "conversation_id": conversation_id,
@@ -194,6 +281,11 @@ def create_group_key_distribution_packet(
         "wrapped_key": wrapped_key,
         "epoch": epoch
     }
+
+    if group_key_signature is not None:
+        packet["group_key_signature"] = group_key_signature
+
+    return packet
 
 
 def create_group_leave_packet(sender, conversation_id):
@@ -429,6 +521,48 @@ def create_read_receipt_notification_packet(conversation_id, reader):
         "type": "read_receipt_notification",
         "conversation_id": conversation_id,
         "reader": reader
+    }
+
+
+def create_typing_indicator_packet(conversation_id, is_typing):
+    """
+    Tell the server this account is (or has just stopped) typing in
+    ``conversation_id`` (Phase 19.24 -- Typing Indicator). Deliberately
+    carries no sender field -- mirrors create_read_receipt_packet()'s
+    identical pattern: the server derives who exclusively from the
+    authenticated socket (see server/client_handler.py::
+    handle_typing_indicator()), never from anything client-supplied.
+
+    Purely a live, ephemeral hint -- never persisted anywhere, on
+    either side, and never replayed via message_history_request. A
+    client that never sees the matching is_typing=False (e.g. the
+    sender's connection drops mid-type) is expected to age the
+    indicator out locally after a short timeout, exactly like a real
+    messaging app; the server itself does not track or expire this
+    state either.
+    """
+
+    return {
+        "type": "typing_indicator",
+        "conversation_id": conversation_id,
+        "is_typing": bool(is_typing),
+    }
+
+
+def create_typing_indicator_notification_packet(conversation_id, username, is_typing):
+    """
+    Server -> the other active member(s) of a conversation: `username`
+    has started (or stopped) typing in `conversation_id` (Phase 19.24
+    -- Typing Indicator). Mirrors create_read_receipt_notification_
+    packet()'s shape; never sent back to the actor's own socket (see
+    handle_typing_indicator()'s own docstring for why).
+    """
+
+    return {
+        "type": "typing_indicator_notification",
+        "conversation_id": conversation_id,
+        "username": username,
+        "is_typing": bool(is_typing),
     }
 
 
@@ -921,17 +1055,53 @@ def create_blob_download_result_packet(request_id, ciphertext=None, error=None):
 
 def create_delivery_failure_packet(
     receiver,
-    reason="User is offline."
+    reason="User is offline.",
+    message_id=None,
 ):
     """
     Create a packet informing the sender that a private message
     could not be delivered (e.g. the recipient is not connected).
+
+    ``message_id`` (Phase 19.14 -- Message Status Ticks): optional,
+    added additively -- only set at the one call site where the
+    message was actually persisted before the failure was detected
+    (server/client_handler.py's live-relay branch); the earlier
+    "could not even be persisted" failure path has no message row to
+    reference and correctly leaves this None. A client showing a
+    per-message error tick falls back to marking its most recently
+    sent, still-pending message to ``receiver`` when this is None,
+    exactly as it already had to before this field existed.
     """
 
     return {
         "type": "delivery_failure",
         "receiver": receiver,
-        "reason": reason
+        "reason": reason,
+        "message_id": message_id,
+    }
+
+
+def create_message_delivered_packet(receiver, message_id, conversation_id=None):
+    """
+    Server -> sender (Phase 19.14 -- Message Status Ticks): a direct
+    message was just relayed live to at least one of ``receiver``'s
+    currently-connected devices (server/client_handler.py's
+    "delivered_to_any_device" branch, which already promotes the
+    MessageRecipient row to DELIVERED -- this packet is the one thing
+    that branch was previously missing: telling the SENDER it
+    happened at all). Before this phase, a live-delivered message and
+    one still in flight looked identical to the sender -- there was no
+    positive delivered signal, only the negative ones (delivery_
+    failure/message_queued) for the two cases where delivery did NOT
+    happen live. Reusing MessageDeliveryStatus.DELIVERED as this
+    packet's implicit meaning, not inventing a new status.
+    """
+
+    return {
+        "type": "message_delivered",
+        "receiver": receiver,
+        "message_id": message_id,
+        "conversation_id": conversation_id,
     }
 
 
@@ -964,6 +1134,239 @@ def create_message_queued_packet(receiver, message_id=None, conversation_id=None
         "receiver": receiver,
         "message_id": message_id,
         "conversation_id": conversation_id
+    }
+
+
+# ======================================================================
+# Phase 19.24 -- Message Lifecycle Events (edit/delete/reactions).
+#
+# Every event below is addressed by message_id alone (never a client-
+# claimed conversation_id/receiver pairing) -- the server always
+# resolves message_id -> conversation_id -> membership/authorization
+# itself (see server/client_handler.py::handle_message_edit() et al.),
+# the same pattern create_blob_download_request_packet() already
+# established. None of these packets ever carry a client-supplied
+# "actor"/"editor"/"deleted_by" field on the REQUEST side -- the
+# server derives the actor exclusively from the authenticated socket,
+# exactly like create_read_receipt_packet() already does. The actor
+# only ever appears on the NOTIFICATION (server -> other clients) side,
+# where it is the server's own, already-authenticated answer.
+# ======================================================================
+
+
+def create_message_edit_packet(message_id, envelope, epoch, message_signature, expected_edit_version):
+    """
+    Client -> server: re-encrypt this message's content in place.
+
+    ``envelope``/``epoch``/``message_signature`` are produced exactly
+    like a live "chat" send (see create_payload_packet()) -- an edit is
+    authenticated/signed content, not a bare string. ``expected_edit_
+    version`` is this client's last-known edit_version for the message
+    (0 for a never-edited message) -- server/client_handler.py::
+    handle_message_edit() rejects the edit if the row's actual
+    edit_version has since moved past it (a concurrent edit from
+    another of the sender's own devices, or a stale/replayed/duplicate
+    packet), rather than silently overwriting a newer edit with an
+    older one.
+    """
+
+    return {
+        "type": "message_edit",
+        "message_id": message_id,
+        "ciphertext": envelope.ciphertext,
+        "content_metadata": envelope.content_metadata or None,
+        "epoch": epoch,
+        "message_signature": message_signature,
+        "expected_edit_version": expected_edit_version,
+    }
+
+
+def create_message_edited_notification_packet(
+    message_id, conversation_id, ciphertext, content_metadata, epoch,
+    message_signature, editor, edited_at, edit_version,
+):
+    """
+    Server -> every conversation member (including the editor's OTHER
+    authorized devices -- multi-device sync): the accepted result of a
+    message_edit. ``editor`` is the server's own authenticated answer
+    (always equal to the message's original sender -- see handle_
+    message_edit()'s docstring for why no broader edit-authorization
+    policy exists), never echoed from the request.
+    """
+
+    return {
+        "type": "message_edited",
+        "message_id": message_id,
+        "conversation_id": conversation_id,
+        "ciphertext": ciphertext,
+        "content_metadata": content_metadata,
+        "epoch": epoch,
+        "message_signature": message_signature,
+        "editor": editor,
+        "edited_at": edited_at,
+        "edit_version": edit_version,
+    }
+
+
+def create_message_delete_for_me_packet(message_id):
+    """
+    Client -> server: hide this message from the requesting user only
+    (database/models/message_hidden_for_user.py). Carries no other
+    field -- the actor is always the authenticated socket.
+    """
+
+    return {"type": "message_delete_for_me", "message_id": message_id}
+
+
+def create_message_delete_for_everyone_packet(message_id):
+    """
+    Client -> server: request REAL, authorized global deletion of this
+    message's content (server/client_handler.py::handle_message_
+    delete_for_everyone()). Carries no actor field -- the server
+    re-derives the original sender from the stored row and rejects
+    unless the authenticated socket IS that sender.
+    """
+
+    return {"type": "message_delete_for_everyone", "message_id": message_id}
+
+
+def create_message_deleted_notification_packet(message_id, conversation_id, deleted_by, deleted_at):
+    """
+    Server -> every conversation member (including the deleter's other
+    devices): a message_delete_for_everyone was accepted. Never carries
+    ciphertext/content -- there is none left server-side by the time
+    this is sent (handle_message_delete_for_everyone() nulls it in the
+    same transaction). ``deleted_by`` is the server's own authenticated
+    answer, for UI attribution ("You deleted this message" vs. "<name>
+    deleted this message").
+    """
+
+    return {
+        "type": "message_deleted",
+        "message_id": message_id,
+        "conversation_id": conversation_id,
+        "deleted_by": deleted_by,
+        "deleted_at": deleted_at,
+    }
+
+
+def create_reaction_add_packet(message_id, envelope, epoch, message_signature=None):
+    """
+    Client -> server: set/replace the requesting user's reaction on
+    this message. ``envelope`` is the AES-256-GCM-encrypted reaction
+    string (payload/reaction_adapter.py) under the conversation's
+    current epoch key -- the server persists ciphertext only and never
+    learns which reaction was chosen (see database/models/
+    message_reaction.py's own docstring).
+
+    ``message_signature`` (continued Phase 19.24 -- receiver-side
+    verification): base64-encoded ML-DSA-65 signature over crypto/
+    message_protocol.py::canonical_message_payload(..., purpose=
+    REACTION_PAYLOAD_PURPOSE) -- lets the RECEIVING client verify this
+    reaction's origin independently of trusting the server's own
+    authorization check, exactly like an ordinary chat message.
+    Optional only for backward compatibility with a caller that
+    predates this addition; every real caller now supplies it.
+    """
+
+    packet = {
+        "type": "reaction_add",
+        "message_id": message_id,
+        "ciphertext": envelope.ciphertext,
+        "epoch": epoch,
+    }
+    if message_signature is not None:
+        packet["message_signature"] = message_signature
+    return packet
+
+
+def create_reaction_remove_packet(message_id):
+    """Client -> server: remove the requesting user's reaction (if
+    any) from this message. No ciphertext -- there is nothing left to
+    encrypt once removed."""
+
+    return {"type": "reaction_remove", "message_id": message_id}
+
+
+def create_reaction_updated_notification_packet(
+    message_id, conversation_id, actor, action, ciphertext=None, epoch=None,
+    message_signature=None,
+):
+    """
+    Server -> every conversation member: a reaction_add or
+    reaction_remove was accepted. ``action`` is "add" or "remove".
+    ``actor`` is the server's own authenticated answer -- who reacted,
+    never a client-supplied field. ``ciphertext``/``epoch``/
+    ``message_signature`` are present only for "add" (all None for
+    "remove", since there is nothing to decrypt or verify).
+    ``message_signature`` is relayed through unchanged from the
+    original reaction_add packet -- the server never generates or
+    checks it itself, exactly like an ordinary chat message's
+    signature; verification is the RECEIVING client's job (see
+    ClientSession.handle_reaction_updated()).
+    """
+
+    return {
+        "type": "reaction_updated",
+        "message_id": message_id,
+        "conversation_id": conversation_id,
+        "actor": actor,
+        "action": action,
+        "ciphertext": ciphertext,
+        "epoch": epoch,
+        "message_signature": message_signature,
+    }
+
+
+def create_message_pin_packet(message_id):
+    """
+    Client -> server: pin ``message_id`` for every member of its
+    conversation (Phase 19.24 -- Pinned Messages). No ciphertext/epoch/
+    signature -- unlike reaction_add, there is no content of its own
+    here to protect or verify; see database/models/message.py::
+    pinned_at/pinned_by's own docstring for the full trust-model
+    rationale (attribution is server-derived from the authenticated
+    connection, exactly like deleted_by already is).
+    """
+
+    return {"type": "message_pin", "message_id": message_id}
+
+
+def create_message_unpin_packet(message_id):
+    """Client -> server: unpin ``message_id``, if currently pinned."""
+
+    return {"type": "message_unpin", "message_id": message_id}
+
+
+def create_message_pinned_notification_packet(
+    message_id, conversation_id, pinned_by, pinned_at,
+):
+    """
+    Server -> every conversation member: ``message_id`` was pinned.
+    ``pinned_by`` is the server's own authenticated answer (a
+    username), never a client-supplied field.
+    """
+
+    return {
+        "type": "message_pinned",
+        "message_id": message_id,
+        "conversation_id": conversation_id,
+        "pinned_by": pinned_by,
+        "pinned_at": pinned_at,
+    }
+
+
+def create_message_unpinned_notification_packet(message_id, conversation_id, unpinned_by):
+    """Server -> every conversation member: ``message_id`` was
+    unpinned. ``unpinned_by`` is who performed the unpin (server-
+    derived), kept for logging/attribution parity with the pin
+    notification even though most UIs will simply drop the row."""
+
+    return {
+        "type": "message_unpinned",
+        "message_id": message_id,
+        "conversation_id": conversation_id,
+        "unpinned_by": unpinned_by,
     }
 
 
@@ -1004,13 +1407,41 @@ def create_user_list_packet(users):
 def create_public_key_packet(
     username,
     algorithm,
-    public_key
+    public_key,
+    signing_public_key=None,
+    identity_signature=None,
+    device_id=None,
 ):
     """
     Create a public key exchange packet.
+
+    ``signing_public_key``/``identity_signature`` (Protocol-Level
+    ML-DSA Origin Authentication): optional and additive. When present,
+    they carry this sender's base64-encoded ML-DSA-65 public key and
+    its ML-DSA signature over crypto/identity_protocol.py::
+    canonical_identity_payload(username, public_key, signing_public_key)
+    -- see that module for the canonical construction, and
+    client/session.py::send_public_key()/handle_public_key() for where
+    they are produced and verified. Omitted (None) by every pre-
+    existing caller that built this packet before this phase existed,
+    which keeps constructing exactly the legacy, unsigned packet shape
+    -- ClientSession.handle_public_key() treats the absence of
+    ``signing_public_key`` as "legacy packet, use the existing KEM-only
+    path", not as an error.
+
+    ``device_id`` (Phase 16D -- Device-Aware Peer Identity): optional
+    and additive, and deliberately NOT part of the ML-DSA-signed
+    identity payload above -- it is transport metadata only, telling a
+    device-aware receiver WHICH of this account's devices this
+    identity belongs to (see client/session.py::_peer_identity_key()),
+    never a claim the receiver is asked to cryptographically trust on
+    its own. Omitted by every pre-existing caller (a session that has
+    never called enroll_device(), which is every one of this
+    codebase's pre-16D regression tests), which keeps constructing the
+    exact same packet shape as before.
     """
 
-    return {
+    packet = {
         "type": "key_exchange",
         "operation": "public_key",
         "algorithm": algorithm,
@@ -1018,13 +1449,26 @@ def create_public_key_packet(
         "public_key": public_key
     }
 
+    if signing_public_key is not None:
+        packet["signing_public_key"] = signing_public_key
+
+    if identity_signature is not None:
+        packet["identity_signature"] = identity_signature
+
+    if device_id is not None:
+        packet["device_id"] = device_id
+
+    return packet
+
 
 def create_session_key_packet(
     sender,
     receiver,
     algorithm,
     encrypted_key,
-    epoch=None
+    epoch=None,
+    conversation_id=None,
+    session_key_signature=None,
 ):
     """
     Create an encrypted AES session key packet.
@@ -1036,9 +1480,39 @@ def create_session_key_packet(
     this session key belongs to. Optional and additive: an omitted
     epoch defaults to `None` on the wire, which handle_session_key()
     already treats as 1, identical to pre-fix behavior.
+
+    `conversation_id` (RSA Direct-Session-Key ML-DSA Origin
+    Authentication, Phase 13.6): the sender's own, locally-resolved
+    direct-conversation id -- the same value bound into
+    `session_key_signature` below. Optional and additive: server/
+    client_handler.py's own, pre-existing D3.1 hardening still
+    overwrites this field with its own server-side resolution
+    (`_resolve_direct_conversation_id(sender_id, recipient_id)`)
+    before relay, exactly as before Phase 13.6 -- never trusting a
+    client-supplied value for THAT purpose. Sending it here too is
+    what lets the receiver's signature check independently confirm the
+    server's resolution agrees with what the sender actually signed;
+    it does not replace or weaken the server-side check.
+
+    `session_key_signature` (RSA Direct-Session-Key ML-DSA Origin
+    Authentication, Phase 13.6): base64-encoded ML-DSA signature over
+    crypto/session_key_protocol.py::canonical_rsa_session_key_payload(
+    sender, receiver, conversation_id, algorithm, encrypted_key, epoch)
+    -- see that module for the canonical construction, and client/
+    session.py::establish_session_key()/handle_session_key() for where
+    it is produced and verified. Optional and additive, exactly like
+    Phase 13's group_key_signature field. Only meaningful for the RSA
+    branch: a KYBER-mode session key is never sent as this packet type
+    (it uses group_key_distribution/group_key_signature instead -- see
+    handle_session_key()'s own docstring on why its "algorithm ==
+    KYBER" branch is legacy/unreachable in current production code).
+    handle_session_key() rejects an RSA-mode packet with no
+    session_key_signature at all -- there is no legacy unsigned path
+    for session-key material, for the same reason Phase 13 gave
+    group-key material none.
     """
 
-    return {
+    packet = {
         "type": "key_exchange",
         "operation": "session_key",
         "algorithm": algorithm,
@@ -1047,6 +1521,14 @@ def create_session_key_packet(
         "encrypted_key": encrypted_key,
         "epoch": epoch
     }
+
+    if conversation_id is not None:
+        packet["conversation_id"] = conversation_id
+
+    if session_key_signature is not None:
+        packet["session_key_signature"] = session_key_signature
+
+    return packet
 
 
 def parse_packet(packet):
@@ -1058,3 +1540,513 @@ def parse_packet(packet):
     """
 
     return packet
+
+
+# ============================================================
+# Multi-Device Identity (Phase 16)
+# ============================================================
+#
+# Flat-dict / request_id convention identical to every other
+# request/response packet pair above (e.g. direct_conversation_
+# request/result, epoch_reservation_request/result) -- request_id is
+# attached by ClientSession.send_request() itself, never set here,
+# exactly like those. The account identity used server-side is always
+# resolved from the authenticated connection (user.id), never trusted
+# from any field on these packets -- see server/device_handler.py.
+
+
+def create_device_enroll_request_packet(
+    device_id, device_name, platform, kem_public_key, ml_dsa_public_key, enrollment_signature
+):
+    """
+    A device's own, self-signed request to become known to the
+    account (crypto/device_protocol.py::canonical_device_enrollment_
+    payload()). ``enrollment_signature`` is base64-encoded, over that
+    canonical payload, signed with THIS device's own private ML-DSA
+    key -- proves possession of the advertised keys, not authorization
+    (see that module's own docstring).
+    """
+
+    return {
+        "type": "device_enroll_request",
+        "device_id": device_id,
+        "device_name": device_name,
+        "platform": platform,
+        "kem_public_key": kem_public_key,
+        "ml_dsa_public_key": ml_dsa_public_key,
+        "enrollment_signature": enrollment_signature,
+    }
+
+
+def create_device_enroll_result_packet(request_id, success, state=None, device_id=None, error=None):
+    return {
+        "type": "device_enroll_result",
+        "request_id": request_id,
+        "success": success,
+        "state": state,
+        "device_id": device_id,
+        "error": error,
+    }
+
+
+def create_device_list_request_packet():
+    return {"type": "device_list_request"}
+
+
+def create_device_list_result_packet(request_id, devices):
+    """
+    ``devices`` is a list of dicts, each already stripped down to
+    non-sensitive fields (device_id, device_name, platform,
+    fingerprint, state, created_at) by the caller -- never including
+    the raw public key bytes/base64 unless a caller genuinely needs
+    them (kept out by default to match this project's established
+    "don't relay more than the receiver needs" convention).
+    """
+
+    return {"type": "device_list_result", "request_id": request_id, "devices": devices}
+
+
+def create_device_authorize_packet(target_device_id, target_fingerprint, authorizer_device_id, authorization_signature):
+    """
+    An already-AUTHORIZED device vouching for a PENDING one
+    (crypto/device_protocol.py::canonical_device_authorization_
+    payload()). ``authorization_signature`` is base64-encoded, signed
+    with the AUTHORIZING device's own private ML-DSA key.
+    """
+
+    return {
+        "type": "device_authorize",
+        "target_device_id": target_device_id,
+        "target_fingerprint": target_fingerprint,
+        "authorizer_device_id": authorizer_device_id,
+        "authorization_signature": authorization_signature,
+    }
+
+
+def create_device_authorize_result_packet(request_id, success, error=None):
+    return {"type": "device_authorize_result", "request_id": request_id, "success": success, "error": error}
+
+
+def create_device_revoke_packet(target_device_id, revoker_device_id, revocation_signature):
+    """
+    An already-AUTHORIZED device revoking a device (possibly itself)
+    (crypto/device_protocol.py::canonical_device_revocation_payload()).
+    ``revocation_signature`` is base64-encoded, signed with the
+    REVOKING device's own private ML-DSA key.
+    """
+
+    return {
+        "type": "device_revoke",
+        "target_device_id": target_device_id,
+        "revoker_device_id": revoker_device_id,
+        "revocation_signature": revocation_signature,
+    }
+
+
+def create_device_revoke_result_packet(request_id, success, error=None):
+    return {"type": "device_revoke_result", "request_id": request_id, "success": success, "error": error}
+
+
+def create_device_session_bind_packet(device_id, session_nonce, binding_signature):
+    """
+    Phase 16B -- Device Authentication Binding: proves THIS connection
+    is operated by the party holding the private ML-DSA key for
+    ``device_id`` (crypto/device_protocol.py::canonical_device_
+    session_binding_payload()). ``binding_signature`` is base64-
+    encoded, signed with the connecting device's own private ML-DSA
+    key.
+    """
+
+    return {
+        "type": "device_session_bind",
+        "device_id": device_id,
+        "session_nonce": session_nonce,
+        "binding_signature": binding_signature,
+    }
+
+
+def create_device_session_bind_result_packet(request_id, success, error=None):
+    return {
+        "type": "device_session_bind_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+# ------------------------------------------------------------------
+# Cross-Device Key Synchronization (Phase 16C)
+# ------------------------------------------------------------------
+
+
+def create_device_key_sync_packet(
+    target_device_id, target_fingerprint, conversation_id, epoch,
+    package_type, encapsulation, wrapped_key, sync_signature,
+):
+    """
+    One device delivering wrapped conversation/group key material to
+    another of the same account's own devices
+    (crypto/device_protocol.py::canonical_device_key_sync_payload()).
+    ``encapsulation``/``wrapped_key`` are exactly what KeyManager.
+    wrap_key_for_member() already produces for ordinary group-key
+    distribution -- reused unchanged, never a new wire format.
+    ``sync_signature`` is base64-encoded, signed with the SOURCE
+    device's own private ML-DSA key.
+    """
+
+    return {
+        "type": "device_key_sync",
+        "target_device_id": target_device_id,
+        "target_fingerprint": target_fingerprint,
+        "conversation_id": conversation_id,
+        "epoch": epoch,
+        "package_type": package_type,
+        "encapsulation": encapsulation or None,
+        "wrapped_key": wrapped_key,
+        "sync_signature": sync_signature,
+    }
+
+
+def create_device_key_sync_result_packet(request_id, success, error=None):
+    return {
+        "type": "device_key_sync_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+# ------------------------------------------------------------------
+# Inbox: verification requests + group member-add approval
+# (Phase 19.13 -- User Manual Feedback Implementation)
+#
+# Both workflows share one small server-side store (database/models/
+# inbox_notification.py) and one request/response/list shape here --
+# neither packet carries any cryptography of its own. Approving a
+# verification_request still requires the RECIPIENT's own client to
+# call the existing, unweakened ClientSession.confirm_combined_peer_
+# verification() locally, using the fingerprint it has already
+# observed for the requester -- this inbox layer only records who
+# asked whom and what they decided; it is never itself the trust
+# decision. Approving a group_add_request runs through the exact
+# same server-side add-member + group-key-distribution path an
+# admin's own direct group_add_members already does (server/
+# client_handler.py's _perform_group_add_members()) -- reused, not
+# duplicated.
+# ------------------------------------------------------------------
+
+
+def create_verification_request_packet(target_username):
+    """
+    Ask the server to notify ``target_username`` that the sender wants
+    to verify their identity. The sender's own identity comes from the
+    authenticated socket server-side, never from this packet.
+    """
+
+    return {
+        "type": "verification_request",
+        "target_username": target_username,
+    }
+
+
+def create_group_remove_member_packet(conversation_id, target_username):
+    """
+    Ask the server to remove ``target_username`` from a group
+    conversation. Server-enforced admin-only (server/client_handler.py
+    ::handle_group_remove_member()) -- the caller's role is always
+    re-derived server-side from ConversationRepository.
+    get_admin_user_id(), never trusted from this packet or from
+    whether the client happened to show the Remove Member button.
+    """
+
+    return {
+        "type": "group_remove_member",
+        "conversation_id": conversation_id,
+        "target_username": target_username,
+    }
+
+
+def create_group_remove_member_result_packet(request_id, success, error=None):
+    return {
+        "type": "group_remove_member_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+def create_inbox_list_request_packet():
+    """
+    Ask for every inbox notification (pending or already resolved)
+    addressed to the authenticated caller. Carries no fields, exactly
+    like create_conversation_list_request_packet() -- whose inbox to
+    return is entirely the authenticated connection's own identity.
+    """
+
+    return {
+        "type": "inbox_list_request",
+    }
+
+
+def create_inbox_list_result_packet(request_id, notifications):
+    """
+    Server -> client: the result of an inbox_list_request.
+    ``notifications`` is a list of plain dicts: {notification_id,
+    type ("verification_request"|"group_add_request"), status
+    ("pending"|"approved"|"denied"), requester_username,
+    created_at, and -- group_add_request only --
+    conversation_id/group_name/candidate_username}.
+    """
+
+    return {
+        "type": "inbox_list_result",
+        "request_id": request_id,
+        "notifications": notifications,
+    }
+
+
+def create_inbox_response_packet(notification_id, approve):
+    """
+    The recipient's decision on one pending inbox notification.
+    ``approve`` True/False -- server-side handling differs by the
+    notification's own ``type`` (verification_request vs
+    group_add_request), see handle_inbox_response()'s own docstring.
+    Sending this for a verification_request does NOT itself perform
+    cryptographic verification -- the recipient's client must already
+    have called confirm_combined_peer_verification() locally before
+    sending approve=True (see gui/mobile UI wiring); this packet only
+    ever records/propagates that outcome.
+    """
+
+    return {
+        "type": "inbox_response",
+        "notification_id": notification_id,
+        "approve": approve,
+    }
+
+
+def create_inbox_notification_packet(notification):
+    """
+    Server -> client: a brand-new inbox notification has just arrived
+    for this connection (pushed live, if online, the moment it is
+    created -- see handle_verification_request()/
+    handle_group_add_members()). Same per-notification shape as one
+    entry in create_inbox_list_result_packet()'s ``notifications``
+    list, so the client can reuse one parsing path for both.
+    """
+
+    return {
+        "type": "inbox_notification",
+        "notification": notification,
+    }
+
+
+def create_inbox_response_result_packet(notification):
+    """
+    Server -> the ORIGINAL REQUESTER: their earlier verification_
+    request or group_add_request has just been approved or denied
+    (pushed live if they are online). Same per-notification shape
+    again, so "was this approved or denied" and "here is a brand new
+    request for you" render through the same client-side code path.
+    """
+
+    return {
+        "type": "inbox_response_result",
+        "notification": notification,
+    }
+
+
+# ------------------------------------------------------------------
+# Settings (Phase 19.14): change username/password, profile picture
+# upload/fetch. Server-side, all four are authenticated-account-only
+# self-service operations -- see auth/authentication_service.py::
+# change_username()/change_password() and server/client_handler.py's
+# profile-picture handlers for the actual validation/storage.
+# ------------------------------------------------------------------
+
+
+def create_change_username_request_packet(new_username):
+    return {"type": "change_username_request", "new_username": new_username}
+
+
+def create_change_username_result_packet(request_id, success, error=None):
+    return {
+        "type": "change_username_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+def create_change_password_request_packet(current_password, new_password, confirm_password):
+    """
+    ``current_password``/``new_password`` travel over this connection's
+    existing TLS 1.3 channel only (the same transport every credential
+    -- the original login password, the register password -- already
+    crosses); never logged, never persisted in plaintext anywhere (see
+    AuthenticationService.change_password()'s own docstring).
+    """
+
+    return {
+        "type": "change_password_request",
+        "current_password": current_password,
+        "new_password": new_password,
+        "confirm_password": confirm_password,
+    }
+
+
+def create_change_password_result_packet(request_id, success, error=None):
+    return {
+        "type": "change_password_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+def create_profile_picture_upload_request_packet(image_base64, content_type):
+    """
+    ``image_base64`` is the raw (not end-to-end encrypted) image
+    bytes, base64-encoded -- a profile picture is, by design, visible
+    to any other user who looks this account up, unlike message
+    attachments (crypto/... payload adapters), which stay end-to-end
+    encrypted. Still travels only over this connection's TLS channel.
+    """
+
+    return {
+        "type": "profile_picture_upload_request",
+        "image_base64": image_base64,
+        "content_type": content_type,
+    }
+
+
+def create_profile_picture_upload_result_packet(request_id, success, error=None):
+    return {
+        "type": "profile_picture_upload_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+def create_profile_picture_request_packet(username):
+    return {"type": "profile_picture_request", "username": username}
+
+
+def create_profile_picture_result_packet(request_id, found, image_base64=None, content_type=None):
+    return {
+        "type": "profile_picture_result",
+        "request_id": request_id,
+        "found": found,
+        "image_base64": image_base64,
+        "content_type": content_type,
+    }
+
+
+# ------------------------------------------------------------------
+# Bio (Phase 19.22 -- Settings): the User.bio column has existed since
+# the initial migration but had no wire format at all until now. Same
+# request/response shape as change_username_request/result and
+# profile_picture_request/result above -- update-own + fetch-by-
+# username, no new pattern introduced.
+# ------------------------------------------------------------------
+
+
+def create_change_bio_request_packet(bio):
+    return {"type": "change_bio_request", "bio": bio}
+
+
+def create_change_bio_result_packet(request_id, success, error=None):
+    return {
+        "type": "change_bio_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+def create_bio_request_packet(username):
+    return {"type": "bio_request", "username": username}
+
+
+def create_last_seen_request_packet(username):
+    """Phase 19.24 -- Presence/Last Seen. Client -> server: ask for
+    ``username``'s last-seen timestamp -- only ever sent for a peer
+    the requester's own online_users list already reports as OFFLINE
+    (an online peer has nothing to ask for)."""
+
+    return {"type": "last_seen_request", "username": username}
+
+
+def create_last_seen_result_packet(request_id, found, last_seen_at=None):
+    """``found=False`` covers both "no such account" and "blocked in
+    either direction" -- same account-enumeration/privacy guard as
+    create_bio_result_packet()'s identical "found" contract. ``last_
+    seen_at`` is None whenever the account has never disconnected
+    (still online right now, or has never logged in), which is a true
+    statement, not a missing one -- the client must render "no last-
+    seen information" rather than inventing a time.
+    """
+
+    return {
+        "type": "last_seen_result",
+        "request_id": request_id,
+        "found": found,
+        "last_seen_at": last_seen_at,
+    }
+
+
+def create_bio_result_packet(request_id, found, bio=None):
+    return {
+        "type": "bio_result",
+        "request_id": request_id,
+        "found": found,
+        "bio": bio,
+    }
+
+
+# ------------------------------------------------------------------
+# Phase 19.24 -- Block User. Same request/response shape as change_
+# username_request/result above -- a block/unblock is server-side and
+# persisted (database/models/blocked_user.py), unlike Mute/Archive's
+# local-only preferences, since it must be enforced for every
+# authorized device of both accounts, not just this one connection.
+# ------------------------------------------------------------------
+
+
+def create_block_user_request_packet(target_username):
+    return {"type": "block_user_request", "target_username": target_username}
+
+
+def create_block_user_result_packet(request_id, success, error=None):
+    return {
+        "type": "block_user_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+def create_unblock_user_request_packet(target_username):
+    return {"type": "unblock_user_request", "target_username": target_username}
+
+
+def create_unblock_user_result_packet(request_id, success, error=None):
+    return {
+        "type": "unblock_user_result",
+        "request_id": request_id,
+        "success": success,
+        "error": error,
+    }
+
+
+def create_blocked_users_list_request_packet():
+    return {"type": "blocked_users_list_request"}
+
+
+def create_blocked_users_list_result_packet(request_id, usernames):
+    return {
+        "type": "blocked_users_list_result",
+        "request_id": request_id,
+        "usernames": usernames,
+    }

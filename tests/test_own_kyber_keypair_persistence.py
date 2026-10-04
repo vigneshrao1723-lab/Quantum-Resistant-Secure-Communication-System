@@ -457,7 +457,9 @@ def app(running_server, monkeypatch, tmp_path):
         session = ClientSession()
         opened.append(session)
 
-        result = session.authenticate_credentials(payload["username"], password)
+        # UI Finalization -- Login Identifier: phone number, not username,
+        # is what authenticate_credentials() now authenticates with.
+        result = session.authenticate_credentials(payload["phone_number"], password)
         assert result.success, result.message
 
         session.user_id = result.user_id
@@ -537,9 +539,17 @@ def test_own_keypair_survives_a_third_login_too(app):
 
 def test_private_key_never_appears_in_the_outgoing_public_key_packet(app, monkeypatch):
     """TEST L / Section 7: the packet actually sent to the server by
-    send_public_key() must contain only the public key -- the private
-    (decapsulation) key must never be present in the outgoing wire
-    packet, in any form."""
+    send_public_key() must contain only PUBLIC material -- neither the
+    Kyber private (decapsulation) key nor the ML-DSA private (signing)
+    seed may ever be present in the outgoing wire packet, in any form.
+
+    Protocol-Level ML-DSA Origin Authentication: send_public_key() now
+    also attaches signing_public_key/identity_signature (both public:
+    a public key and a signature, never signing material itself) --
+    the expected key set below was widened to include them, but the
+    core property under test (no PRIVATE key material on the wire) is
+    unchanged and additionally checked for the ML-DSA private seed
+    too."""
 
     bob_payload = app["register"]("bob_")
     bob = app["launch"](bob_payload, send_key=False, start_receiving=False)
@@ -555,6 +565,7 @@ def test_private_key_never_appears_in_the_outgoing_public_key_packet(app, monkey
 
     private_key = bob.key_manager.kyber.decapsulation_key
     public_key_wire_text = bob.key_manager.public_key.decode("utf-8")
+    signing_private_seed = bob.key_manager.ml_dsa.export_private_key()
 
     bob.send_public_key()
 
@@ -564,11 +575,22 @@ def test_private_key_never_appears_in_the_outgoing_public_key_packet(app, monkey
     packet = key_packets[0]
     serialized = json.dumps(packet, default=str)
 
-    assert set(packet.keys()) == {"type", "operation", "algorithm", "username", "public_key"}
+    assert set(packet.keys()) == {
+        "type",
+        "operation",
+        "algorithm",
+        "username",
+        "public_key",
+        "signing_public_key",
+        "identity_signature",
+    }
     assert packet["public_key"] == public_key_wire_text
 
     assert private_key.hex() not in serialized
     assert base64.b64encode(private_key).decode("ascii") not in serialized
+
+    assert signing_private_seed.hex() not in serialized
+    assert base64.b64encode(signing_private_seed).decode("ascii") not in serialized
 
 
 def test_existing_kyber_operations_unaffected_direct_key_wrap(app):

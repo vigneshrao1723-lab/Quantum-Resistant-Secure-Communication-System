@@ -114,7 +114,15 @@ def test_different_user_pairs_get_different_conversations(db_session, unique_suf
     assert conversation_ab.id != conversation_ac.id
 
 
-def test_preview_includes_conversation_with_no_messages(db_session, unique_suffix):
+def test_preview_excludes_direct_conversation_with_no_messages(db_session, unique_suffix):
+    """UI Finalization Decision 1: a direct conversation row can exist
+    (get_or_create_direct_conversation() creates one the moment either
+    side merely OPENS a chat -- see ClientSession.set_current_chat())
+    with zero real activity. It must not be returned here, or it would
+    make an empty conversation appear in the sidebar merely because it
+    was opened once -- see get_conversation_previews_for_user()'s
+    docstring. This replaces the previous version of this test, which
+    asserted the opposite (pre-Decision-1) behavior."""
     user_repo = UserRepository(db_session)
     conversation_repo = ConversationRepository(db_session)
 
@@ -126,9 +134,89 @@ def test_preview_includes_conversation_with_no_messages(db_session, unique_suffi
 
     previews = conversation_repo.get_conversation_previews_for_user(user_a.id)
 
+    assert previews == []
+
+
+def test_preview_excludes_messageless_conversation_for_either_participant(
+    db_session, unique_suffix
+):
+    """The exclusion isn't one-sided -- neither participant sees an
+    unmessaged direct conversation, not just the one who happened to
+    open it first."""
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+
+    user_a = _make_user(user_repo, unique_suffix, "a")
+    user_b = _make_user(user_repo, unique_suffix, "b")
+
+    conversation_repo.get_or_create_direct_conversation(user_a.id, user_b.id)
+    conversation_repo.commit()
+
+    assert conversation_repo.get_conversation_previews_for_user(user_a.id) == []
+    assert conversation_repo.get_conversation_previews_for_user(user_b.id) == []
+
+
+def test_preview_includes_group_conversation_with_no_messages(db_session, unique_suffix):
+    """The exclusion is scoped to direct conversations only -- a group
+    is always eagerly created with real membership (never a lazy,
+    merely-opened placeholder the way a direct conversation can be),
+    so it must appear immediately, before its first message."""
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+
+    user_a = _make_user(user_repo, unique_suffix, "a")
+    user_b = _make_user(user_repo, unique_suffix, "b")
+    user_c = _make_user(user_repo, unique_suffix, "c")
+
+    conversation = conversation_repo.create_group_conversation(
+        member_ids=[user_a.id, user_b.id, user_c.id], name="Fresh Group"
+    )
+    conversation_repo.commit()
+
+    previews = conversation_repo.get_conversation_previews_for_user(user_a.id)
+
     assert len(previews) == 1
+    assert previews[0].conversation.id == conversation.id
     assert previews[0].latest_message is None
-    assert [user.id for user in previews[0].participants] == [user_b.id]
+
+
+def test_direct_conversation_appears_once_a_message_exists(db_session, unique_suffix):
+    """The other half of Decision 1: once real activity exists, the
+    same conversation that was excluded above is included -- and stays
+    included across a fresh preview query, standing in for
+    'survives reload/reconnect' at the repository level (the query has
+    no session-scoped state to lose between calls)."""
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+    message_repo = MessageRepository(db_session)
+
+    user_a = _make_user(user_repo, unique_suffix, "a")
+    user_b = _make_user(user_repo, unique_suffix, "b")
+
+    conversation = conversation_repo.get_or_create_direct_conversation(
+        user_a.id, user_b.id
+    )
+    conversation_repo.commit()
+
+    assert conversation_repo.get_conversation_previews_for_user(user_a.id) == []
+
+    message_repo.save_message(
+        sender_id=user_a.id,
+        receiver_id=user_b.id,
+        conversation_id=conversation.id,
+        ciphertext="the first real message",
+        algorithm="KYBER",
+        timestamp=_utc_now(),
+    )
+    message_repo.commit()
+
+    previews_after = conversation_repo.get_conversation_previews_for_user(user_a.id)
+    previews_after_again = conversation_repo.get_conversation_previews_for_user(user_a.id)
+
+    assert len(previews_after) == 1
+    assert previews_after[0].conversation.id == conversation.id
+    assert len(previews_after_again) == 1
+    assert previews_after_again[0].conversation.id == conversation.id
 
 
 def test_preview_includes_latest_message_and_participant(db_session, unique_suffix):
@@ -387,6 +475,183 @@ def test_record_recipients_marks_connected_members_delivered(db_session, unique_
     assert status_by_recipient[user_b.id] == MessageDeliveryStatus.DELIVERED
     assert status_by_recipient[user_c.id] == MessageDeliveryStatus.QUEUED
     assert user_a.id not in status_by_recipient
+
+
+# ----------------------------------------------------------------------
+# BUG -- Offline Unread/Notification
+# ----------------------------------------------------------------------
+
+
+def test_preview_unread_count_reflects_not_yet_read_messages(db_session, unique_suffix):
+    """The core case: 3 messages queued for Bob while he was offline,
+    none of them READ yet -- his preview must report unread_count=3."""
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+    message_repo = MessageRepository(db_session)
+
+    alice = _make_user(user_repo, unique_suffix, "alice")
+    bob = _make_user(user_repo, unique_suffix, "bob")
+
+    conversation = conversation_repo.get_or_create_direct_conversation(
+        alice.id, bob.id
+    )
+    conversation_repo.commit()
+
+    for index in range(3):
+        message = message_repo.save_message(
+            sender_id=alice.id,
+            receiver_id=bob.id,
+            conversation_id=conversation.id,
+            ciphertext=f"offline message {index}",
+            algorithm="KYBER",
+            timestamp=_utc_now(),
+        )
+        message_repo.record_recipients(
+            message.id, recipient_ids=[bob.id], delivered_recipient_ids=[]
+        )
+    message_repo.commit()
+
+    previews = conversation_repo.get_conversation_previews_for_user(bob.id)
+
+    assert len(previews) == 1
+    assert previews[0].unread_count == 3
+
+
+def test_preview_unread_count_excludes_already_read_messages(db_session, unique_suffix):
+    """A message already marked READ (e.g. from an earlier session)
+    must not be counted, regardless of how many times the preview is
+    fetched afterwards -- proves this reads live status, not a cached
+    "was ever queued" signal."""
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+    message_repo = MessageRepository(db_session)
+
+    alice = _make_user(user_repo, unique_suffix, "alice")
+    bob = _make_user(user_repo, unique_suffix, "bob")
+
+    conversation = conversation_repo.get_or_create_direct_conversation(
+        alice.id, bob.id
+    )
+    conversation_repo.commit()
+
+    message = message_repo.save_message(
+        sender_id=alice.id,
+        receiver_id=bob.id,
+        conversation_id=conversation.id,
+        ciphertext="already read",
+        algorithm="KYBER",
+        timestamp=_utc_now(),
+    )
+    message_repo.record_recipients(
+        message.id, recipient_ids=[bob.id], delivered_recipient_ids=[]
+    )
+    message_repo.commit()
+
+    message_repo.mark_conversation_read(conversation.id, bob.id)
+    message_repo.commit()
+
+    previews = conversation_repo.get_conversation_previews_for_user(bob.id)
+
+    assert len(previews) == 1
+    assert previews[0].unread_count == 0
+
+
+def test_preview_unread_count_never_counts_the_senders_own_messages(
+    db_session, unique_suffix
+):
+    """Alice's own sent messages must never inflate HER unread count --
+    record_recipients() never creates a MessageRecipient row for the
+    sender, so this holds by construction; verified directly rather
+    than assumed."""
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+    message_repo = MessageRepository(db_session)
+
+    alice = _make_user(user_repo, unique_suffix, "alice")
+    bob = _make_user(user_repo, unique_suffix, "bob")
+
+    conversation = conversation_repo.get_or_create_direct_conversation(
+        alice.id, bob.id
+    )
+    conversation_repo.commit()
+
+    message = message_repo.save_message(
+        sender_id=alice.id,
+        receiver_id=bob.id,
+        conversation_id=conversation.id,
+        ciphertext="alice's own message",
+        algorithm="KYBER",
+        timestamp=_utc_now(),
+    )
+    message_repo.record_recipients(
+        message.id, recipient_ids=[bob.id], delivered_recipient_ids=[]
+    )
+    message_repo.commit()
+
+    alice_previews = conversation_repo.get_conversation_previews_for_user(alice.id)
+
+    assert len(alice_previews) == 1
+    assert alice_previews[0].unread_count == 0
+
+
+def test_preview_unread_counts_are_independent_per_conversation(
+    db_session, unique_suffix
+):
+    """Bob has 2 unread from Alice and 5 unread from Charlie -- the two
+    counts must not bleed into each other, and this must hold from a
+    single batched query (not accidentally summing across
+    conversations)."""
+    user_repo = UserRepository(db_session)
+    conversation_repo = ConversationRepository(db_session)
+    message_repo = MessageRepository(db_session)
+
+    alice = _make_user(user_repo, unique_suffix, "alice")
+    bob = _make_user(user_repo, unique_suffix, "bob")
+    charlie = _make_user(user_repo, unique_suffix, "charlie")
+
+    alice_conversation = conversation_repo.get_or_create_direct_conversation(
+        alice.id, bob.id
+    )
+    charlie_conversation = conversation_repo.get_or_create_direct_conversation(
+        charlie.id, bob.id
+    )
+    conversation_repo.commit()
+
+    for index in range(2):
+        message = message_repo.save_message(
+            sender_id=alice.id,
+            receiver_id=bob.id,
+            conversation_id=alice_conversation.id,
+            ciphertext=f"from alice {index}",
+            algorithm="KYBER",
+            timestamp=_utc_now(),
+        )
+        message_repo.record_recipients(
+            message.id, recipient_ids=[bob.id], delivered_recipient_ids=[]
+        )
+
+    for index in range(5):
+        message = message_repo.save_message(
+            sender_id=charlie.id,
+            receiver_id=bob.id,
+            conversation_id=charlie_conversation.id,
+            ciphertext=f"from charlie {index}",
+            algorithm="KYBER",
+            timestamp=_utc_now(),
+        )
+        message_repo.record_recipients(
+            message.id, recipient_ids=[bob.id], delivered_recipient_ids=[]
+        )
+
+    message_repo.commit()
+
+    previews = {
+        preview.conversation.id: preview.unread_count
+        for preview in conversation_repo.get_conversation_previews_for_user(bob.id)
+    }
+
+    assert previews[alice_conversation.id] == 2
+    assert previews[charlie_conversation.id] == 5
 
 
 # ----------------------------------------------------------------------

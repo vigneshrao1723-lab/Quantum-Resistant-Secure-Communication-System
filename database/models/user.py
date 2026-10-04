@@ -88,6 +88,19 @@ class User(Base):
     )
     last_login_at = Column(DateTime, nullable=True)
 
+    # Phase 19.24 -- Presence/Last Seen: overwritten (never appended
+    # to -- a single timestamp, not a history log, so this is not the
+    # "unnecessary historical storage" the phase's own mandate warns
+    # against) every time this account's connection closes (server/
+    # client_handler.py's disconnect path). NULL for an account that
+    # has never disconnected yet (still online, or never logged in) --
+    # a client reads that as "no last-seen information", never as a
+    # fabricated time. Deliberately server-side and persisted (not a
+    # purely live signal like the online/offline broadcast already is)
+    # because "when did they last leave" must survive this client's
+    # own restart, unlike an ephemeral typing indicator.
+    last_seen_at = Column(DateTime, nullable=True)
+
     bio = Column(String(256), nullable=True)
     locale = Column(String(16), nullable=True)
     timezone = Column(String(64), nullable=True)

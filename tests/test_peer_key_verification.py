@@ -56,7 +56,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession, PEER_KEY_STATE_CHANGED, PeerNotVerifiedError
-from crypto.key_manager import KeyManager, fingerprint_public_key
+from crypto.key_manager import KeyManager, fingerprint_combined_identity, fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
@@ -207,6 +207,32 @@ def _wire_text(key_manager_public_key_bytes):
     return key_manager_public_key_bytes.decode("utf-8")
 
 
+def _observed_identity_fingerprint(session):
+    """
+    The fingerprint a real, currently-connected ClientSession's
+    signed send_public_key() packet is actually observed and stored
+    under (Protocol-Level ML-DSA Origin Authentication): the COMBINED
+    (ML-KEM + ML-DSA) fingerprint, since a real send_public_key() call
+    always attaches an ML-DSA signature now, and handle_public_key()
+    routes any packet carrying one through the combined-identity
+    observation logic (client/session.py::observe_peer_identity()),
+    never the legacy single-key path.
+
+    Used only for tests that observe a peer through the REAL app-level
+    launch/reconnect flow. Tests that hand-craft an UNSIGNED packet via
+    _fake_public_key_packet() deliberately still exercise the legacy
+    path and correctly keep using fingerprint_public_key() -- the two
+    are not interchangeable, and using the wrong one here would not
+    "fix" a test, it would silently stop testing the path that test
+    exists to prove.
+    """
+
+    return fingerprint_combined_identity(
+        session.key_manager.public_key,
+        session.key_manager.ml_dsa.export_public_key(),
+    )
+
+
 def _a_different_but_genuinely_valid_public_key():
     """
     A different, but structurally VALID public key -- an attacker's
@@ -247,7 +273,7 @@ def test_first_observed_peer_key_becomes_unverified_and_is_persisted(app):
     entry = alice.key_store.get_peer_verification(bob_payload["username"])
 
     assert entry["state"] == PEER_STATE_UNVERIFIED
-    assert entry["fingerprint"] == fingerprint_public_key(bob.key_manager.public_key)
+    assert entry["fingerprint"] == _observed_identity_fingerprint(bob)
 
     # Not automatically VERIFIED -- the explicit, separate assertion
     # requirement C calls for.
@@ -266,7 +292,7 @@ def test_first_observed_fingerprint_survives_a_reload(app):
         == PEER_STATE_UNVERIFIED
     )
 
-    expected_fingerprint = fingerprint_public_key(bob.key_manager.public_key)
+    expected_fingerprint = _observed_identity_fingerprint(bob)
     alice.disconnect()
 
     alice_again = app["launch"](alice_payload)
@@ -327,7 +353,7 @@ def test_reconnecting_with_the_same_verified_key_does_not_flag_a_change(app):
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
     )
 
-    real_fingerprint = fingerprint_public_key(bob.key_manager.public_key)
+    real_fingerprint = _observed_identity_fingerprint(bob)
     alice.key_store.verify_peer_fingerprint(bob_payload["username"], real_fingerprint)
 
     bob.disconnect()
@@ -511,7 +537,7 @@ def test_verified_state_and_key_changed_flag_behave_correctly_across_restart(app
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
     )
 
-    real_fingerprint = fingerprint_public_key(bob.key_manager.public_key)
+    real_fingerprint = _observed_identity_fingerprint(bob)
     alice.key_store.verify_peer_fingerprint(bob_payload["username"], real_fingerprint)
 
     alice.disconnect()
@@ -787,7 +813,16 @@ def test_legitimate_matching_key_behavior_is_unaffected_by_the_fix(app):
     """Preserve existing behavior for the common case: a VERIFIED
     peer's key arriving again, unchanged, must still update KeyManager
     normally and stay VERIFIED -- the fix must not make ordinary,
-    non-attack traffic newly fail."""
+    non-attack traffic newly fail.
+
+    Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    establishing a session key (even for a direct conversation --
+    establish_session_key() reuses the group_key_distribution channel)
+    now also requires the RECEIVER to have the SENDER VERIFIED, so bob
+    must verify alice too, not only the reverse -- see tests/
+    test_group_key_authentication.py for the dedicated coverage of
+    this new rule itself; this test's own focus (legacy single-key
+    matching-key behavior) is otherwise unaffected."""
 
     alice_payload = app["register"]("alice_")
     bob_payload = app["register"]("bob_")
@@ -798,9 +833,18 @@ def test_legitimate_matching_key_behavior_is_unaffected_by_the_fix(app):
     assert _wait_for(
         lambda: alice.key_manager.get_public_key(bob_payload["username"]) is not None
     )
+    assert _wait_for(
+        lambda: bob.key_manager.get_public_key(alice_payload["username"]) is not None
+    )
+    assert _wait_for(
+        lambda: bob._observed_peer_signing_public_keys.get(alice_payload["username"]) is not None
+    )
 
     real_fingerprint = fingerprint_public_key(bob.key_manager.public_key)
     alice.key_store.verify_peer_fingerprint(bob_payload["username"], real_fingerprint)
+
+    bob_fingerprint = _observed_identity_fingerprint(alice)
+    bob.confirm_combined_peer_verification(alice_payload["username"], bob_fingerprint)
 
     # Bob's real key arrives again (e.g. a group key distribution
     # event re-touching the same cached identity key).

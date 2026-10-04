@@ -169,8 +169,34 @@ class AuthenticationService:
         )
 
     def authenticate_user(self, login_data: LoginRequest) -> AuthenticationResult:
-        """Authenticate an existing user and issue tokens."""
-        user = self.user_repo.get_by_username_or_email(login_data.identifier)
+        """Authenticate an existing user and issue tokens.
+
+        UI Finalization -- Login Identifier: phone number + password is
+        now the only valid login combination. Username and email are
+        registration/display identifiers, not login credentials --
+        neither is accepted here, matching the same phone-number
+        normalisation registration already applies (BUG 7 /
+        security/phone_number.py), so "+91 98765 43210" and
+        "+919876543210" resolve to the same account. A login_data.
+        identifier that is not a plausible phone number at all is
+        rejected the same way an unrecognised one is: this function
+        never reveals which half (identifier vs. password) was wrong.
+        """
+        try:
+            normalized_identifier = normalize_phone_number(login_data.identifier)
+        except InvalidPhoneNumberError:
+            self._log_auth_event(
+                "login_failed",
+                identifier=login_data.identifier,
+                reason="invalid_phone_number",
+            )
+            return AuthenticationResult(
+                success=False,
+                message="Invalid phone number or password.",
+                errors={"identifier": "Invalid phone number or password."},
+            )
+
+        user = self.user_repo.get_by_phone_number(normalized_identifier)
         if not user:
             self._log_auth_event(
                 "login_failed",
@@ -179,7 +205,7 @@ class AuthenticationService:
             )
             return AuthenticationResult(
                 success=False,
-                message="Invalid username/email or password.",
+                message="Invalid phone number or password.",
                 errors={"identifier": "User not found."},
             )
 
@@ -219,7 +245,7 @@ class AuthenticationService:
             )
             return AuthenticationResult(
                 success=False,
-                message="Invalid username/email or password.",
+                message="Invalid phone number or password.",
                 errors={"password": "Password verification failed."},
             )
 
@@ -499,3 +525,78 @@ class AuthenticationService:
         if session is None:
             raise SessionInvalidError("Session not found.")
         return session
+
+    # ------------------------------------------------------------
+    # Settings (Phase 19.14): account self-service changes for an
+    # already-authenticated user. Each mirrors register_user()'s own
+    # validate-then-write shape (collect errors, refuse if any exist,
+    # otherwise write once and commit) rather than inventing a new
+    # convention.
+    # ------------------------------------------------------------
+
+    def change_username(self, user_id, new_username: str) -> dict:
+        """Rename ``user_id``'s account. Returns {"success": bool,
+        "error": str | None}. No format validator existed anywhere in
+        this codebase before this phase (confirmed by inspection of
+        register_user()/auth/schemas.py) -- this adds the same minimal
+        length check the users.username column itself already enforces
+        (String(32)), plus the pre-existing duplicate-username check
+        register_user() already performs, reused here rather than
+        duplicated logic."""
+
+        new_username = (new_username or "").strip()
+
+        if not (3 <= len(new_username) <= 32):
+            return {"success": False, "error": "Username must be between 3 and 32 characters."}
+
+        user = self.user_repo.get_by_id(user_id)
+        if user is None:
+            return {"success": False, "error": "Account not found."}
+
+        if new_username == user.username:
+            return {"success": True, "error": None}
+
+        existing = self.user_repo.get_by_username(new_username)
+        if existing is not None and existing.id != user.id:
+            return {"success": False, "error": "That username is already taken."}
+
+        try:
+            self.user_repo.update_username(user, new_username, _utc_now())
+            self.user_repo.commit()
+        except IntegrityError:
+            self.user_repo.rollback()
+            return {"success": False, "error": "That username is already taken."}
+
+        self._log_auth_event("username_changed", user_id=str(user.id))
+        return {"success": True, "error": None}
+
+    def change_password(self, user_id, current_password: str, new_password: str, confirm_password: str) -> dict:
+        """Change ``user_id``'s password. Returns {"success": bool,
+        "error": str | None}. Requires the CURRENT password (proof of
+        continued account ownership, not just a valid session -- a
+        stolen/left-open session token alone must not be enough to
+        lock the real owner out) and re-uses register_user()'s exact
+        same password-policy check and hashing call -- never a second,
+        weaker password rule."""
+
+        user = self.user_repo.get_by_id(user_id)
+        if user is None:
+            return {"success": False, "error": "Account not found."}
+
+        if not self.password_handler.verify_password(user.password_hash, current_password):
+            self._log_auth_event("password_change_failed", user_id=str(user.id), reason="bad_current_password")
+            return {"success": False, "error": "Current password is incorrect."}
+
+        if new_password != confirm_password:
+            return {"success": False, "error": "New password and confirmation do not match."}
+
+        violations = self.password_handler.get_password_policy_violations(new_password)
+        if violations:
+            return {"success": False, "error": " ".join(violations)}
+
+        password_hash = self.password_handler.hash_password(new_password)
+        self.user_repo.update_password_hash(user, password_hash, _utc_now())
+        self.user_repo.commit()
+
+        self._log_auth_event("password_changed", user_id=str(user.id))
+        return {"success": True, "error": None}

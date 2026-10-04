@@ -29,9 +29,22 @@ audit:
      under user B -- peers always see it under A.
 
   2. A public-key packet sent AFTER authentication (i.e. in the main
-     receive loop rather than during connection setup) cannot alter an
-     established identity/key association: the loop has no handler for
-     operation == "public_key", so such a packet is inert.
+     receive loop rather than during connection setup) can legitimately
+     update the SENDER's own key (Phase 16D -- Multi-Device Security
+     Hardening added a live re-broadcast handler, used by
+     ClientSession.enroll_device() to attach device_id to a device-
+     aware client's identity once it becomes known, which happens after
+     the original bootstrap broadcast already fired -- see server/
+     client_handler.py's own "Public Key Re-broadcast" comment). What
+     is NOT possible, before or after that addition, is using it to
+     rebind a DIFFERENT identity: ServerState.set_public_key() is keyed
+     by socket and distribute_public_keys() re-labels the outgoing
+     packet with client["username"] from the JWT-authenticated
+     connection state -- the packet's own claimed ``username`` field is
+     still never read by either. A post-authentication packet claiming
+     to belong to someone else therefore still updates (and is still
+     only ever relayed under) the AUTHENTICATED sender's own identity,
+     never the claimed one.
 
 Run with:
     pytest tests/test_public_key_identity_binding.py -v
@@ -145,7 +158,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -296,12 +309,17 @@ def test_forged_key_does_not_replace_the_victims_own_key_on_the_server(two_users
 # 2. A post-authentication public-key packet cannot rebind the identity
 # ----------------------------------------------------------------------
 
-def test_post_authentication_public_key_packet_does_not_rebind_identity(two_users):
+def test_post_authentication_public_key_packet_cannot_rebind_a_different_identity(two_users):
     """
     The first key_exchange packet is consumed during connection setup.
-    A second one, arriving in the main receive loop, has no handler --
-    it must neither replace the sender's stored key nor be relayed to
-    anyone, and above all must not re-label anyone's key.
+    A second one, arriving in the main receive loop, is (Phase 16D)
+    processed as a legitimate re-broadcast of the SENDER's own
+    identity -- but an attempted identity swap (claiming a DIFFERENT
+    username than the one this socket authenticated as) must still be
+    completely ineffective: the victim's own server-side key entry
+    must stay untouched, and whatever IS relayed to the victim as a
+    result must still be correctly labelled with the attacker's own
+    authenticated username, never the claimed one.
     """
 
     port = two_users["port"]
@@ -326,7 +344,8 @@ def test_post_authentication_public_key_packet_does_not_rebind_identity(two_user
     assert _await_public_key_for(victim_sock, attacker_name) is not None
 
     # Second key_exchange packet, now in the main loop, attempting both
-    # a key swap and an identity swap.
+    # a legitimate-looking key update AND an identity swap (claiming to
+    # be victim_name, not this socket's own authenticated identity).
     _send(
         attacker_sock,
         create_public_key_packet(
@@ -336,23 +355,36 @@ def test_post_authentication_public_key_packet_does_not_rebind_identity(two_user
         ),
     )
 
-    # Nothing further may reach the victim as a result.
-    assert (
-        _recv_until(
-            victim_sock,
-            lambda p: (
-                p.get("type") == "key_exchange"
-                and p.get("operation") == "public_key"
-            ),
-            attempts=8,
-        )
-        is None
-    ), "a post-authentication public-key packet must not be relayed"
+    # The identity swap fails: whatever reaches the victim as a result
+    # of this packet is labelled with the ATTACKER's own authenticated
+    # username, never victim_name -- ServerState.set_public_key() is
+    # keyed by socket and distribute_public_keys() re-labels from the
+    # JWT-authenticated state, never from the packet's own claimed
+    # "username" field (which is not even read).
+    relayed = _await_public_key_for(victim_sock, attacker_name)
+    assert relayed is not None, (
+        "Phase 16D: a post-authentication public-key packet from the "
+        "sender's OWN authenticated connection is now a legitimate "
+        "re-broadcast and must still reach the victim -- correctly "
+        "labelled."
+    )
+    assert relayed["username"] == attacker_name
+    assert relayed["username"] != victim_name
+    assert relayed["public_key"] == "attacker-key-v2"
 
     keys_by_username = _server_keys_by_username(two_users["server_state"])
 
+    # The victim's OWN stored key is never touched by anything the
+    # attacker's connection sends -- this is the actual security
+    # property this test exists to protect.
     assert keys_by_username[victim_name] == "victim-public-key"
-    assert keys_by_username[attacker_name] == "attacker-key-v1"
+
+    # The attacker's own key entry legitimately updates to their own
+    # latest broadcast -- exactly what Phase 16D's re-broadcast
+    # capability is for (e.g. ClientSession.enroll_device() attaching
+    # device_id once it becomes known, after the original bootstrap
+    # broadcast already fired).
+    assert keys_by_username[attacker_name] == "attacker-key-v2"
 
     victim_sock.close()
     attacker_sock.close()

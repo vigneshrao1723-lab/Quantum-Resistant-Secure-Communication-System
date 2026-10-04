@@ -125,7 +125,7 @@ def _token(payload):
     db = SessionLocal()
     try:
         result = AuthenticationService(db).authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -688,6 +688,17 @@ def test_lookup_leads_into_the_existing_direct_conversation_flow(
     alice_session.key_store.verify_peer_fingerprint(
         bob["username"], fingerprint_public_key(bob_session.key_manager.public_key)
     )
+    # Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    # bob is also the RECEIVER of the live group_key_distribution
+    # packet the message send below triggers, which now separately
+    # requires bob to have alice already VERIFIED too.
+    bob_session.key_store = SecureKeyStore(
+        bob["user_id"], storage_dir=tmp_path / "keystore-bob"
+    )
+    bob_session.key_store.unlock(bob["password"])
+    bob_session.key_store.verify_peer_fingerprint(
+        alice["username"], fingerprint_public_key(alice_session.key_manager.public_key)
+    )
 
     found = alice_session.find_user_by_phone_number("+919876532123")
     assert found is not None
@@ -735,8 +746,10 @@ def test_own_phone_number_is_returned_by_the_real_login_flow(
     alice = accounts("+91 98765 45454", hint="alice_")
 
     session = ClientSession()
+    # UI Finalization -- Login Identifier: phone number, not username,
+    # is what authenticate_credentials() now authenticates with.
     result = session.authenticate_credentials(
-        alice["username"], alice["password"]
+        alice["phone_number"], alice["password"]
     )
 
     assert result.success, result.errors

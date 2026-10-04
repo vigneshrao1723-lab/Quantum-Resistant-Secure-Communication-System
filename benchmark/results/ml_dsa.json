@@ -1,0 +1,57 @@
+{
+  "environment": {
+    "timestamp_utc": "2026-08-31T05:56:16.775979+00:00",
+    "python": "3.12.10",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "machine": "AMD64",
+    "cryptography_version": "49.0.0",
+    "backend": "native (cryptography / Rust+OpenSSL bindings, cryptography.hazmat.primitives.asymmetric.mldsa)"
+  },
+  "configuration": {
+    "iterations": 200,
+    "warmup": 20,
+    "keygen_iterations": 100,
+    "keygen_warmup": 10,
+    "message_size_bytes": 256
+  },
+  "timing": {
+    "key_generation": {
+      "iterations": 100,
+      "mean_ms": 0.14050599944312125,
+      "stdev_ms": 0.02381408489369773,
+      "median_ms": 0.1370999962091446,
+      "min_ms": 0.13529998250305653,
+      "max_ms": 0.37009999505244195
+    },
+    "signing": {
+      "iterations": 200,
+      "mean_ms": 0.6160309995175339,
+      "stdev_ms": 0.450739239273489,
+      "median_ms": 0.4904000088572502,
+      "min_ms": 0.21199998445808887,
+      "max_ms": 3.2829999981913716
+    },
+    "verification": {
+      "iterations": 200,
+      "mean_ms": 0.1354115002322942,
+      "stdev_ms": 0.014964279321523518,
+      "median_ms": 0.1320999872405082,
+      "min_ms": 0.12959999730810523,
+      "max_ms": 0.27230000705458224
+    }
+  },
+  "sizes_bytes": {
+    "public_key": 1952,
+    "private_key_seed": 32,
+    "signature": 3309
+  },
+  "correctness": {
+    "every_sample_independently_verified": true,
+    "note": "Each timed key-generation sample was checked against the fixed ML-DSA-65 key sizes; each timed signing sample was checked against the fixed signature size AND independently re-verified with MLDSASigner.verify(); each timed verification sample was checked to actually return True. Any failure would have aborted this run before reaching this report."
+  },
+  "interpretation": {
+    "timing_caveat": "Timings are environment-dependent performance data for this machine/run (CPU, OS scheduler, Python interpreter, cryptography library build) -- not a portable, machine-independent property of ML-DSA-65.",
+    "size_validity": "Key and signature sizes are fixed by FIPS 204 (ML-DSA-65) and hold for any conforming implementation."
+  }
+}

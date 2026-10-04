@@ -63,9 +63,13 @@ The following are implemented and covered by the automated test suite (`tests/`)
 - **Cryptographic layer** (`crypto/`): AES-256-GCM (payload/session encryption), RSA-2048-OAEP and Kyber768/ML-KEM-768 (session key exchange), and ML-DSA-65 (origin authentication of identity announcements, messages, and both key-establishment paths) — all executed client-side only.
 - **Protocol / request-response layer** (`utils/protocol.py`, `utils/request_registry.py`): defines the JSON packet schema and correlates outgoing client requests with server responses by `request_id`.
 
+For the full layered breakdown (GUI → session → security/protocol → TLS → server relay → database/storage) and component responsibility table, see [System Architecture](docs/architecture/system_architecture.md).
+
 ---
 
 ## Security Model
+
+Detailed documentation: [Security Architecture](docs/architecture/security/security_architecture.md) (property-by-layer map, domain-separated signing purposes, trust state machine) · [Threat Model](docs/architecture/security/threat_model.md) (attacker capabilities, honest scope limitation) · [Key Establishment Flow](docs/architecture/security/key_establishment_flow.md) (exact packet fields and verification order) · [Attack → Rejection → Recovery](docs/architecture/security/attack_rejection_recovery.md) (the full sequence, FYP-viva-ready).
 
 ### Threat model: the server is an untrusted relay for cryptographic origin authentication
 
@@ -251,7 +255,7 @@ Earlier foundational work (multi-client TCP communication, username-based sessio
 
 ## Testing
 
-The suite currently collects **1,415 tests** across 98 files (`pytest --collect-only -q`), most recently confirmed passing in full against the current `master` HEAD. This count changes as work continues — treat it as a snapshot, not a maintained guarantee; run `pytest --collect-only -q` yourself for the exact current figure rather than trusting this number indefinitely.
+The suite currently collects **1,541 tests** across 120 files (`pytest --collect-only -q`, reconfirmed during Phase 19.17 — all 1,541 pass). This count changes as work continues — treat it as a snapshot, not a maintained guarantee; run `pytest --collect-only -q` yourself for the exact current figure rather than trusting this number indefinitely.
 
 Tests require a running local PostgreSQL instance and a `DATABASE_URL` pointing at it (see [Installation / Setup](#installation--setup)) — `tests/conftest.py` wraps each test in a transaction that's rolled back on teardown, so no test data persists, but a real database connection is required for the suite to run at all (SQLite is not supported).
 
@@ -260,6 +264,8 @@ Install the test dependencies (see below) and run the suite with:
 ```bash
 pytest -q
 ```
+
+Performance measurements for the ML-DSA-65 signature primitive (key generation/signing/verification) are documented separately — see [ML-DSA Benchmark](docs/benchmark/ml_dsa_benchmark.md). For a reproducible walkthrough of the malicious-relay/security-rejection defense (and an FYP presentation guide built on it), see [Security Rejection Demonstration](docs/demo/security_rejection_demo.md) and [FYP Presentation Guide](docs/demo/fyp_presentation_guide.md).
 
 ---
 
@@ -343,6 +349,16 @@ python main.py
 ```
 
 Multiple client instances can be run concurrently against the same server for multi-user testing.
+
+### Android
+
+Building the Android APK requires WSL2 (Buildozer/python-for-android have no native Windows target). From inside an already-provisioned WSL2 environment (see `docs/architecture/mobile_client.md`'s "Phase 19.7" section for the one-time SDK/NDK/JDK setup):
+
+```bash
+scripts/build_android_apk.sh debug
+```
+
+This swaps in the Android entrypoint (`mobile/android_main.py`), runs Buildozer, restores the desktop `main.py` afterward regardless of outcome, and prints the resulting `.apk`'s path and SHA-256. See `docs/architecture/mobile_client.md` for the full build history and physical-device validation record.
 
 ---
 

@@ -34,7 +34,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
-from crypto.key_manager import KeyManager, fingerprint_public_key
+from crypto.key_manager import KeyManager, fingerprint_combined_identity
 from database.connection import SessionLocal
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.session_repository import SessionRepository
@@ -91,12 +91,29 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
     finally:
         db.close()
+
+
+def _identity_fingerprint(key_manager):
+    """
+    Protocol-Level ML-DSA Origin Authentication: the fingerprint a real
+    ClientSession's signed send_public_key() packet is actually
+    observed and stored under -- the COMBINED (ML-KEM + ML-DSA)
+    fingerprint, since a real send_public_key() call always attaches
+    an ML-DSA signature now. Every verify_peer_fingerprint() call in
+    this file pre-seeds a VERIFIED entry against a peer that will (or
+    already did) send a real signed packet from this exact
+    key_manager -- using the legacy single-key fingerprint would make
+    that later comparison spuriously disagree."""
+
+    return fingerprint_combined_identity(
+        key_manager.public_key, key_manager.ml_dsa.export_public_key()
+    )
 
 
 def _make_connected_session(payload, monkeypatch, tmp_path, key_manager=None):
@@ -221,10 +238,10 @@ def alice_and_bob(running_server, monkeypatch, tmp_path):
     # later reconnects with a genuinely new keypair is re-verified
     # individually, at that point, by the tests that do so.
     alice.key_store.verify_peer_fingerprint(
-        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+        bob.username, _identity_fingerprint(bob.key_manager)
     )
     bob.key_store.verify_peer_fingerprint(
-        alice.username, fingerprint_public_key(alice.key_manager.public_key)
+        alice.username, _identity_fingerprint(alice.key_manager)
     )
 
     _open_direct_chat(alice, bob.username)
@@ -333,9 +350,22 @@ def test_restart_recovers_the_historical_key_when_the_partner_is_connected(
     # reconnect triggers is a one-shot event with no retry, so
     # verifying only after `connect` returns would race it.
     new_alice_key_manager = KeyManager()
+    # Message-Level ML-DSA Origin Authentication: this test is
+    # specifically about KEM-key recovery on restart -- Alice's SIGNING
+    # identity is kept continuous across the "restart" by reusing her
+    # exported private seed, exactly like a real client's persisted
+    # signing keypair (load_or_create_signing_keypair()) would. Without
+    # this, new_alice would sign with a different ML-DSA key than
+    # "message before the restart" was originally signed with, and her
+    # own pre-restart history (checked below) would fail signature
+    # verification when loaded back -- see _verify_history_message_
+    # signature()'s "own message" handling.
+    new_alice_key_manager.ml_dsa.import_private_key(
+        old_alice.key_manager.ml_dsa.export_private_key()
+    )
     bob.key_store.verify_peer_fingerprint(
         fixture["alice_payload"]["username"],
-        fingerprint_public_key(new_alice_key_manager.public_key),
+        _identity_fingerprint(new_alice_key_manager),
     )
     new_alice = fixture["connect"](fixture["alice_payload"], key_manager=new_alice_key_manager)
 
@@ -344,7 +374,7 @@ def test_restart_recovers_the_historical_key_when_the_partner_is_connected(
     # verify bob -- whose identity has not changed -- before she can
     # send to him again below.
     new_alice.key_store.verify_peer_fingerprint(
-        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+        bob.username, _identity_fingerprint(bob.key_manager)
     )
 
     assert _wait_for(
@@ -449,10 +479,10 @@ def test_restart_reserves_a_new_epoch_when_no_recovery_is_possible(alice_and_bob
     # the other's new post-restart fingerprint yet, and both directions
     # send below.
     new_alice.key_store.verify_peer_fingerprint(
-        new_bob.username, fingerprint_public_key(new_bob.key_manager.public_key)
+        new_bob.username, _identity_fingerprint(new_bob.key_manager)
     )
     new_bob.key_store.verify_peer_fingerprint(
-        new_alice.username, fingerprint_public_key(new_alice.key_manager.public_key)
+        new_alice.username, _identity_fingerprint(new_alice.key_manager)
     )
 
     # Nothing can be recovered -- neither side has the key to give.
@@ -531,7 +561,7 @@ def test_restart_without_recovery_never_collides_with_the_partners_epoch(
     new_alice_key_manager = KeyManager()
     bob.key_store.verify_peer_fingerprint(
         fixture["alice_payload"]["username"],
-        fingerprint_public_key(new_alice_key_manager.public_key),
+        _identity_fingerprint(new_alice_key_manager),
     )
     new_alice = fixture["connect"](fixture["alice_payload"], key_manager=new_alice_key_manager)
 
@@ -539,7 +569,7 @@ def test_restart_without_recovery_never_collides_with_the_partners_epoch(
     # and isolated, but bob's identity has not changed, so she can
     # verify him immediately.
     new_alice.key_store.verify_peer_fingerprint(
-        bob.username, fingerprint_public_key(bob.key_manager.public_key)
+        bob.username, _identity_fingerprint(bob.key_manager)
     )
     time.sleep(0.6)
 

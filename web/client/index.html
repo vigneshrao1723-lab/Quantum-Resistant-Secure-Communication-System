@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>QRSCS Web Client</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="./style.css">
+<!--
+  Import map (a native browser feature, no bundler needed): resolves
+  both the bare specifiers crypto.js itself imports AND the absolute
+  "/npm/..." specifiers the vendored files' OWN internal cross-package
+  imports use, to local files under web/client/vendor/. See
+  web/client/vendor/VENDOR.md for what each file is and
+  docs/architecture/web_interoperability.md for why an import map
+  (rather than a bundler) is this project's chosen approach.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "@noble/post-quantum/ml-kem.js": "./vendor/pq-ml-kem.js",
+    "@noble/post-quantum/ml-dsa.js": "./vendor/pq-ml-dsa.js",
+    "@noble/ciphers/aes.js": "./vendor/ciphers-aes.js",
+    "/npm/@noble/hashes@2.4.0/sha3.js/+esm": "./vendor/hashes-sha3.js",
+    "/npm/@noble/hashes@2.4.0/utils.js/+esm": "./vendor/hashes-utils.js",
+    "/npm/@noble/curves@2.4.0/abstract/fft.js/+esm": "./vendor/curves-fft.js",
+    "/npm/@noble/curves@2.4.0/utils.js/+esm": "./vendor/curves-utils.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="securityWarning"></div>
+
+<!-- ==================================================================
+     LOGIN / REGISTER SCREEN -- mirrors gui/login_window.py and
+     mobile/app.py::LoginScreen exactly: phone number is the sole
+     login identifier (username is registration-only -- the
+     authenticated username always comes from the server's own
+     response, never re-typed at login), and full_name/email are
+     derived from the username exactly as MainWindow.
+     handle_registration()/LoginScreen._register() do -- never asked
+     of the user. One toggle button flips both the field set and its
+     own label, same as both other clients.
+     ================================================================== -->
+<div id="screen-login">
+  <div class="auth-card">
+    <div class="brand-mark">QRSCS</div>
+    <p class="brand-full">Quantum-Resistant Secure Communication System</p>
+    <p class="brand-subtitle">End-to-end chat secured with post-quantum cryptography</p>
+
+    <div id="regUsernameField" hidden>
+      <label class="field-label" for="regUsername">Username</label>
+      <input id="regUsername" class="input" placeholder="Choose a username">
+    </div>
+
+    <label class="field-label" for="phoneNumber">Phone number</label>
+    <input id="phoneNumber" class="input" placeholder="+91 98765 43210" autocomplete="username">
+
+    <label class="field-label" for="password">Password</label>
+    <input id="password" type="password" class="input" placeholder="Enter your password" autocomplete="current-password">
+
+    <div id="regConfirmPasswordField" hidden>
+      <label class="field-label" for="regConfirmPassword">Confirm password</label>
+      <input id="regConfirmPassword" type="password" class="input" placeholder="Confirm your password" autocomplete="new-password">
+    </div>
+
+    <button id="connectBtn" class="btn btn-primary btn-block">Login</button>
+    <button id="toggleModeBtn" class="btn btn-ghost btn-block" type="button">Create an account</button>
+    <div id="authStatus" class="auth-status"></div>
+
+    <div class="gateway-field">
+      <label class="field-label" for="gatewayUrl">Gateway URL</label>
+      <input id="gatewayUrl" class="input" value="ws://127.0.0.1:8765">
+    </div>
+  </div>
+</div>
+
+<!-- ==================================================================
+     APP SHELL -- sidebar (search / Chats / Groups / Inbox / Devices)
+     + main pane (chat header / messages / composer), the same
+     structural relationship as mobile/app.py's ChatScreen adapted to
+     a wide viewport (see docs/architecture/web_interoperability.md).
+     ================================================================== -->
+<div id="screen-app" hidden>
+  <div class="topbar">
+    <div class="brand-mark">QRSCS</div>
+    <div class="topbar-spacer"></div>
+    <div id="connectionStatus" class="connection-pill" data-state="disconnected">disconnected</div>
+    <button id="logoutBtn" class="btn-icon" title="Disconnect / Logout">&#9211;</button>
+  </div>
+
+  <div class="app-body">
+    <div class="sidebar" id="sidebar">
+      <div class="sidebar-search">
+        <input id="peerUsername" class="input" placeholder="Search username to start a chat...">
+      </div>
+
+      <!-- Internal state only -- the active group's raw conversation_id
+           is never something a normal user should see or type; main.js
+           reads/writes .value the same as any other field, it's just
+           not rendered. openGroupChat()/renderGroupList() are how a
+           real user actually opens a group (its row-card). -->
+      <input type="hidden" id="activeGroupId">
+
+      <div class="sidebar-tabs">
+        <button class="tab-btn is-active" data-tab="chats" type="button">Chats</button>
+        <button class="tab-btn" data-tab="groups" type="button">Groups</button>
+        <button class="tab-btn" data-tab="inbox" type="button">Inbox<span id="inboxBadge" class="tab-badge" hidden>0</span></button>
+      </div>
+
+      <div class="sidebar-panel is-active" data-panel="chats">
+        <div class="sidebar-toolbar">
+          <button id="archivedChatsToggle" type="button" class="btn btn-ghost btn-sm">Archived</button>
+        </div>
+        <div class="sidebar-list" id="chatList">
+          <div class="empty-hint">Type a username above and press Enter to open a direct chat.</div>
+        </div>
+      </div>
+
+      <div class="sidebar-panel" data-panel="groups">
+        <div style="padding:10px 14px 4px;">
+          <input id="groupName" class="input" placeholder="Group name" style="margin-bottom:8px;">
+          <input id="groupMembers" class="input" placeholder="Members (comma-separated usernames)" style="margin-bottom:8px;">
+          <button id="createGroupBtn" class="btn btn-primary btn-block btn-sm">Create Group</button>
+        </div>
+        <div class="sidebar-toolbar">
+          <button id="archivedGroupsToggle" type="button" class="btn btn-ghost btn-sm">Archived</button>
+        </div>
+        <div class="sidebar-list" id="groupList"></div>
+      </div>
+
+      <div class="sidebar-panel" data-panel="inbox">
+        <div class="sidebar-list" id="inboxList">
+          <div class="empty-hint">No notifications.</div>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button id="settingsToggleBtn" class="btn btn-ghost btn-sm" style="flex:1;">&#9881; Settings</button>
+      </div>
+    </div>
+
+    <div class="main-pane" id="mainPane">
+
+      <!-- Empty state -->
+      <div class="main-empty" id="mainEmpty">
+        <div style="font-size:34px;">&#128172;</div>
+        <div>Select a conversation, or search a username to begin.</div>
+      </div>
+
+      <!-- Direct chat view -->
+      <div id="chatView" hidden style="display:flex; flex-direction:column; height:100%;">
+        <div class="chat-header">
+          <button class="btn-icon chat-header-back" id="chatBackBtn" type="button">&#8592;</button>
+          <div class="avatar sm" id="chatAvatar">?</div>
+          <div class="chat-header-info">
+            <div class="chat-header-title" id="chatTitle">&mdash;
+              <span id="peerVerifiedBadge" class="verified-badge is-unverified">unverified</span>
+            </div>
+            <div class="chat-header-sub" id="peerPresence"></div>
+            <div class="chat-header-sub" id="fingerprintDisplay"></div>
+          </div>
+          <button id="confirmVerifiedBtn" class="btn btn-ghost btn-sm">Confirm match</button>
+          <button id="requestVerificationBtn" class="btn btn-ghost btn-sm">Request Approval</button>
+          <button id="establishKeyBtn" class="btn btn-ghost btn-sm">Establish key</button>
+          <button id="markReadBtn" class="btn-icon" title="Mark read">&#10003;</button>
+          <button id="loadHistoryBtn" class="btn-icon" title="Load history">&#8635;</button>
+          <button id="searchBtn" class="btn-icon" title="Search in this conversation" type="button">&#128269;</button>
+          <button id="pinnedBtn" class="btn-icon" title="Pinned messages" type="button">&#128204;</button>
+          <button id="galleryBtn" class="btn-icon" title="Media gallery" type="button">&#128451;</button>
+          <button id="wallpaperBtn" class="btn-icon" title="Chat wallpaper" type="button">&#128444;</button>
+        </div>
+        <div id="searchBar" class="search-bar" hidden>
+          <input id="searchInput" class="input" placeholder="Search in this conversation">
+          <span id="searchResultLabel" class="search-result-label"></span>
+          <button id="searchPrevBtn" class="btn-icon" type="button" title="Previous match">&#9650;</button>
+          <button id="searchNextBtn" class="btn-icon" type="button" title="Next match">&#9660;</button>
+          <button id="searchCloseBtn" class="btn-icon" type="button" title="Close search">&#10005;</button>
+        </div>
+        <div class="message-scroll" id="messages"></div>
+        <div id="readStatus" style="padding:0 20px 6px;font-size:11px;color:var(--text-muted);"></div>
+        <div id="composerContext" class="composer-context" hidden>
+          <span id="composerContextText"></span>
+          <button id="composerContextCancel" class="btn-icon" type="button" title="Cancel">&#10005;</button>
+        </div>
+        <div id="typingStatus" class="typing-status" hidden></div>
+        <div class="composer">
+          <input id="attachmentInput" type="file" hidden>
+          <button id="attachBtn" class="btn-icon" title="Attach a photo, file, voice, or video message" type="button">&#128206;</button>
+          <input id="messageText" class="input" placeholder="Type a message...">
+          <button id="sendAttachmentBtn" class="btn btn-ghost btn-sm" hidden>Send file</button>
+          <button id="sendBtn" class="btn btn-primary btn-sm">Send</button>
+        </div>
+      </div>
+
+      <!-- Group chat view -->
+      <div id="groupChatView" hidden style="display:flex; flex-direction:column; height:100%;">
+        <div class="chat-header">
+          <button class="btn-icon chat-header-back" id="groupBackBtn" type="button">&#8592;</button>
+          <div class="avatar sm" id="groupAvatar">G</div>
+          <div class="chat-header-info">
+            <div class="chat-header-title" id="groupTitle">&mdash;</div>
+            <div class="chat-header-sub" id="groupSub"></div>
+          </div>
+          <button id="groupInfoBtn" class="btn-icon" title="Group info">&#8505;</button>
+          <button id="loadGroupHistoryBtn" class="btn-icon" title="Load history">&#8635;</button>
+          <button id="groupSearchBtn" class="btn-icon" title="Search in this conversation" type="button">&#128269;</button>
+          <button id="groupPinnedBtn" class="btn-icon" title="Pinned messages" type="button">&#128204;</button>
+          <button id="groupGalleryBtn" class="btn-icon" title="Media gallery" type="button">&#128451;</button>
+          <button id="groupWallpaperBtn" class="btn-icon" title="Chat wallpaper" type="button">&#128444;</button>
+        </div>
+        <div id="groupSearchBar" class="search-bar" hidden>
+          <input id="groupSearchInput" class="input" placeholder="Search in this conversation">
+          <span id="groupSearchResultLabel" class="search-result-label"></span>
+          <button id="groupSearchPrevBtn" class="btn-icon" type="button" title="Previous match">&#9650;</button>
+          <button id="groupSearchNextBtn" class="btn-icon" type="button" title="Next match">&#9660;</button>
+          <button id="groupSearchCloseBtn" class="btn-icon" type="button" title="Close search">&#10005;</button>
+        </div>
+        <div class="message-scroll" id="groupMessages"></div>
+        <div id="groupComposerContext" class="composer-context" hidden>
+          <span id="groupComposerContextText"></span>
+          <button id="groupComposerContextCancel" class="btn-icon" type="button" title="Cancel">&#10005;</button>
+        </div>
+        <div id="groupTypingStatus" class="typing-status" hidden></div>
+        <div class="composer">
+          <input id="groupMessageText" class="input" placeholder="Message the group...">
+          <button id="sendGroupMessageBtn" class="btn btn-primary btn-sm">Send</button>
+        </div>
+      </div>
+
+      <!-- Group info view -->
+      <div id="groupInfoView" hidden style="overflow-y:auto;">
+        <div class="chat-header">
+          <button class="btn-icon chat-header-back" id="groupInfoBackBtn" type="button">&#8592;</button>
+          <div class="chat-header-info">
+            <div class="chat-header-title">Group Info</div>
+          </div>
+        </div>
+        <div class="card" style="margin:14px;">
+          <div class="group-info-name" id="groupInfoName">&mdash;</div>
+          <div class="group-info-sub" id="groupInfoSub"></div>
+        </div>
+        <div class="card" style="margin:14px;">
+          <div class="panel-header" style="padding:0 0 8px;">Members</div>
+          <div id="groupInfoMembers"></div>
+        </div>
+      </div>
+
+      <!-- Settings view -->
+      <div id="settingsView" hidden style="overflow-y:auto;">
+        <div class="panel-header">Settings</div>
+        <div class="card">
+          <div class="settings-item">
+            <div>
+              <div class="settings-item-label">Change Username</div>
+              <div class="settings-item-hint" id="changeUsernameHint">Your display name across every client.</div>
+            </div>
+            <button id="changeUsernameToggleBtn" class="btn btn-ghost btn-sm">Edit</button>
+          </div>
+          <div id="changeUsernameForm" hidden style="padding:0 0 14px;">
+            <input id="newUsernameInput" class="input" placeholder="New username" style="margin-bottom:8px;">
+            <button id="changeUsernameSubmitBtn" class="btn btn-primary btn-sm">Save Username</button>
+          </div>
+          <div class="settings-item">
+            <div>
+              <div class="settings-item-label">Change Password</div>
+              <div class="settings-item-hint" id="changePasswordHint">Requires your current password.</div>
+            </div>
+            <button id="changePasswordToggleBtn" class="btn btn-ghost btn-sm">Edit</button>
+          </div>
+          <div id="changePasswordForm" hidden style="padding:0 0 14px;">
+            <input id="currentPasswordInput" type="password" class="input" placeholder="Current password" style="margin-bottom:8px;">
+            <input id="newPasswordInput" type="password" class="input" placeholder="New password" style="margin-bottom:8px;">
+            <input id="confirmNewPasswordInput" type="password" class="input" placeholder="Confirm new password" style="margin-bottom:8px;">
+            <button id="changePasswordSubmitBtn" class="btn btn-primary btn-sm">Save Password</button>
+          </div>
+          <div class="settings-item">
+            <div style="display:flex; align-items:center; gap:12px;">
+              <div class="avatar" id="myProfilePicAvatar" style="cursor:pointer;">?</div>
+              <div>
+                <div class="settings-item-label">Profile Picture</div>
+                <div class="settings-item-hint" id="myProfilePicHint">Visible to anyone who looks your account up.</div>
+              </div>
+            </div>
+            <input id="profilePicInput" type="file" accept="image/*" hidden>
+            <button id="profilePicChangeBtn" class="btn btn-ghost btn-sm">Change</button>
+          </div>
+          <div class="settings-item">
+            <div>
+              <div class="settings-item-label">Logout</div>
+              <div class="settings-item-hint">Ends this session; automatic reconnect will not occur.</div>
+            </div>
+            <button id="settingsLogoutBtn" class="btn btn-danger btn-sm">Logout</button>
+          </div>
+        </div>
+
+        <!-- Linked Devices -- moved here from the main sidebar/chat
+             screen: this is real, working Phase 18 device-identity
+             functionality (enroll/bind/authorize/revoke/key-sync), not
+             a mockup, but it's advanced account management, not
+             something that belongs beside the message composer. -->
+        <div class="panel-header">Linked Devices</div>
+        <div class="card">
+          <div class="row-sub" style="margin-bottom:10px;">This device: <span id="myDeviceId" class="mono">(not yet enrolled)</span></div>
+          <input id="deviceName" class="input" value="Web Browser" style="margin-bottom:8px;">
+          <input id="devicePlatform" class="input" value="web" style="margin-bottom:8px;" hidden>
+          <div style="display:flex; gap:8px; margin-bottom:10px;">
+            <button id="enrollDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Enroll</button>
+            <button id="bindDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Bind session</button>
+          </div>
+          <button id="listDevicesBtn" class="btn btn-ghost btn-block btn-sm">Refresh device list</button>
+          <div id="deviceList" style="margin-top:10px;"></div>
+          <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">
+            <div class="row-sub" style="margin-bottom:8px; text-transform:uppercase; font-size:10px; letter-spacing:0.04em;">Authorize / revoke a device</div>
+            <input id="targetDeviceId" class="input" placeholder="Target device_id" style="margin:8px 0;">
+            <div style="display:flex; gap:8px; margin-bottom:8px;">
+              <button id="observeDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Show fingerprint</button>
+              <button id="authorizeDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Authorize</button>
+            </div>
+            <div id="deviceFingerprintDisplay" class="row-sub" style="margin-bottom:8px;"></div>
+            <button id="revokeDeviceBtn" class="btn btn-danger btn-block btn-sm">Revoke device</button>
+            <input id="syncConversationId" class="input" placeholder="Conversation id to sync" style="margin:8px 0;">
+            <button id="syncKeyBtn" class="btn btn-ghost btn-block btn-sm">Sync key to target device</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Developer diagnostics only -- not part of the normal product
+     surface. Stays in the DOM (main.js's appendLog() always writes to
+     it, for anyone debugging with ?debug=1) but is hidden from an
+     ordinary user by default; see main.js's own startup check. -->
+<div id="devLog" hidden>
+  <div class="dev-log-label">Developer log</div>
+  <div id="log"></div>
+</div>
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>

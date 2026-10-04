@@ -43,7 +43,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
-from crypto.key_manager import fingerprint_public_key
+from crypto.key_manager import fingerprint_combined_identity
 from database.connection import SessionLocal
 from database.models.message import Message
 from database.repositories.session_repository import SessionRepository
@@ -291,7 +291,7 @@ def _token(payload):
     db = SessionLocal()
     try:
         result = AuthenticationService(db).authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -347,11 +347,20 @@ def chat(running_server, monkeypatch, tmp_path):
         # broadcasts the SAME persisted identity key instead of a
         # fresh ephemeral one that would look like a KEY_CHANGED to an
         # already-verified peer.
+        #
+        # Protocol-Level ML-DSA Origin Authentication: also loads/
+        # persists the signing keypair (identity/key-persistence
+        # foundation phase), for the identical reason -- send_public_key()
+        # now always attaches an ML-DSA signature, so a reconnecting
+        # session whose SIGNING key was left ephemeral would look like
+        # a KEY_CHANGED to an already-verified peer even with its KEM
+        # key correctly persisted.
         session.key_store = SecureKeyStore(
             payload["user_id"], storage_dir=key_store_dir / payload["username"]
         )
         session.key_store.unlock(payload["password"])
         session.key_manager.load_or_create_kyber_keypair(session.key_store)
+        session.key_manager.load_or_create_signing_keypair(session.key_store)
         session.send_public_key()
         session.start_receiver()
         opened.append(session)
@@ -371,11 +380,22 @@ def chat(running_server, monkeypatch, tmp_path):
         lambda: bob.key_manager.get_public_key(alice_payload["username"]) is not None
     )
 
-    # Only Alice ever sends in this file's real-server tests (an
-    # image, then a direct-key-redelivery on Bob's reconnect) -- so
-    # only Alice needs Bob verified.
+    # Alice sends the image, then a direct-key-redelivery on Bob's
+    # reconnect -- so Alice needs Bob verified. Phase 13 (Group-Key-
+    # Distribution ML-DSA Origin Authentication): Bob is also the
+    # RECEIVER of that group_key_distribution packet, which now
+    # separately requires Bob to have Alice already VERIFIED too.
     alice.key_store.verify_peer_fingerprint(
-        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
+        bob_payload["username"],
+        fingerprint_combined_identity(
+            bob.key_manager.public_key, bob.key_manager.ml_dsa.export_public_key()
+        ),
+    )
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"],
+        fingerprint_combined_identity(
+            alice.key_manager.public_key, alice.key_manager.ml_dsa.export_public_key()
+        ),
     )
 
     yield {

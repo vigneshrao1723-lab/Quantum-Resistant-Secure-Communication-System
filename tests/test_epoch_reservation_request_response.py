@@ -136,7 +136,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -603,10 +603,17 @@ def alice_and_bob(running_server, monkeypatch, tmp_path):
 
     # Server-Untrusted Identity Verification, Stage 3: establish_
     # session_key() now refuses a cached-but-unverified peer key.
-    # Only alice ever sends in the tests built on this fixture, so
-    # only she needs bob verified.
+    #
+    # Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    # bob is also the RECEIVER of the group_key_distribution packet
+    # establish_session_key() sends, which now separately requires bob
+    # to have alice already VERIFIED too -- "only alice ever sends" no
+    # longer means only alice needs the other side verified.
     alice.key_store.verify_peer_fingerprint(
         bob.username, fingerprint_public_key(bob.key_manager.public_key)
+    )
+    bob.key_store.verify_peer_fingerprint(
+        alice.username, fingerprint_public_key(alice.key_manager.public_key)
     )
 
     yield {"alice": alice, "bob": bob}

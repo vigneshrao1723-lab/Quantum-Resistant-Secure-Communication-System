@@ -146,7 +146,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -605,9 +605,14 @@ def test_set_current_chat_uses_request_response_not_database(running_server, mon
         assert expected is not None
         assert session.current_conversation_id == expected
 
-        cached = session.conversation_store.get(bob_payload["username"])
-        assert cached is not None
-        assert cached.conversation_id == expected
+        # UI Finalization Decision 1: set_current_chat() deliberately
+        # does NOT cache into ConversationStore by itself -- opening a
+        # chat is not activity (see conversation_store.py's docstring
+        # and _resolve_direct_conversation_id()'s). current_conversation_id
+        # above is already correctly resolved for KeyManager's sake;
+        # the store only learns of this conversation once a message is
+        # actually sent/received.
+        assert session.conversation_store.get(bob_payload["username"]) is None
     finally:
         session.disconnect()
         _delete_user(alice_payload["username"])

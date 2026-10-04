@@ -48,6 +48,7 @@ import pytest
 
 from client.session import ClientSession
 from crypto.key_manager import fingerprint_public_key
+from crypto.ml_dsa import MLDSASigner
 from storage.secure_key_store import SecureKeyStore
 
 
@@ -70,6 +71,14 @@ class _StubKeyManager:
     def __init__(self, behaviors):
         self.behaviors = behaviors
         self.wrap_attempts = []
+        # Group-Key-Distribution ML-DSA Origin Authentication:
+        # _distribute_group_key() now signs every wrapped delivery via
+        # self.key_manager.ml_dsa -- a real MLDSASigner (not a further
+        # stub) since sign_group_key_payload() needs a real .sign()
+        # producing a real, verifiable signature; nothing about the
+        # wrap-loop control flow this file actually tests is affected.
+        self.ml_dsa = MLDSASigner()
+        self.ml_dsa.generate_keys()
 
     def get_public_key(self, username):
         if self.behaviors.get(username) == "missing":

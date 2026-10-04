@@ -56,11 +56,14 @@ def test_serialize_handles_unicode():
 
 
 def test_serialize_rejects_unknown_payload_type():
-    """"image" is a real, implemented PayloadType since Phase 6 (see
-    tests/test_file_payload_pipeline.py) -- this guards the branch for
-    a payload_type that is genuinely unimplemented, e.g. a future
-    voice type before its own serializer branch exists."""
-    payload = Payload(payload_type="voice", content=b"not implemented yet")
+    """"image"/"voice"/"video" are real, implemented PayloadTypes since
+    Phase 6/Phase 19.24 (see tests/test_file_payload_pipeline.py) --
+    this guards the branch for a payload_type that is genuinely
+    unimplemented, e.g. some future type before its own serializer
+    branch exists. "holographic" is deliberately not a real
+    PayloadType member at all, so this can never accidentally start
+    passing again just because a future phase implements it."""
+    payload = Payload(payload_type="holographic", content=b"not implemented yet")
 
     try:
         serialize_payload(payload)

@@ -141,7 +141,7 @@ def _login_locally(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result
@@ -200,7 +200,7 @@ def test_login_valid_credentials_returns_success_and_tokens(running_server, monk
 
     session = ClientSession()
     try:
-        result = session.authenticate_credentials(user["username"], user["password"])
+        result = session.authenticate_credentials(user["phone_number"], user["password"])
 
         assert result.success is True
         assert result.errors is None
@@ -234,7 +234,7 @@ def test_login_invalid_password_is_rejected(running_server, monkeypatch):
 
     session = ClientSession()
     try:
-        result = session.authenticate_credentials(user["username"], "WrongPassword!123")
+        result = session.authenticate_credentials(user["phone_number"], "WrongPassword!123")
 
         assert result.success is False
         assert result.errors and "password" in result.errors
@@ -244,11 +244,15 @@ def test_login_invalid_password_is_rejected(running_server, monkeypatch):
 
 
 def test_login_unknown_identifier_is_rejected(running_server, monkeypatch):
+    """A well-formed phone number that no account has -- see
+    test_authentication_service.py's dedicated "Login Identifier"
+    section for the malformed-identifier case, and for username/email
+    specifically being rejected as identifiers."""
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
 
     session = ClientSession()
-    result = session.authenticate_credentials(f"no-such-user-{uuid.uuid4().hex[:8]}", "whatever")
+    result = session.authenticate_credentials("+919999999999", "whatever")
 
     assert result.success is False
     assert result.errors and "identifier" in result.errors
@@ -270,7 +274,7 @@ def test_login_inactive_user_is_rejected(running_server, monkeypatch):
 
     session = ClientSession()
     try:
-        result = session.authenticate_credentials(user["username"], user["password"])
+        result = session.authenticate_credentials(user["phone_number"], user["password"])
 
         assert result.success is False
         assert result.errors["status"] == "Account is inactive."
@@ -293,7 +297,7 @@ def test_login_locked_user_is_rejected(running_server, monkeypatch):
 
     session = ClientSession()
     try:
-        result = session.authenticate_credentials(user["username"], user["password"])
+        result = session.authenticate_credentials(user["phone_number"], user["password"])
 
         assert result.success is False
         assert result.errors["status"] == "Account is locked."
@@ -311,7 +315,7 @@ def test_login_returned_token_authenticates_through_existing_server(running_serv
 
     session = ClientSession()
     try:
-        result = session.authenticate_credentials(user["username"], user["password"])
+        result = session.authenticate_credentials(user["phone_number"], user["password"])
         assert result.success is True
 
         sock = _raw_tls_connect(port)
@@ -341,7 +345,7 @@ def test_login_request_requires_no_prior_authentication(running_server):
     try:
         packet = {
             "type": "login_request",
-            "identifier": user["username"],
+            "identifier": user["phone_number"],
             "password": user["password"],
             "request_id": str(uuid.uuid4()),
         }
@@ -367,7 +371,7 @@ def test_login_result_never_contains_password_hash_or_extra_fields(running_serve
     try:
         packet = {
             "type": "login_request",
-            "identifier": user["username"],
+            "identifier": user["phone_number"],
             "password": user["password"],
             "request_id": str(uuid.uuid4()),
         }
@@ -435,7 +439,7 @@ def test_login_request_missing_request_id_is_silently_ignored(running_server):
     try:
         packet = {
             "type": "login_request",
-            "identifier": user["username"],
+            "identifier": user["phone_number"],
             "password": user["password"],
         }
         # Deliberately no request_id -- mirrors

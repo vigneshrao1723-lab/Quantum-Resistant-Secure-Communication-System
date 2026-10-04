@@ -31,6 +31,8 @@ Run with:
     pytest tests/test_group_member_selection_clicks.py -v
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
@@ -40,6 +42,17 @@ from gui.add_members_dialog import AddMembersDialog
 from gui.create_group_dialog import CreateGroupDialog
 
 USERS = ["alice", "bob", "carol", "dave"]
+
+
+def _make_session():
+    """A mock session sufficient for construction -- these tests drive
+    the existing checkbox-selection rows only, never the UI
+    Finalization Decision 2 phone-search path, so no return value
+    needs configuring beyond get_username()."""
+
+    session = MagicMock()
+    session.get_username.return_value = "me"
+    return session
 
 
 @pytest.fixture(scope="module")
@@ -55,7 +68,7 @@ def _show(dialog):
 
 @pytest.fixture()
 def create_dialog(qt_app):
-    dialog = _show(CreateGroupDialog(list(USERS)))
+    dialog = _show(CreateGroupDialog(_make_session(), list(USERS)))
     dialog.name_input.setText("Demo Group")
 
     yield dialog
@@ -65,7 +78,7 @@ def create_dialog(qt_app):
 
 @pytest.fixture()
 def add_dialog(qt_app):
-    dialog = _show(AddMembersDialog(list(USERS)))
+    dialog = _show(AddMembersDialog(_make_session(), list(USERS), []))
 
     yield dialog
 

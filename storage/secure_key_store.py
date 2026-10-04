@@ -126,6 +126,7 @@ import json
 import os
 import secrets
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from argon2.low_level import Type, hash_secret_raw
@@ -138,6 +139,7 @@ from config import (
 )
 from crypto.aes import AESCipher
 from crypto.kyber import ML_KEM_768_PRIVATE_KEY_BYTES, ML_KEM_768_PUBLIC_KEY_BYTES
+from crypto.ml_dsa import ML_DSA_65_PRIVATE_SEED_BYTES, ML_DSA_65_PUBLIC_KEY_BYTES
 
 # Bumped only if the on-disk layout changes incompatibly. Readers
 # refuse a version they do not understand rather than guessing.
@@ -221,6 +223,47 @@ class SecureKeyStore:
         # only through save_own_kyber_keypair().
         self._own_kyber_keypair = None
 
+        # This local user's own ML-DSA-65 signing keypair (ML-DSA
+        # identity/key-persistence foundation phase): (public_key,
+        # private_seed), both raw bytes, or None if never persisted --
+        # populated by unlock(), mutated only through
+        # save_own_signing_keypair(). Independent of, and stored
+        # alongside, _own_kyber_keypair -- this is the SAME peer
+        # identity's second key, not a second identity.
+        self._own_signing_keypair = None
+
+        # This installation's stable device_id (Phase 16B -- Multi-
+        # Device Identity persistence): a plain UUID string, or None
+        # if never persisted -- populated by unlock(), mutated only
+        # through save_device_id(). Stored alongside, but independent
+        # of, the keypairs above: it names THIS device to the account/
+        # device-management protocol (crypto/device_protocol.py), it
+        # is never itself a cryptographic key. Persisting it here (the
+        # same encrypted-at-rest file the keys already live in, not a
+        # second store) is what makes enroll_device() idempotent
+        # across restarts -- see client/session.py::ClientSession.
+        # enroll_device()'s own docstring.
+        self._device_id = None
+
+        # Phase 19.24 -- Mute/Archive/Wallpaper: per-conversation LOCAL
+        # preferences, {conversation_key: {"muted_until": str | None,
+        # "archived": bool, "wallpaper": str | None}}. conversation_key
+        # is the same identity everything else in this codebase already
+        # uses (a username for a direct conversation, a conversation_id
+        # for a group) -- never a value that needs cross-referencing
+        # against the database. "muted_until" is either an ISO-8601
+        # UTC timestamp (muted until then), the literal string
+        # "forever" (muted until explicitly turned off), or None/absent
+        # (not muted). These are UI preferences, not identity or key
+        # material -- unlike _peers/_own_kyber_keypair/_own_signing_
+        # keypair above, a malformed section here is handled leniently
+        # (reset to {}) rather than failing the whole store closed: the
+        # worst case of losing this section is a conversation
+        # un-muting/un-archiving itself, never a security regression.
+        # Populated by unlock(), mutated only through set_conversation_
+        # muted_until()/set_conversation_archived().
+        self._conversation_prefs = {}
+
         # The most recently known {conversation_id: {epoch: key_bytes}}
         # snapshot -- set by unlock() and by save(). Needed so the
         # peer-verification methods below, which have no conversation-
@@ -278,6 +321,9 @@ class SecureKeyStore:
             self._derived_key = _derive_key(password, self._salt, **self._params)
             self._peers = {}
             self._own_kyber_keypair = None
+            self._own_signing_keypair = None
+            self._device_id = None
+            self._conversation_prefs = {}
             self._last_keys_snapshot = {}
             return {}
 
@@ -337,10 +383,41 @@ class SecureKeyStore:
             # same whether it comes from a pre-Stage-2.5 store or a
             # brand-new one: generate once, persist from here on.
             own_kyber_keypair_raw = document.get("own_kyber_keypair")
+            # Absent, not required, same reasoning again: every store
+            # written before the ML-DSA identity/key-persistence
+            # foundation phase existed has no "own_signing_keypair"
+            # section -- that honestly means "no signing keypair
+            # persisted yet", not a malformed file. KeyManager.
+            # load_or_create_signing_keypair() treats None exactly the
+            # same whether it comes from a pre-existing store or a
+            # brand-new one: generate once, persist from here on.
+            own_signing_keypair_raw = document.get("own_signing_keypair")
+            # Absent, not required, same reasoning again: a store
+            # written before Phase 16B existed has no "device_id"
+            # section -- that honestly means "this installation has
+            # never enrolled a device yet", not a malformed file.
+            # ClientSession.enroll_device() treats None exactly the
+            # same whether it comes from a pre-existing store or a
+            # brand-new one: generate once, persist from here on.
+            device_id_raw = document.get("device_id")
         except (KeyError, TypeError, ValueError) as error:
             raise KeyStoreLocked(
                 "The local key store contents are malformed."
             ) from error
+
+        # Absent, not required, same reasoning as "peers"/"device_id"
+        # above: a store written before Phase 19.24 (Mute/Archive/
+        # Wallpaper) existed has no "conversation_prefs" section -- that
+        # honestly means "no local preferences set yet", not a
+        # malformed file. Unlike the sections above, a structurally
+        # wrong section here does NOT fail the store closed -- see this
+        # field's own __init__ comment for why that would be the wrong
+        # tradeoff for a UI preference.
+        conversation_prefs_raw = document.get("conversation_prefs", {})
+        if isinstance(conversation_prefs_raw, dict):
+            self._conversation_prefs = conversation_prefs_raw
+        else:
+            self._conversation_prefs = {}
 
         try:
             decoded_peers = self._decode_peers(peers_raw)
@@ -373,6 +450,25 @@ class SecureKeyStore:
                 "The local key store's own Kyber keypair data is malformed."
             ) from error
 
+        try:
+            decoded_own_signing_keypair = self._decode_own_signing_keypair(
+                own_signing_keypair_raw
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            # Fail closed, for exactly the same reason as the own-Kyber-
+            # keypair branch above: this section is only ever absent
+            # (handled above) or exactly what this module itself
+            # previously wrote, since it lives inside the same GCM-
+            # authenticated payload as everything else here. Refusing
+            # the whole store rather than silently generating a
+            # replacement signing keypair is deliberate -- a
+            # replacement would be a NEW signing identity that any peer
+            # who already VERIFIED this user's current combined
+            # fingerprint would see as an unexplained KEY_CHANGED.
+            raise KeyStoreLocked(
+                "The local key store's own signing keypair data is malformed."
+            ) from error
+
         # The plaintext header is only trustworthy if it matches the
         # copy sealed inside the authenticated payload. A mismatch
         # means the file was edited after it was written.
@@ -389,6 +485,8 @@ class SecureKeyStore:
         self._derived_key = derived
         self._peers = decoded_peers
         self._own_kyber_keypair = decoded_own_kyber_keypair
+        self._own_signing_keypair = decoded_own_signing_keypair
+        self._device_id = device_id_raw
 
         decoded_keys = self._decode(raw)
         self._last_keys_snapshot = decoded_keys
@@ -448,6 +546,11 @@ class SecureKeyStore:
                 "own_kyber_keypair": self._encode_own_kyber_keypair(
                     self._own_kyber_keypair
                 ),
+                "own_signing_keypair": self._encode_own_signing_keypair(
+                    self._own_signing_keypair
+                ),
+                "device_id": self._device_id,
+                "conversation_prefs": self._conversation_prefs,
             })
         )
 
@@ -472,6 +575,8 @@ class SecureKeyStore:
         self._params = None
         self._peers = {}
         self._own_kyber_keypair = None
+        self._own_signing_keypair = None
+        self._device_id = None
         self._last_keys_snapshot = {}
 
     # ------------------------------------------------------------------
@@ -484,6 +589,15 @@ class SecureKeyStore:
         Return {"fingerprint": str, "state": PEER_STATE_*} for
         ``username``, or None if no fingerprint has ever been
         observed for them.
+
+        Deliberately exactly these two keys, unchanged since Stage 1,
+        even though self._peers[username] now optionally also carries
+        "signing_public_key" (Message-Level ML-DSA Origin
+        Authentication) -- callers throughout this codebase and its
+        test suite compare this return value against a literal
+        {"fingerprint": ..., "state": ...} dict; silently adding a
+        third key here would break every one of them. Read the signing
+        key via get_peer_signing_public_key() instead.
         """
 
         entry = self._peers.get(username)
@@ -491,7 +605,42 @@ class SecureKeyStore:
         if entry is None:
             return None
 
-        return dict(entry)
+        return {"fingerprint": entry["fingerprint"], "state": entry["state"]}
+
+    def get_all_peer_verifications(self):
+        """
+        Phase 19.23 -- Issue 1: return {username: {"fingerprint": str,
+        "state": PEER_STATE_*, "signing_public_key": bytes | None}}
+        for every peer this store has ever recorded an observation or
+        verification for.
+
+        Purely additive and read-only, exactly like get_peer_
+        verification() for a single peer -- this exposes no new trust
+        decision and changes what nothing here is willing to consider
+        VERIFIED; it is the same already-persisted self._peers this
+        class has always kept, just returned for every entry instead
+        of requiring the caller to already know one username to ask
+        about.
+
+        Introduced because mobile/session.py::MobileClientSession
+        caches peer state in its own session-local self.peers dict,
+        populated only as each peer's key is actually observed live
+        (unlike ClientSession on Desktop, which reads straight through
+        to this store on every call and therefore has no equivalent
+        gap) -- without this, a peer verified in an EARLIER session who
+        happens not to be observed again this session (e.g. currently
+        offline) would report as unverified after every fresh login,
+        even though this store never forgot them. See
+        MobileClientSession._rehydrate_peers_from_key_store().
+
+        Returns a shallow copy of each entry so a caller mutating the
+        returned dicts cannot corrupt this store's own state.
+        """
+
+        return {
+            username: dict(entry)
+            for username, entry in self._peers.items()
+        }
 
     def has_verified_fingerprint(self, username):
         """True only if this peer has an explicitly VERIFIED entry --
@@ -517,7 +666,7 @@ class SecureKeyStore:
 
         return entry["fingerprint"] == fingerprint
 
-    def record_observed_peer_fingerprint(self, username, fingerprint):
+    def record_observed_peer_fingerprint(self, username, fingerprint, signing_public_key=None):
         """
         Record ``fingerprint`` as this peer's current UNVERIFIED key.
 
@@ -543,6 +692,14 @@ class SecureKeyStore:
         (correct, at the time) "not verified yet" result and overwrite
         the VERIFIED entry that had just been set, defeating the exact
         protection this method exists to provide.
+
+        ``signing_public_key`` (Message-Level ML-DSA Origin
+        Authentication): the peer's raw ML-DSA public key bytes,
+        persisted alongside the fingerprint -- optional and additive,
+        None for a legacy KEM-only observation (see get_peer_signing_
+        public_key()'s own docstring for why this needs to be
+        persisted at all, not merely cached in ClientSession's
+        session-local dicts).
         """
 
         if not username:
@@ -558,10 +715,11 @@ class SecureKeyStore:
             self._peers[username] = {
                 "fingerprint": fingerprint,
                 "state": PEER_STATE_UNVERIFIED,
+                "signing_public_key": signing_public_key,
             }
             self._write(self._last_keys_snapshot)
 
-    def verify_peer_fingerprint(self, username, fingerprint):
+    def verify_peer_fingerprint(self, username, fingerprint, signing_public_key=None):
         """
         Explicitly mark ``fingerprint`` as ``username``'s VERIFIED
         key -- the action a later stage's explicit user-driven
@@ -570,27 +728,90 @@ class SecureKeyStore:
         overwrite an existing VERIFIED entry: calling it IS the
         explicit authorization record_observed_peer_fingerprint()'s
         protection exists to require.
+
+        ``signing_public_key`` (Message-Level ML-DSA Origin
+        Authentication): see record_observed_peer_fingerprint()'s
+        identical parameter. ``None`` here means "leave whatever was
+        already on file for this peer's signing key untouched" (rather
+        than erasing it) if this call is re-verifying the SAME
+        fingerprint that was already associated with a signing key --
+        callers that DO have a signing key to persist (every real one,
+        via ClientSession.confirm_combined_peer_verification()) always
+        pass it explicitly.
         """
 
         if not username:
             raise KeyStoreError("A peer username is required.")
 
         with self._lock:
+
+            if signing_public_key is None:
+                existing = self._peers.get(username)
+                if existing is not None:
+                    signing_public_key = existing.get("signing_public_key")
+
             self._peers[username] = {
                 "fingerprint": fingerprint,
                 "state": PEER_STATE_VERIFIED,
+                "signing_public_key": signing_public_key,
             }
             self._write(self._last_keys_snapshot)
 
+    def get_peer_signing_public_key(self, username):
+        """
+        Returns ``username``'s persisted raw ML-DSA public-key bytes,
+        or None if never recorded (a legacy KEM-only observation, or
+        no observation at all).
+
+        Message-Level ML-DSA Origin Authentication: ClientSession's own
+        _observed_peer_signing_public_keys/_pending_key_changed_
+        signing_raw_keys are session-local and do not survive a
+        restart -- fine for the LIVE "chat" packet path (a peer who
+        never came back online this session has nothing live to
+        verify anyway), but not for offline/history verification: a
+        message from a peer who is not currently online (and so never
+        re-broadcasts their public-key packet on this session's
+        reconnect) would otherwise be permanently unverifiable after
+        every restart, even though this peer's identity was already
+        legitimately observed or VERIFIED in an earlier session. This
+        is ClientSession's fallback source when its own in-memory
+        cache has nothing for a given peer -- see _resolve_trusted_
+        signing_key()'s own docstring.
+        """
+
+        entry = self._peers.get(username)
+
+        if entry is None:
+            return None
+
+        return entry.get("signing_public_key")
+
     @staticmethod
     def _encode_peers(peers):
-        return {
-            str(username): {
+        encoded = {}
+
+        for username, entry in (peers or {}).items():
+
+            row = {
                 "fingerprint": str(entry["fingerprint"]),
                 "state": str(entry["state"]),
             }
-            for username, entry in (peers or {}).items()
-        }
+
+            # Message-Level ML-DSA Origin Authentication: optional,
+            # additive -- absent (rather than null) for every entry
+            # recorded before this phase existed, and for a legacy
+            # KEM-only observation. base64 at the persistence boundary,
+            # exactly like every other raw-bytes field this store
+            # already persists (own_kyber_keypair, own_signing_keypair).
+            signing_public_key = entry.get("signing_public_key")
+            if signing_public_key is not None:
+                row["signing_public_key"] = base64.b64encode(
+                    signing_public_key
+                ).decode("ascii")
+
+            encoded[str(username)] = row
+
+        return encoded
 
     @staticmethod
     def _decode_peers(raw):
@@ -602,10 +823,29 @@ class SecureKeyStore:
             if state not in (PEER_STATE_UNVERIFIED, PEER_STATE_VERIFIED):
                 raise ValueError(f"Unknown peer verification state {state!r}.")
 
-            decoded[str(username)] = {
+            decoded_entry = {
                 "fingerprint": str(entry["fingerprint"]),
                 "state": state,
             }
+
+            signing_public_key_b64 = entry.get("signing_public_key")
+
+            if signing_public_key_b64 is not None:
+                signing_public_key = base64.b64decode(
+                    signing_public_key_b64, validate=True
+                )
+
+                if len(signing_public_key) != ML_DSA_65_PUBLIC_KEY_BYTES:
+                    raise ValueError(
+                        f"Persisted peer signing public key for "
+                        f"{username!r} must decode to exactly "
+                        f"{ML_DSA_65_PUBLIC_KEY_BYTES} bytes; got "
+                        f"{len(signing_public_key)}."
+                    )
+
+                decoded_entry["signing_public_key"] = signing_public_key
+
+            decoded[str(username)] = decoded_entry
 
         return decoded
 
@@ -700,6 +940,293 @@ class SecureKeyStore:
             )
 
         return (encapsulation_key, decapsulation_key)
+
+    # ------------------------------------------------------------------
+    # This local user's own ML-DSA-65 signing keypair (ML-DSA identity/
+    # key-persistence foundation phase)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # This installation's own stable device_id (Phase 16B -- Multi-
+    # Device Identity persistence)
+    # ------------------------------------------------------------------
+
+    def get_device_id(self):
+        """
+        Return this installation's persisted device_id (a plain UUID
+        string), or None if this installation has never enrolled a
+        device yet.
+        """
+
+        return self._device_id
+
+    def save_device_id(self, device_id):
+        """
+        Persist this installation's device_id. Called exactly once
+        ever, per installation -- the first time ClientSession.
+        enroll_device() finds nothing already on file.
+
+        Refuses to overwrite an existing persisted device_id, mirroring
+        save_own_kyber_keypair()'s/save_own_signing_keypair()'s
+        identical fail-closed reasoning: a caller reaching this branch
+        with a device_id already on file is a bug (it would silently
+        make this installation appear to the server as a SECOND,
+        unrelated device the next time it enrolls), not a routine
+        event.
+        """
+
+        if not isinstance(device_id, str) or not device_id:
+            raise KeyStoreError("A non-empty device_id string is required.")
+
+        with self._lock:
+
+            if self._device_id is not None:
+                raise KeyStoreError(
+                    "A device_id is already persisted for this "
+                    "installation; it must never be silently replaced."
+                )
+
+            self._device_id = device_id
+            self._write(self._last_keys_snapshot)
+
+    # ------------------------------------------------------------------
+    # Phase 19.24 -- Mute/Archive: per-conversation LOCAL preferences.
+    # See this class's _conversation_prefs field comment for the exact
+    # shape and why a malformed section here degrades leniently rather
+    # than failing the whole store closed.
+    # ------------------------------------------------------------------
+
+    def get_conversation_muted_until(self, conversation_key):
+        """
+        Return this conversation's raw "muted_until" value: an ISO-8601
+        UTC timestamp string, the literal string "forever", or None if
+        not muted (including if never set at all). Callers that only
+        need a yes/no answer should use is_conversation_muted() below,
+        which also accounts for an already-expired timestamp.
+        """
+
+        entry = self._conversation_prefs.get(conversation_key)
+
+        if not entry:
+            return None
+
+        return entry.get("muted_until")
+
+    def is_conversation_muted(self, conversation_key):
+        """
+        True if this conversation is currently muted: "muted_until" is
+        the literal string "forever", or an ISO-8601 timestamp that has
+        not yet passed. An expired timestamp reads as not muted here
+        without needing its own explicit unmute -- mirrors how a
+        calendar reminder that has already fired is simply over, not an
+        error state.
+        """
+
+        muted_until = self.get_conversation_muted_until(conversation_key)
+
+        if muted_until is None:
+            return False
+
+        if muted_until == "forever":
+            return True
+
+        try:
+            deadline = datetime.fromisoformat(muted_until)
+        except (TypeError, ValueError):
+            # A malformed timestamp is handled the same lenient way as
+            # the rest of this section: treated as "not muted" rather
+            # than raising, since this is a UI preference, not identity
+            # or key material.
+            return False
+
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+
+        return datetime.now(timezone.utc) < deadline
+
+    def set_conversation_muted_until(self, conversation_key, muted_until):
+        """
+        Set (``muted_until`` an ISO-8601 UTC timestamp string or the
+        literal "forever") or clear (``muted_until`` None) this
+        conversation's mute state. ``conversation_key`` is the same
+        identity used throughout this codebase for a conversation: a
+        username for direct, a conversation_id for group.
+        """
+
+        if not conversation_key:
+            raise KeyStoreError("A conversation key is required.")
+
+        with self._lock:
+
+            entry = dict(self._conversation_prefs.get(conversation_key, {}))
+
+            if muted_until is None:
+                entry.pop("muted_until", None)
+            else:
+                entry["muted_until"] = muted_until
+
+            if entry:
+                self._conversation_prefs[conversation_key] = entry
+            else:
+                self._conversation_prefs.pop(conversation_key, None)
+
+            self._write(self._last_keys_snapshot)
+
+    def is_conversation_archived(self, conversation_key):
+        """True if conversation ``conversation_key`` is archived."""
+
+        entry = self._conversation_prefs.get(conversation_key)
+
+        return bool(entry and entry.get("archived"))
+
+    def get_conversation_wallpaper(self, conversation_key):
+        """Return this conversation's wallpaper id (one of the preset
+        keys every client's own WALLPAPER catalog defines), or None
+        for the default. A PRESET id, never arbitrary image bytes --
+        keeps this local-only preference as small and simple as Mute/
+        Archive, with no new file-storage handling per platform."""
+
+        entry = self._conversation_prefs.get(conversation_key)
+
+        return entry.get("wallpaper") if entry else None
+
+    def set_conversation_wallpaper(self, conversation_key, wallpaper_id):
+        """Set (a preset id string) or reset (None) conversation
+        ``conversation_key``'s wallpaper -- same local-only, never-
+        server-visible preference as Mute/Archive above."""
+
+        if not conversation_key:
+            raise KeyStoreError("A conversation key is required.")
+
+        with self._lock:
+
+            entry = dict(self._conversation_prefs.get(conversation_key, {}))
+
+            if wallpaper_id is None:
+                entry.pop("wallpaper", None)
+            else:
+                entry["wallpaper"] = wallpaper_id
+
+            if entry:
+                self._conversation_prefs[conversation_key] = entry
+            else:
+                self._conversation_prefs.pop(conversation_key, None)
+
+            self._write(self._last_keys_snapshot)
+
+    def set_conversation_archived(self, conversation_key, archived):
+        """
+        Archive (``archived=True``) or unarchive (``archived=False``)
+        conversation ``conversation_key``. Archiving retains history --
+        it never deletes or hides anything server-side, purely a local
+        "don't show this in my main list" preference, exactly like
+        muting above.
+        """
+
+        if not conversation_key:
+            raise KeyStoreError("A conversation key is required.")
+
+        with self._lock:
+
+            entry = dict(self._conversation_prefs.get(conversation_key, {}))
+
+            if archived:
+                entry["archived"] = True
+            else:
+                entry.pop("archived", None)
+
+            if entry:
+                self._conversation_prefs[conversation_key] = entry
+            else:
+                self._conversation_prefs.pop(conversation_key, None)
+
+            self._write(self._last_keys_snapshot)
+
+    def get_own_signing_keypair(self):
+        """
+        Return this local user's persisted ML-DSA signing keypair as
+        ``(public_key, private_seed)`` -- both raw bytes, byte-for-byte
+        identical to what was originally passed to
+        save_own_signing_keypair() -- or None if none has ever been
+        persisted (a fresh installation, or a store created before this
+        phase existed).
+        """
+
+        return self._own_signing_keypair
+
+    def save_own_signing_keypair(self, public_key, private_seed):
+        """
+        Persist this local user's ML-DSA signing keypair. Called
+        exactly once ever, per installation -- the first time
+        KeyManager.load_or_create_signing_keypair() finds nothing
+        already on file.
+
+        Deliberately refuses to overwrite an existing persisted
+        keypair, for exactly the same reason as
+        save_own_kyber_keypair(): there is no legitimate "this
+        changed, update it" case for this user's own signing identity
+        from this method's caller. Minting a second, silently-swapped
+        signing identity underneath whatever peers have already
+        VERIFIED this user's current combined fingerprint is exactly
+        the failure this store must never produce on its own, so this
+        fails closed (raises) rather than silently proceeding.
+        """
+
+        if not isinstance(public_key, (bytes, bytearray)) or not public_key:
+            raise KeyStoreError("A signing public key is required.")
+
+        if not isinstance(private_seed, (bytes, bytearray)) or not private_seed:
+            raise KeyStoreError("A signing private seed is required.")
+
+        with self._lock:
+
+            if self._own_signing_keypair is not None:
+                raise KeyStoreError(
+                    "An own signing keypair is already persisted for this "
+                    "user; it must never be silently replaced."
+                )
+
+            self._own_signing_keypair = (
+                bytes(public_key),
+                bytes(private_seed),
+            )
+            self._write(self._last_keys_snapshot)
+
+    @staticmethod
+    def _encode_own_signing_keypair(own_signing_keypair):
+        if own_signing_keypair is None:
+            return None
+
+        public_key, private_seed = own_signing_keypair
+
+        return {
+            "public_key": base64.b64encode(public_key).decode("ascii"),
+            "private_seed": base64.b64encode(private_seed).decode("ascii"),
+        }
+
+    @staticmethod
+    def _decode_own_signing_keypair(raw):
+        if raw is None:
+            return None
+
+        public_key = base64.b64decode(raw["public_key"], validate=True)
+        private_seed = base64.b64decode(raw["private_seed"], validate=True)
+
+        if len(public_key) != ML_DSA_65_PUBLIC_KEY_BYTES:
+            raise ValueError(
+                f"Persisted ML-DSA public key must decode to exactly "
+                f"{ML_DSA_65_PUBLIC_KEY_BYTES} bytes; got "
+                f"{len(public_key)}."
+            )
+
+        if len(private_seed) != ML_DSA_65_PRIVATE_SEED_BYTES:
+            raise ValueError(
+                f"Persisted ML-DSA private seed must decode to exactly "
+                f"{ML_DSA_65_PRIVATE_SEED_BYTES} bytes; got "
+                f"{len(private_seed)}."
+            )
+
+        return (public_key, private_seed)
 
     # ------------------------------------------------------------------
 

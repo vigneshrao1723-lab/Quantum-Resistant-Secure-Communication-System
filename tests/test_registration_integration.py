@@ -115,7 +115,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -269,6 +269,7 @@ def test_register_then_login_on_the_same_session_object(running_server, monkeypa
     suffix = uuid.uuid4().hex[:10]
     username = f"reg_then_login_{suffix}"
     password = "Str0ng!Passw0rd"
+    phone_number = f"+91{uuid.uuid4().int % 10**12:012d}"
 
     session = ClientSession()
     try:
@@ -278,12 +279,14 @@ def test_register_then_login_on_the_same_session_object(running_server, monkeypa
             email=f"{username}@example.com",
             password=password,
             confirm_password=password,
-            phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
+            phone_number=phone_number,
         )
         assert result.success is True
 
+        # UI Finalization -- Login Identifier: phone number, not
+        # username, is what login now authenticates with.
         session.access_token = _login_and_get_token(
-            {"username": username, "password": password}
+            {"phone_number": phone_number, "password": password}
         )
 
         session.connect()

@@ -23,7 +23,7 @@ import pytest
 from crypto.aes import AESCipher
 from domain.payload import Payload
 from domain.payload_serializer import deserialize_payload, serialize_payload
-from domain.payload_type import BLOB_STORAGE_PAYLOAD_TYPES, PayloadType
+from domain.payload_type import BLOB_STORAGE_PAYLOAD_TYPES, PayloadType, classify_attachment
 from payload.file_adapter import FilePayloadAdapter
 
 VALID_KEY = b"K" * 32
@@ -43,10 +43,41 @@ def test_blob_storage_payload_types_excludes_text():
 
 
 # =====================================================
+# Phase 19.24 -- Voice/Video Messages: NOT a new payload pipeline --
+# just two more PayloadType members routed through the exact same
+# blob-storage/adapter machinery FILE/IMAGE already use (see domain/
+# payload_type.py's own module docstring). These assert that reuse is
+# real, not merely claimed.
+# =====================================================
+
+def test_blob_storage_payload_types_contains_voice_and_video():
+    assert PayloadType.VOICE in BLOB_STORAGE_PAYLOAD_TYPES
+    assert PayloadType.VIDEO in BLOB_STORAGE_PAYLOAD_TYPES
+
+
+@pytest.mark.parametrize("filename,expected", [
+    ("clip.m4a", PayloadType.VOICE),
+    ("clip.ogg", PayloadType.VOICE),
+    ("clip.wav", PayloadType.VOICE),
+    ("clip.mp4", PayloadType.VIDEO),
+    ("clip.webm", PayloadType.VIDEO),
+    ("photo.png", PayloadType.IMAGE),
+    ("photo.webp", PayloadType.IMAGE),
+    ("document.pdf", PayloadType.FILE),
+    ("no_extension_at_all", PayloadType.FILE),
+])
+def test_classify_attachment(filename, expected):
+    assert classify_attachment(filename) == expected
+
+
+# =====================================================
 # domain/payload_serializer.py -- binary passthrough
 # =====================================================
 
-@pytest.mark.parametrize("payload_type", [PayloadType.FILE, PayloadType.IMAGE])
+@pytest.mark.parametrize(
+    "payload_type",
+    [PayloadType.FILE, PayloadType.IMAGE, PayloadType.VOICE, PayloadType.VIDEO],
+)
 def test_serialize_deserialize_binary_round_trip(payload_type):
     raw_bytes = b"\x00\x01\xffnot-utf8-safe-binary-content"
     payload = Payload(payload_type=payload_type, content=raw_bytes)
@@ -61,7 +92,10 @@ def test_serialize_deserialize_binary_round_trip(payload_type):
 # payload/file_adapter.py
 # =====================================================
 
-@pytest.mark.parametrize("payload_type", [PayloadType.FILE, PayloadType.IMAGE])
+@pytest.mark.parametrize(
+    "payload_type",
+    [PayloadType.FILE, PayloadType.IMAGE, PayloadType.VOICE, PayloadType.VIDEO],
+)
 def test_file_adapter_encrypt_decrypt_round_trip(payload_type):
     aes = AESCipher(VALID_KEY)
     adapter = FilePayloadAdapter(payload_type)

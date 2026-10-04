@@ -20,6 +20,7 @@ that move those database operations behind the server are what make a
 client genuinely credential-free.
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -429,6 +430,40 @@ def validate_config():
                     f"{name} does not exist: {value}. A production "
                     f"deployment must supply its own TLS material."
                 )
+
+            # Phase 19.19 -- L-3 closure. The path check above catches
+            # the accidental case (env vars simply left at their
+            # certs/dev/ defaults); it does nothing if the SAME dev
+            # bytes are copied to a different path (and possibly
+            # renamed) and pointed at from there -- a deliberate
+            # misconfiguration, but still one that would otherwise
+            # start up successfully and silently trust a keypair whose
+            # private half is committed to this repository. Comparing
+            # file CONTENT (not the path or name) against every known
+            # dev cert/key file closes that gap.
+            try:
+                configured_hash = hashlib.sha256(resolved.read_bytes()).digest()
+            except OSError:
+                continue
+
+            for dev_file in _DEV_CERTS_DIR.glob("*"):
+                try:
+                    dev_hash = hashlib.sha256(dev_file.read_bytes()).digest()
+                except OSError:
+                    continue
+
+                if configured_hash == dev_hash:
+                    raise ValueError(
+                        f"{name} ({value}) is byte-identical to this "
+                        f"project's own generated development TLS "
+                        f"material ({dev_file}), even though its path/"
+                        f"name does not match. This is refused for the "
+                        f"same reason as the path-based check above: "
+                        f"the private key half of this material is "
+                        f"committed to the repository and is not "
+                        f"secret. Supply real, independently-generated "
+                        f"certificates via {name} in the environment."
+                    )
 
     if REQUEST_TIMEOUT_SECONDS <= 0:
         raise ValueError("REQUEST_TIMEOUT_SECONDS must be a positive number.")

@@ -15,22 +15,32 @@ actually received the recipient's key yet. The first send attempt
 against an offline-since-this-session recipient then failed inside
 ClientSession.establish_session_key() with a blocking QMessageBox.
 
-The fix is entirely in gui/chat_window.py + one new ClientSession
-signal -- no protocol, crypto, schema, or identifier changes:
+The fix was originally: gate the composer on KeyManager.get_public_key()
+so a doomed send could never be attempted. BUG -- Offline First Contact
+(client/session.py::establish_session_key()) removed the reason that
+gate existed at all -- the AES session key is now always generated
+locally (os.urandom(32)), independent of the recipient's public key,
+so a brand-new direct conversation with a currently offline recipient
+is now genuinely sendable, not just "safely disabled". Delivery of
+that key to the recipient is deferred to the existing recovery
+mechanism (see client/session.py::establish_session_key()'s
+docstring) rather than blocking the composer.
 
-  - ChatWindow._update_composer_availability(): the single place that
-    decides whether the composer is usable for the currently-open
-    direct conversation, based on KeyManager.get_public_key() alone
-    (never a stale cache, never a substitute key -- see
-    crypto/key_manager.py, untouched).
-  - ClientSession.public_key_received (new Signal(str)): emitted from
-    handle_public_key() right after a key is validated and stored --
-    the same validated, unchanged storage path as before.
-  - ChatWindow.handle_public_key_received(): re-checks availability
-    only when the arriving key belongs to whoever is currently open.
-  - ChatWindow.send_message(): a defense-in-depth guard mirroring the
-    composer's own enabled state, so a doomed send can never actually
-    reach the network even if triggered some other way.
+  - ChatWindow._update_composer_availability(): now enables a direct
+    conversation's composer unconditionally (like a group's always
+    was) -- see its docstring for the case-by-case analysis of why no
+    direct-conversation state is left that should block it.
+  - ClientSession.public_key_received (Signal(str)): unchanged,
+    still emitted from handle_public_key() right after a key is
+    validated and stored.
+  - ChatWindow.handle_public_key_received(): unchanged wiring, kept
+    as a hook point even though it no longer changes enabled state.
+  - ChatWindow.send_message(): the old public-key-based defense-in-
+    depth pre-check was removed (it was based on the now-obsolete
+    signal); the generic try/except around send_chat_message() -- and
+    the deeper ValueError _send_encrypted_payload() would raise if
+    establish_session_key() ever left no key stored -- remain the
+    defense-in-depth for a genuine failure.
 
 These tests drive a REAL ChatWindow against a real running server and
 real, separately-connecting ClientSessions -- the same pattern
@@ -39,17 +49,10 @@ tests/test_chat_window_read_receipt_on_receive.py already established
 re-implementation of it.
 
 Standalone-commit scope: _update_composer_availability() only ever
-toggles InputBar.set_enabled() here -- no visible "Waiting for
-recipient..." status text yet, since that requires a QLabel
-(composer_status_label) whose construction/layout placement belongs to
-a separate, not-yet-committed initial-chat-state change. These tests
-therefore assert on input_bar's own enabled state directly rather than
-on any status label, which keeps this file committable independently
-of that other work. A later, small follow-up change wires
-composer_status_label back into this method once the initial-chat-state
-work has landed; the safety/functional guarantees these tests cover
-(no dialog, no transmission, correct enable/disable) do not depend on
-that label existing at all.
+toggles InputBar.set_enabled() here -- no visible status text yet,
+since that requires a QLabel (composer_status_label) whose
+construction/layout placement belongs to a separate, not-yet-committed
+initial-chat-state change.
 
 Run with:
     pytest tests/test_composer_public_key_availability.py -v
@@ -70,7 +73,7 @@ import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
-from crypto.key_manager import fingerprint_public_key
+from crypto.key_manager import fingerprint_combined_identity, fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
@@ -248,7 +251,27 @@ def test_available_public_key_enables_the_composer_and_sending_works(
     )
     alice.key_store.unlock(alice_payload["password"])
     alice.key_store.verify_peer_fingerprint(
-        bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
+        bob_payload["username"],
+        fingerprint_combined_identity(
+            bob.key_manager.public_key, bob.key_manager.ml_dsa.export_public_key()
+        ),
+    )
+    # Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    # bob is also the RECEIVER of the live group_key_distribution
+    # packet alice_window.send_message() below triggers, which now
+    # separately requires bob to have alice already VERIFIED too --
+    # otherwise the packet is silently rejected on bob's receiver
+    # thread (no modal dialog there; the message is simply never
+    # delivered) and the assertion below fails.
+    bob.key_store = SecureKeyStore(
+        bob_payload["user_id"], storage_dir=tmp_path / "keystore-bob"
+    )
+    bob.key_store.unlock(bob_payload["password"])
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"],
+        fingerprint_combined_identity(
+            alice.key_manager.public_key, alice.key_manager.ml_dsa.export_public_key()
+        ),
     )
 
     alice_window = ChatWindow(alice)
@@ -271,11 +294,12 @@ def test_available_public_key_enables_the_composer_and_sending_works(
 
 
 # ----------------------------------------------------------------------
-# B -- missing public key: safe state, no error dialog
+# B -- missing public key: BUG -- Offline First Contact -- composer
+# stays usable, sending succeeds via a locally-generated key
 # ----------------------------------------------------------------------
 
 
-def test_missing_public_key_disables_composer_safely(
+def test_missing_public_key_keeps_composer_enabled_for_a_new_conversation(
     connect, accounts
 ):
     alice_payload = accounts("alice_")
@@ -290,21 +314,22 @@ def test_missing_public_key_disables_composer_safely(
     # Exactly what handle_find_user() does after a successful search.
     alice_window.open_conversation(_direct_summary(bob_payload["username"]))
 
-    # The conversation itself is real -- opening it still names the
-    # partner in the header -- only sending is blocked.
     assert alice_window.chat_partner_label.text() == bob_payload["username"]
 
-    assert alice_window.input_bar.message_input.isEnabled() is False
-    assert alice_window.input_bar.send_button.isEnabled() is False
+    # BUG -- Offline First Contact: establish_session_key() can now
+    # always generate a key locally, regardless of public-key
+    # availability, so there is no reason left to disable the
+    # composer for a brand-new conversation with an offline recipient.
+    assert alice_window.input_bar.message_input.isEnabled() is True
 
 
-def test_missing_public_key_no_error_dialog_and_no_send_attempt_on_real_interaction(
+def test_missing_public_key_real_interaction_sends_via_a_locally_generated_key(
     connect, accounts
 ):
-    """A real user interaction with the disabled widgets -- typing and
-    pressing Enter, clicking Send -- must produce nothing: no
-    message_sent emission, no error dialog, no bubble added, and (the
-    security requirement) the underlying send is never even called."""
+    """A real user interaction -- typing and pressing Enter -- must
+    actually send: no error dialog, a real send attempt reaching
+    ClientSession.send_chat_message(), and a session key generated
+    locally with no public key involved."""
 
     alice_payload = accounts("alice_")
     bob_payload = accounts("bob_")
@@ -317,20 +342,24 @@ def test_missing_public_key_no_error_dialog_and_no_send_attempt_on_real_interact
 
     alice_window.open_conversation(_direct_summary(bob_payload["username"]))
 
+    assert alice.key_manager.get_public_key(bob_payload["username"]) is None
+
     dialogs_shown = []
     alice_window.show_error = lambda message: dialogs_shown.append(message)
-
-    sent_signals = []
-    alice_window.input_bar.message_sent.connect(
-        lambda message: sent_signals.append(message)
-    )
 
     send_attempts = []
     original_send_chat_message = alice.send_chat_message
 
-    def _tracked_send_chat_message(message):
+    def _tracked_send_chat_message(message, **kwargs):
+        # Phase 19.24 -- send_chat_message() now also accepts
+        # reply_to_message_id/client_message_id (Message Lifecycle
+        # Events); gui/chat_window.py::send_message() always passes
+        # both on an ordinary send now (client_message_id for retry
+        # idempotency). This tracking wrapper only cares about the
+        # message text itself, so it forwards whatever it was given
+        # rather than assuming the old 1-arg shape.
         send_attempts.append(message)
-        return original_send_chat_message(message)
+        return original_send_chat_message(message, **kwargs)
 
     alice.send_chat_message = _tracked_send_chat_message
 
@@ -338,21 +367,34 @@ def test_missing_public_key_no_error_dialog_and_no_send_attempt_on_real_interact
 
     QTest.keyClicks(alice_window.input_bar.message_input, "hello bob")
     QTest.keyClick(alice_window.input_bar.message_input, Qt.Key_Return)
-    QTest.mouseClick(alice_window.input_bar.send_button, Qt.LeftButton)
 
-    assert sent_signals == [], "the disabled composer still emitted message_sent"
     assert dialogs_shown == [], f"a blocking error dialog was shown: {dialogs_shown}"
-    assert send_attempts == [], "an encrypted send was attempted with no public key"
-    assert alice_window.messages.count() == messages_before
+    assert send_attempts == ["hello bob"], (
+        "typing and pressing Enter with no public key available did not "
+        "reach send_chat_message()"
+    )
+    assert alice_window.messages.count() > messages_before, (
+        "no message bubble was added for the real interaction"
+    )
+
+    conversation_id = alice.current_conversation_id
+    assert alice.key_manager.has_key(conversation_id), (
+        "no session key was generated locally for the new conversation"
+    )
+    # Still no public key -- the key came from os.urandom(32), not
+    # from any Kyber/RSA operation that would have required one.
+    assert alice.key_manager.get_public_key(bob_payload["username"]) is None
 
 
 # ----------------------------------------------------------------------
-# C -- key arrives after the conversation is already open
+# C -- composer stays usable whether the key arrives before or after
+# the first send, and the first-contact message still reaches the
+# recipient once they connect (BUG -- Offline First Contact)
 # ----------------------------------------------------------------------
 
 
-def test_public_key_arriving_while_open_enables_the_composer_automatically(
-    connect, accounts
+def test_composer_stays_enabled_and_message_still_arrives_once_recipient_connects(
+    connect, accounts, tmp_path
 ):
     alice_payload = accounts("alice_")
     bob_payload = accounts("bob_")
@@ -364,32 +406,90 @@ def test_public_key_arriving_while_open_enables_the_composer_automatically(
     alice_window.show()
 
     alice_window.open_conversation(_direct_summary(bob_payload["username"]))
-    assert alice_window.input_bar.message_input.isEnabled() is False
+    assert alice_window.input_bar.message_input.isEnabled() is True
 
-    bob = connect(bob_payload)  # triggers server-side distribute_public_keys()
-
-    assert _wait_for(lambda: _composer_enabled(alice_window)), (
-        "composer never auto-enabled once the recipient's key arrived -- "
-        "the user would have had to close/reopen the conversation"
-    )
-
-    # And it is now genuinely usable, not just visually enabled.
+    # Sent while bob is genuinely offline: locally encrypted/persisted,
+    # delivery of the wrapping key deferred to recovery.
     alice_window.send_message("now it works")
 
-    assert _wait_for(
-        lambda: any(
-            summary.latest_message and summary.latest_message.text == "now it works"
-            for summary in bob.conversation_store.get_all()
-        )
+    assert _composer_enabled(alice_window) is True
+
+    conversation_id = alice.current_conversation_id
+
+    # Bob's own Kyber identity keypair exists the instant his
+    # ClientSession is constructed (KeyManager.__init__() sets
+    # public_key eagerly) -- independent of any network activity -- so
+    # alice can explicitly verify his fingerprint BEFORE he ever
+    # connects. This matters here specifically: the moment bob comes
+    # online, the server-triggered direct-key-redelivery flow (Server-
+    # Untrusted Identity Verification, Stage 3 gates it exactly like
+    # establish_session_key() -- see handle_direct_key_redelivery_
+    # required()) fires immediately and only once, with no retry.
+    # Verifying only after connect(bob_payload) returns would race that
+    # one-shot delivery instead of reliably preceding it, so bob's
+    # session is built here (mirroring the `connect` fixture's own
+    # steps) rather than via that fixture, with verification inserted
+    # in between construction and going online.
+    bob = ClientSession()
+    bob.user_id = bob_payload["user_id"]
+    bob.access_token = _token(bob_payload)
+
+    alice.key_store = SecureKeyStore(
+        alice_payload["user_id"], storage_dir=tmp_path / "keystore"
+    )
+    alice.key_store.unlock(alice_payload["password"])
+    alice.key_store.verify_peer_fingerprint(
+        bob_payload["username"],
+        fingerprint_combined_identity(
+            bob.key_manager.public_key, bob.key_manager.ml_dsa.export_public_key()
+        ),
+    )
+    # Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    # bob is also the RECEIVER of the redelivered group_key_
+    # distribution packet his own reconnect below triggers, which now
+    # separately requires bob to have alice already VERIFIED too --
+    # set up here, before he ever connects, for the same one-shot-no-
+    # retry race-avoidance reason as alice's own verify above.
+    bob.key_store = SecureKeyStore(
+        bob_payload["user_id"], storage_dir=tmp_path / "keystore-bob"
+    )
+    bob.key_store.unlock(bob_payload["password"])
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"],
+        fingerprint_combined_identity(
+            alice.key_manager.public_key, alice.key_manager.ml_dsa.export_public_key()
+        ),
     )
 
+    bob.connect()  # triggers recovery, not live key exchange
+    bob.login(bob_payload["username"])
+    bob.send_public_key()
+    bob.start_receiver()
+
+    try:
+        assert _wait_for(
+            lambda: bob.key_manager.has_key(conversation_id)
+        ), "bob never recovered the key for the first-contact conversation"
+
+        bob.set_current_chat(_direct_summary(alice_payload["username"]))
+        history = bob.load_conversation_history(
+            alice_payload["username"], is_group=False
+        )
+        texts = [row["text"] for row in history if not row["is_own"]]
+
+        assert "now it works" in texts, (
+            f"first-contact message never decrypted for bob: {texts}"
+        )
+    finally:
+        bob.disconnect()
+
 
 # ----------------------------------------------------------------------
-# D -- a different user's key must not enable this conversation
+# D -- a different user's key must never be used for this conversation
 # ----------------------------------------------------------------------
 
 
-def test_a_different_users_key_does_not_enable_the_open_conversation(
+def test_a_different_users_key_is_never_used_for_this_conversation(
     connect, accounts
 ):
     alice_payload = accounts("alice_")
@@ -403,7 +503,7 @@ def test_a_different_users_key_does_not_enable_the_open_conversation(
     alice_window.show()
 
     alice_window.open_conversation(_direct_summary(bob_payload["username"]))
-    assert alice_window.input_bar.message_input.isEnabled() is False
+    assert alice_window.input_bar.message_input.isEnabled() is True
 
     connect(carol_payload)  # carol comes online -> alice receives CAROL's key
 
@@ -411,31 +511,46 @@ def test_a_different_users_key_does_not_enable_the_open_conversation(
         lambda: alice.key_manager.get_public_key(carol_payload["username"]) is not None
     ), "test setup failed: alice never received carol's key at all"
 
-    # Give the (wrongly-firing) case a real chance to happen before
-    # asserting it didn't.
-    _wait_for(lambda: _composer_enabled(alice_window), attempts=20)
+    alice_window.send_message("only for bob")
 
-    assert alice_window.input_bar.message_input.isEnabled() is False, (
-        "a different user's key incorrectly enabled this conversation"
-    )
+    conversation_id = alice.current_conversation_id
+    assert _wait_for(lambda: alice.key_manager.has_key(conversation_id))
+
+    bob_session_key = alice.key_manager.get_key(conversation_id)
+
+    assert bob_session_key is not None
+    # The conversation's key came from local generation, never from
+    # wrapping/using carol's public key for anything.
+    assert alice.key_manager.get_public_key(bob_payload["username"]) is None
 
 
 # ----------------------------------------------------------------------
-# E -- security: no message is ever sent without a verified key
+# E -- security: sending with no public key uses only a locally
+# generated key, and no key material is ever transmitted for it
 # ----------------------------------------------------------------------
 
 
-def test_no_plaintext_or_substitute_key_send_path_exists(connect, accounts):
-    """Beyond "the button is disabled": even calling ChatWindow.
-    send_message() directly (bypassing the widget state entirely, as
-    if some other code path reached it) must not reach the network --
-    the defense-in-depth guard inside send_message() itself, not just
-    the composer's enabled state."""
+def test_no_key_material_is_transmitted_when_recipient_key_is_unavailable(
+    connect, accounts, monkeypatch
+):
+    """Sending now succeeds with no public key available -- but it must
+    still never fabricate/substitute a key, and no packet carrying key
+    material (session_key or group_key_distribution) may be put on the
+    wire, since there is nothing valid to wrap it for yet."""
 
     alice_payload = accounts("alice_")
     bob_payload = accounts("bob_")
 
     alice = connect(alice_payload)
+
+    sent_packets = []
+    real_send_message = client_session_module.send_message
+
+    def recording_send_message(sock, packet):
+        sent_packets.append(packet)
+        return real_send_message(sock, packet)
+
+    monkeypatch.setattr(client_session_module, "send_message", recording_send_message)
 
     alice_window = ChatWindow(alice)
     _KEEP_ALIVE.append(alice_window)
@@ -444,26 +559,21 @@ def test_no_plaintext_or_substitute_key_send_path_exists(connect, accounts):
     alice_window.open_conversation(_direct_summary(bob_payload["username"]))
     assert alice.key_manager.get_public_key(bob_payload["username"]) is None
 
-    send_attempts = []
-    original_send_chat_message = alice.send_chat_message
-
-    def _tracked_send_chat_message(message):
-        send_attempts.append(message)
-        return original_send_chat_message(message)
-
-    alice.send_chat_message = _tracked_send_chat_message
-
     dialogs_shown = []
     alice_window.show_error = lambda message: dialogs_shown.append(message)
 
-    # Direct method call -- deliberately bypassing the disabled widget.
-    alice_window.send_message("this must never leave the machine")
+    alice_window.send_message("this must never leave the machine wrapped for anyone")
 
-    assert send_attempts == [], (
-        "send_message() reached ClientSession.send_chat_message() with no "
-        "verified public key"
-    )
     assert dialogs_shown == []
     assert alice.key_manager.get_public_key(bob_payload["username"]) is None, (
-        "no key may be created or substituted as a side effect"
+        "no public key may be fabricated or substituted as a side effect"
+    )
+
+    key_carrying_packets = [
+        p for p in sent_packets
+        if p.get("operation") == "session_key" or p.get("type") == "group_key_distribution"
+    ]
+    assert key_carrying_packets == [], (
+        f"key material was transmitted with no recipient key available: "
+        f"{key_carrying_packets}"
     )

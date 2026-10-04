@@ -13,7 +13,7 @@ import socket
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -30,13 +30,28 @@ from config import (
 )
 from crypto.aes import AESCipher
 from crypto.identity_protocol import sign_identity_payload, verify_identity_payload
+from crypto.device_protocol import (
+    canonical_device_authorization_payload,
+    canonical_device_enrollment_payload,
+    canonical_device_key_sync_payload,
+    canonical_device_revocation_payload,
+    canonical_device_session_binding_payload,
+    sign_device_payload,
+    verify_device_payload,
+)
 from crypto.group_key_protocol import sign_group_key_payload, verify_group_key_payload
 from crypto.session_key_protocol import (
     sign_rsa_session_key_payload,
     verify_rsa_session_key_payload,
 )
 from domain.security_rejection_reason import SecurityRejectionReason
-from crypto.message_protocol import sign_message_payload, verify_message_payload
+from crypto.message_protocol import (
+    EDIT_PAYLOAD_PURPOSE,
+    MESSAGE_PAYLOAD_PURPOSE,
+    REACTION_PAYLOAD_PURPOSE,
+    sign_message_payload,
+    verify_message_payload,
+)
 from crypto.key_manager import (
     KeyManager,
     fingerprint_combined_identity,
@@ -58,6 +73,7 @@ from domain.payload_type import (
 )
 from logger_config import setup_logger
 from payload.file_adapter import FilePayloadAdapter
+from payload.reaction_adapter import ReactionPayloadAdapter
 from payload.text_adapter import TextPayloadAdapter
 from security.phone_number import is_valid_phone_number
 from security.tls import build_client_context
@@ -65,7 +81,15 @@ from utils.network import receive_message, send_message
 from utils.protocol import (
     create_auth_packet,
     create_blob_download_request_packet,
+    create_block_user_request_packet,
+    create_blocked_users_list_request_packet,
     create_conversation_list_request_packet,
+    create_device_authorize_packet,
+    create_device_enroll_request_packet,
+    create_device_key_sync_packet,
+    create_device_list_request_packet,
+    create_device_revoke_packet,
+    create_device_session_bind_packet,
     create_direct_conversation_request_packet,
     create_direct_key_recovery_request_packet,
     create_epoch_reservation_request_packet,
@@ -74,16 +98,36 @@ from utils.protocol import (
     create_group_key_distribution_packet,
     create_group_key_rotation_complete_packet,
     create_group_leave_packet,
+    create_group_remove_member_packet,
+    create_inbox_list_request_packet,
+    create_inbox_response_packet,
+    create_bio_request_packet,
+    create_change_bio_request_packet,
     create_login_request_packet,
     create_logout_request_packet,
+    create_message_delete_for_everyone_packet,
+    create_message_delete_for_me_packet,
+    create_message_edit_packet,
     create_message_history_request_packet,
+    create_message_pin_packet,
+    create_message_unpin_packet,
+    create_last_seen_request_packet,
+    create_change_password_request_packet,
+    create_change_username_request_packet,
     create_payload_packet,
+    create_reaction_add_packet,
+    create_reaction_remove_packet,
+    create_profile_picture_request_packet,
+    create_profile_picture_upload_request_packet,
     create_public_key_packet,
     create_read_receipt_packet,
     create_register_request_packet,
     create_session_key_packet,
+    create_unblock_user_request_packet,
+    create_typing_indicator_packet,
     create_user_lookup_by_phone_request_packet,
     create_user_lookup_request_packet,
+    create_verification_request_packet,
 )
 from utils.request_registry import PendingRequestRegistry, RequestTimeoutError
 
@@ -193,6 +237,69 @@ class ClientSession(QObject):
     # it just sees the correct status next time it opens/reloads.
     read_receipt_updated = Signal(str, str)
 
+    # Phase 19.23 -- Issue 3 (real DELIVERED signal): conversation_id,
+    # receiver username. server/client_handler.py has sent this live
+    # "message_delivered" packet since Phase 19.14; this client simply
+    # never had a signal/handler consuming it until now (mirrors
+    # read_receipt_updated's identical "live hint only, history is
+    # authoritative" contract -- see handle_message_delivered()).
+    message_delivered_updated = Signal(str, str)
+
+    # Phase 19.24 (continued) -- Message Lifecycle Events UI. A live-
+    # sent bubble is tracked under a "live-N" placeholder id until this
+    # client learns the real, server-assigned one -- see gui/message_
+    # widget.py::MessageWidget._add_bubble()'s own docstring. message_
+    # delivered/message_queued are the FIRST packets that ever tell
+    # the sender what that real id is (a fire-and-forget "chat" send
+    # gets no synchronous ack carrying it). (conversation_id,
+    # message_id) -- emitted from BOTH handle_message_delivered() and
+    # handle_message_queued(), since either is the sender's first
+    # chance to learn the id, whichever happens to arrive.
+    own_message_id_resolved = Signal(str, str)
+
+    # Phase 19.24 -- Message Lifecycle Events. Every signal below
+    # carries only ALREADY-DECRYPTED content (edited text, reaction
+    # string), exactly like message_received/payload_message_received
+    # already do -- the GUI never touches ciphertext.
+    #
+    # (conversation_id, message_id, new_text, editor, edited_at, edit_version)
+    message_edited_received = Signal(str, str, str, str, str, int)
+    # (conversation_id, message_id, deleted_by, deleted_at)
+    message_deleted_received = Signal(str, str, str, str)
+    # (conversation_id, message_id, actor, action, reaction_or_empty)
+    reaction_updated_received = Signal(str, str, str, str, str)
+
+    # Phase 19.24 -- Pinned Messages. No decrypted content to carry --
+    # unlike reaction_updated_received above, pin/unpin has no
+    # ciphertext of its own; see database/models/message.py::
+    # pinned_at's own trust-model docstring.
+    # (conversation_id, message_id, pinned_by, pinned_at)
+    message_pinned_received = Signal(str, str, str, str)
+    # (conversation_id, message_id, unpinned_by)
+    message_unpinned_received = Signal(str, str, str)
+
+    # Phase 19.24 (continued) -- purely additive (see message_received's
+    # own "Qt signals are fixed-type" note just above -- widening it to
+    # also carry message_id would break every existing 3-arg connection
+    # across desktop/mobile/tests). Emitted immediately after message_
+    # received/payload_message_received, in the same call, for a "chat"
+    # packet the server already stamped with its real, persisted
+    # message_id (server/client_handler.py's relay branch sets
+    # packet["message_id"] = str(message.id) before ever sending it) --
+    # this is what lets a RECEIVED bubble's Reply/React/Delete-for-me/
+    # Forward context-menu actions become available the instant the
+    # message arrives, not only after the conversation is reopened and
+    # rebuilt from history (which already carries message_id). (identity_
+    # key, message_id).
+    message_id_received = Signal(str, str)
+
+    # Phase 19.24 -- Typing Indicator. Purely a live, ephemeral hint --
+    # never persisted, never replayed via history. (conversation_id,
+    # username, is_typing). Never emitted for this session's own typing
+    # (server/client_handler.py::handle_typing_indicator() excludes the
+    # actor's own socket from the relay).
+    typing_indicator_received = Signal(str, str, bool)
+
     # BUG -- Public-Key Availability: another client's public key was
     # just received and cached (see handle_public_key()) -- username.
     # Purely a live-update hint for a composer that might currently be
@@ -229,6 +336,17 @@ class ClientSession(QObject):
     # material, or any other private value -- see
     # _report_security_rejection()'s own docstring.
     security_rejection = Signal(str, str, str)
+
+    # Phase 19.13 -- Inbox: fires whenever this client's inbox state
+    # changed -- a brand-new notification arrived (handle_inbox_
+    # notification()) or one of THIS user's own earlier requests was
+    # just approved/denied (handle_inbox_response_result()). Arg: the
+    # single notification dict (see create_inbox_list_result_packet()'s
+    # docstring for its shape) -- the GUI's Inbox screen re-fetches
+    # the full list via load_inbox() on this signal rather than trying
+    # to patch one row in place, exactly like every other "something
+    # changed, go reload" signal in this class.
+    inbox_updated = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -278,6 +396,15 @@ class ClientSession(QObject):
         # ---------------------------------
 
         self.online_users = []
+
+        # ---------------------------------
+        # Block User (Phase 19.24) -- local cache of usernames THIS
+        # account has blocked, refreshed once at startup (see get_
+        # blocked_users()'s own docstring) and updated optimistically
+        # by block_user()/unblock_user() themselves.
+        # ---------------------------------
+
+        self.blocked_usernames = set()
 
         # ---------------------------------
         # Unread Message Counts
@@ -333,6 +460,14 @@ class ClientSession(QObject):
             PayloadType.TEXT: TextPayloadAdapter(),
             PayloadType.FILE: FilePayloadAdapter(PayloadType.FILE),
             PayloadType.IMAGE: FilePayloadAdapter(PayloadType.IMAGE),
+            # Phase 19.24 -- Message Lifecycle Events.
+            PayloadType.REACTION: ReactionPayloadAdapter(),
+            # Phase 19.24 -- Voice/Video Messages: the SAME generic
+            # raw-bytes adapter FILE/IMAGE already use -- see domain/
+            # payload_type.py's own module docstring for why voice/
+            # video need no adapter of their own.
+            PayloadType.VOICE: FilePayloadAdapter(PayloadType.VOICE),
+            PayloadType.VIDEO: FilePayloadAdapter(PayloadType.VIDEO),
         }
 
         # ---------------------------------
@@ -361,6 +496,12 @@ class ClientSession(QObject):
         # ---------------------------------
 
         self.key_manager = KeyManager()
+
+        # Multi-Device Identity (Phase 16) -- this device's own
+        # account-management identity, lazily generated by
+        # enroll_device() -- see that method's own docstring for why
+        # this is session-local, not yet persisted.
+        self.device_id = None
 
         # BUG 1 -- local encrypted key store, opened at login.
         # None until unlocked (or if unlocking failed); key_store_error
@@ -434,6 +575,63 @@ class ClientSession(QObject):
         # changed_raw_keys) -- see _lock_key_store().
         self._observed_peer_signing_public_keys = {}
         self._pending_key_changed_signing_raw_keys = {}
+
+        # {username: device_id} -- records the most recent device_id a
+        # signed identity-announcement for this username carried (see
+        # _handle_signed_public_key()'s "device_id (Phase 16D)" note).
+        # Every enrolled mobile device includes one on every
+        # announcement, which means _record_peer_identity_observation()
+        # only ever populates the DEVICE-SCOPED slot for such a peer,
+        # never the plain account-level one -- but every ordinary
+        # trust-consuming call site (the GUI's Verify Identity flow,
+        # the group-key/session-key VERIFIED gates) looks the peer up
+        # with device_id=None (the account-level slot), so it would
+        # find nothing there, forever. _effective_peer_identity_key()
+        # uses this purely-in-memory redirect so those callers land on
+        # the one slot that was actually populated, without changing
+        # what gets written or how often (no new store/dict writes on
+        # the receive path -- this line is the only addition there).
+        # Same lifetime as _observed_peer_raw_public_keys above: not
+        # reset on lock.
+        self._device_scoped_identity_keys = {}
+
+        # {sender_username: [(conversation_id, epoch), ...]} -- a key
+        # distribution this client received and rejected purely
+        # because ``sender`` was not yet VERIFIED (see handle_group_
+        # key_distribution()/handle_session_key()'s "if not self.
+        # _peer_key_is_verified(sender)" branches). The sender is never
+        # told a redelivery attempt failed (SECURITY: rejections are
+        # never observable to the sender, by design -- see
+        # _report_security_rejection()), so once THIS side later
+        # verifies them there is otherwise nothing to prompt a retry:
+        # the sender believes delivery already succeeded, and the
+        # server has no reason to ask again on its own. confirm_peer_
+        # verification()/confirm_combined_peer_verification() drain
+        # this for the peer they just verified and re-request each
+        # pending (conversation_id, epoch) -- the exact same request
+        # handle_direct_key_recovery_available() already sends on
+        # reconnect, just re-triggered by verification instead of by a
+        # fresh connection. Makes "verify late, on either side, in
+        # either order" work without requiring a manual reconnect.
+        # Session-local by nature (nothing to redeliver survives a
+        # restart that a normal reconnect wouldn't already re-announce
+        # anyway) -- not reset on lock is irrelevant since login()
+        # rebuilds a fresh ClientSession object.
+        self._pending_key_requests_awaiting_verification = {}
+
+        # {recipient_username: [(conversation_id, epoch), ...]} -- the
+        # OTHER half of the same "verify late, in either order" gap:
+        # handle_direct_key_redelivery_required() silently declines to
+        # redeliver a key to ``recipient`` when THIS client has not
+        # verified THEM yet (its own "SECURITY: refusing to redeliver"
+        # branch) -- silently, by design, since there is no requester-
+        # visible failure to report for a background, server-triggered
+        # handler. Recorded here so that once this client verifies
+        # ``recipient``, confirm_peer_verification()/confirm_combined_
+        # peer_verification() can retry the exact same redelivery
+        # instead of leaving it stuck until the recipient's next
+        # reconnect re-announces it.
+        self._declined_redeliveries_awaiting_verification = {}
 
         # ---------------------------------
         # Legacy Callbacks
@@ -976,6 +1174,153 @@ class ClientSession(QObject):
             errors=response.get("errors"),
         )
 
+    def change_username(self, new_username):
+        """
+        Phase 19.18 -- L-5/Desktop-parity closure: mirrors
+        MobileClientSession.change_username() exactly, same
+        already-existing, already-tested server-side handler
+        (AuthenticationService.change_username(), unchanged).
+        """
+
+        response = self.send_request(create_change_username_request_packet(new_username))
+
+        if response.get("success"):
+            self.username = new_username
+
+        return response
+
+    def change_password(self, current_password, new_password, confirm_password):
+        """Mirrors MobileClientSession.change_password() exactly."""
+
+        return self.send_request(create_change_password_request_packet(
+            current_password=current_password, new_password=new_password, confirm_password=confirm_password,
+        ))
+
+    # ------------------------------------------------------------------
+    # Phase 19.24 -- Block User. Server-side and persisted (database/
+    # models/blocked_user.py) -- real enforcement across DMs,
+    # verification, presence, typing, group creation/adding, and
+    # search (server/client_handler.py's own enforcement points), not
+    # a local-only preference like Mute/Archive. Mirrors
+    # MobileClientSession's identical methods exactly.
+    # ------------------------------------------------------------------
+
+    def block_user(self, target_username):
+        response = self.send_request(create_block_user_request_packet(target_username))
+        if response.get("success"):
+            self.blocked_usernames.add(target_username)
+        return response
+
+    def unblock_user(self, target_username):
+        response = self.send_request(create_unblock_user_request_packet(target_username))
+        if response.get("success"):
+            self.blocked_usernames.discard(target_username)
+        return response
+
+    def get_blocked_users(self):
+        """Returns the list of usernames this account has blocked, and
+        refreshes self.blocked_usernames (the local cache is_user_
+        blocked() reads -- a network round trip on every sidebar
+        render would be wasteful, so this is called once at startup
+        and updated optimistically by block_user()/unblock_user()
+        themselves; a block made from a SECOND device is not reflected
+        here until the next login, the same documented limitation
+        change_username_request's own docstring already accepts for
+        other clients' stale local state)."""
+
+        response = self.send_request(create_blocked_users_list_request_packet())
+        usernames = response.get("usernames") or []
+        self.blocked_usernames = set(usernames)
+        return usernames
+
+    def is_user_blocked(self, username):
+        return username in self.blocked_usernames
+
+    def upload_profile_picture(self, image_bytes, content_type="image/png"):
+        """
+        Upload/replace this account's profile picture (Phase 19.17C --
+        mirrors MobileClientSession.upload_profile_picture() exactly;
+        Mobile already had a full, working client for this feature,
+        Desktop had none, despite the backend already fully supporting
+        it). Deliberately NOT end-to-end encrypted -- a profile
+        picture is meant to be visible to any other user who looks
+        this account up, unlike message attachments -- still travels
+        only over this connection's TLS channel. Runs on the already-
+        authenticated, already-connected session via send_request(),
+        same as every other post-login request.
+        """
+
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+
+        return self.send_request(create_profile_picture_upload_request_packet(
+            image_base64=image_base64, content_type=content_type,
+        ))
+
+    def fetch_profile_picture(self, username):
+        """
+        Returns the raw image bytes for ``username``'s current profile
+        picture, or None if they have none set (see server/
+        client_handler.py::handle_profile_picture_request()'s own
+        docstring on why "not found" and "no picture set" are
+        deliberately indistinguishable here). Mirrors
+        MobileClientSession.fetch_profile_picture() exactly.
+        """
+
+        response = self.send_request(create_profile_picture_request_packet(username))
+
+        if not response.get("found"):
+            return None
+
+        try:
+            return base64.b64decode(response["image_base64"], validate=True)
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    def change_bio(self, bio):
+        """
+        Phase 19.22 -- Settings: set/replace this account's own bio.
+        Mirrors change_username() exactly; the User.bio column has
+        existed since the initial migration but had no client method
+        at all until now.
+        """
+
+        return self.send_request(create_change_bio_request_packet(bio))
+
+    def fetch_bio(self, username):
+        """
+        Returns ``username``'s current bio, or "" if they have none
+        set or the account does not exist (Phase 19.22 -- mirrors
+        fetch_profile_picture()'s "not found" and "no bio set" being
+        deliberately indistinguishable, same account-enumeration
+        guard).
+        """
+
+        response = self.send_request(create_bio_request_packet(username))
+
+        if not response.get("found"):
+            return ""
+
+        return response.get("bio") or ""
+
+    def fetch_last_seen(self, username):
+        """
+        Phase 19.24 -- Presence/Last Seen: returns ``username``'s last-
+        seen timestamp as a naive UTC datetime, or None -- covering
+        "blocked in either direction", "account not found", and "no
+        last-seen information yet" alike (server/client_handler.py::
+        handle_last_seen_request()'s own docstring for why those three
+        are deliberately indistinguishable to this account). Only ever
+        meaningful to call for a peer this account's own online_users
+        already reports as offline.
+        """
+
+        response = self.send_request(create_last_seen_request_packet(username))
+
+        if not response.get("found") or not response.get("last_seen_at"):
+            return None
+
+        return self._parse_incoming_timestamp(response["last_seen_at"])
+
     def logout(self):
         """
         Ask the server to revoke this session (D2 -- Server-Side API /
@@ -1054,6 +1399,7 @@ class ClientSession(QObject):
             public_key=kem_public_key_wire,
             signing_public_key=base64.b64encode(signing_public_key).decode("ascii"),
             identity_signature=base64.b64encode(signature).decode("ascii"),
+            device_id=self.device_id,
         )
 
         send_message(
@@ -1064,6 +1410,351 @@ class ClientSession(QObject):
         self.logger.info(
             f"{algorithm} public key sent to server (ML-DSA signed)."
         )
+
+    # ==========================================================
+    # Multi-Device Identity (Phase 16)
+    # ==========================================================
+    #
+    # This device's own account-management identity: a self-generated,
+    # session-local device_id (docs/architecture/multi_device_
+    # identity.md's own "Known limitations" -- NOT yet persisted
+    # across restarts the way the KEM/ML-DSA keypair themselves already
+    # are via SecureKeyStore; a restart re-enrolls under a fresh
+    # device_id today). This does not weaken any of enrollment/
+    # authorization/revocation's actual security properties -- it only
+    # means today's device_id is not yet stable across app restarts.
+
+    def enroll_device(self, device_name=None, platform=None):
+        """
+        Self-sign and send this device's own enrollment request
+        (crypto/device_protocol.py::canonical_device_enrollment_
+        payload()), signed with THIS device's own ML-DSA private key
+        -- proves possession of the advertised keys, not authorization
+        by itself (server/device_handler.py::handle_device_enroll_
+        request() decides PENDING vs. bootstrap-AUTHORIZED).
+
+        Phase 16B -- Multi-Device Identity persistence: device_id is
+        read from the local, encrypted SecureKeyStore
+        (get_device_id()) if this installation already enrolled once
+        before (across a restart -- the exact same file the KEM/ML-DSA
+        keypair themselves are already persisted in, not a second
+        store); generated once and persisted (save_device_id()) only
+        the very first time. This is what makes a second call to this
+        method, from a fresh ClientSession representing the SAME
+        installation, resolve to the SAME device_id -- and therefore
+        the SAME server-side row -- instead of silently minting a new
+        device on every restart.
+
+        Requires start_receiver() to already be running (send_request()
+        does). Returns the device_enroll_result packet.
+        """
+
+        newly_resolved_device_id = self.device_id is None
+
+        if self.device_id is None:
+            persisted_device_id = self.key_store.get_device_id() if self.key_store else None
+
+            if persisted_device_id is not None:
+                self.device_id = persisted_device_id
+            else:
+                self.device_id = str(uuid.uuid4())
+                if self.key_store is not None:
+                    self.key_store.save_device_id(self.device_id)
+
+        if newly_resolved_device_id and self.client_socket is not None:
+            # Phase 16D -- Device-Aware Peer Identity: send_public_key()
+            # is normally called once, automatically, right after login
+            # -- BEFORE this method has ever resolved self.device_id
+            # (enroll_device() is an explicit, later, app-level action).
+            # Without this, every already-connected peer would have
+            # cached this identity under the plain-username slot only
+            # (device_id was still None at broadcast time), so any
+            # chat message this device sends AFTER enrolling -- which
+            # now carries sender_device_id -- would fail to resolve a
+            # trusted signing key under the (username, device_id)
+            # composite slot and be rejected. Re-broadcasting here,
+            # exactly once, the moment self.device_id first becomes
+            # known, keeps the two in sync. Harmless if a peer has
+            # already VERIFIED the plain-username slot from the
+            # earlier broadcast: this is a NEW, distinct (username,
+            # device_id) identity slot to them (see _peer_identity_
+            # key()), recorded as its own fresh UNVERIFIED observation
+            # -- never a KEY_CHANGED against the existing VERIFIED
+            # plain-username record, which is untouched.
+            self.send_public_key()
+
+        kem_public_key_wire = self.key_manager.public_key.decode("utf-8")
+        ml_dsa_public_key = self.key_manager.ml_dsa.export_public_key()
+
+        payload = canonical_device_enrollment_payload(
+            self.username, self.device_id, kem_public_key_wire,
+            ml_dsa_public_key, device_name, platform,
+        )
+        signature = sign_device_payload(self.key_manager.ml_dsa, payload)
+
+        packet = create_device_enroll_request_packet(
+            device_id=self.device_id,
+            device_name=device_name,
+            platform=platform,
+            kem_public_key=kem_public_key_wire,
+            ml_dsa_public_key=base64.b64encode(ml_dsa_public_key).decode("ascii"),
+            enrollment_signature=base64.b64encode(signature).decode("ascii"),
+        )
+
+        return self.send_request(packet)
+
+    def bind_device_session(self):
+        """
+        Prove to the server that THIS connection is genuinely operated
+        by the party holding the private ML-DSA key for this device
+        (Phase 16B -- Device Authentication Binding, Step 3), signing
+        crypto/device_protocol.py::canonical_device_session_binding_
+        payload() with this device's own ML-DSA private key. Requires
+        self.device_id to already be set (call enroll_device() first,
+        at least once ever, on this installation).
+
+        Once bound, server-side relay paths that opt into device-state
+        enforcement (server/client_handler.py::
+        handle_group_key_distribution(), currently -- see this phase's
+        own report for the exact list) will re-check this device's
+        live AUTHORIZED/REVOKED state on every subsequent packet on
+        this connection.
+        """
+
+        if self.device_id is None:
+            raise ValueError("No device_id -- call enroll_device() first.")
+
+        session_nonce = uuid.uuid4().hex
+
+        payload = canonical_device_session_binding_payload(
+            self.username, self.device_id, session_nonce,
+        )
+        signature = sign_device_payload(self.key_manager.ml_dsa, payload)
+
+        packet = create_device_session_bind_packet(
+            device_id=self.device_id,
+            session_nonce=session_nonce,
+            binding_signature=base64.b64encode(signature).decode("ascii"),
+        )
+
+        return self.send_request(packet)
+
+    def list_devices(self):
+        """Return this account's device_list_result packet's ``devices`` list."""
+
+        response = self.send_request(create_device_list_request_packet())
+        return response.get("devices", [])
+
+    def authorize_device(self, target_device_id, target_fingerprint):
+        """
+        Vouch for a PENDING device as this (already-AUTHORIZED)
+        device, signing crypto/device_protocol.py::
+        canonical_device_authorization_payload() with THIS device's
+        own ML-DSA private key. The caller is responsible for having
+        actually compared ``target_fingerprint`` against the target
+        device's displayed fingerprint out-of-band FIRST -- this
+        method performs no verification of its own; it only signs what
+        it is told to (mirrors ClientSession.confirm_combined_peer_
+        verification()'s identical division of responsibility between
+        human judgment and the signing call itself).
+        """
+
+        payload = canonical_device_authorization_payload(
+            self.username, target_device_id, target_fingerprint, self.device_id,
+        )
+        signature = sign_device_payload(self.key_manager.ml_dsa, payload)
+
+        packet = create_device_authorize_packet(
+            target_device_id=target_device_id,
+            target_fingerprint=target_fingerprint,
+            authorizer_device_id=self.device_id,
+            authorization_signature=base64.b64encode(signature).decode("ascii"),
+        )
+
+        return self.send_request(packet)
+
+    def revoke_device(self, target_device_id):
+        """Revoke a device (possibly this one) as this AUTHORIZED device."""
+
+        payload = canonical_device_revocation_payload(
+            self.username, target_device_id, self.device_id,
+        )
+        signature = sign_device_payload(self.key_manager.ml_dsa, payload)
+
+        packet = create_device_revoke_packet(
+            target_device_id=target_device_id,
+            revoker_device_id=self.device_id,
+            revocation_signature=base64.b64encode(signature).decode("ascii"),
+        )
+
+        return self.send_request(packet)
+
+    # ==========================================================
+    # Cross-Device Key Synchronization (Phase 16C)
+    # ==========================================================
+    #
+    # Device-peer trust is EXPLICITLY the same VERIFIED/UNVERIFIED/
+    # KEY_CHANGED machinery ordinary peer verification already uses
+    # (storage/secure_key_store.py), applied to a device_id string
+    # instead of a username -- reused, not reimplemented, and
+    # deliberately NOT automatic just because two devices share an
+    # account (Step 16 of this phase's own instructions). A human
+    # still has to compare the fingerprint (trivial in practice, since
+    # both devices belong to the same person) and explicitly confirm
+    # it, exactly like verifying a different person.
+
+    def observe_device_peer_identity(self, device_id, kem_public_key_wire, ml_dsa_public_key):
+        """Observe one of this account's OTHER devices (from
+        list_devices()'s own kem_public_key/ml_dsa_public_key fields)
+        as a device-peer -- UNVERIFIED until explicitly confirmed
+        (confirm_device_peer_verification()). Also registers the KEM
+        public key with KeyManager (add_public_key()) so wrap_key_
+        for_member()/encapsulation can target this device_id, exactly
+        like an ordinary peer's public key already is registered by
+        handle_public_key()."""
+
+        self.observe_peer_identity(device_id, kem_public_key_wire, ml_dsa_public_key)
+        self.key_manager.add_public_key(device_id, kem_public_key_wire)
+
+    def confirm_device_peer_verification(self, device_id, fingerprint):
+        self.confirm_combined_peer_verification(device_id, fingerprint)
+
+    def sync_conversation_key_to_device(self, target_device_id, conversation_id, package_type="direct"):
+        """
+        Wrap this client's own current key for ``conversation_id`` for
+        delivery to ``target_device_id`` (one of this SAME account's
+        other devices) and send it. Reuses KeyManager.
+        wrap_key_for_member() completely unchanged -- the identical
+        KEM-then-DEM (ML-KEM encapsulate + AES-256-GCM) composition
+        ordinary group-key distribution already uses; no new
+        cryptographic construction. Requires the target device to
+        already be device-peer VERIFIED (see class docstring above) --
+        raises PeerNotVerifiedError otherwise, mirroring establish_
+        session_key()'s identical guard for ordinary peers.
+        """
+
+        if not self._peer_key_is_verified(target_device_id):
+            raise PeerNotVerifiedError(
+                target_device_id, self.get_peer_verification_state(target_device_id)
+            )
+
+        epoch = self.key_manager.current_epoch(conversation_id)
+        key_bytes = self.key_manager.get_key(conversation_id, epoch=epoch)
+
+        if key_bytes is None:
+            raise ValueError(f"No key held for conversation {conversation_id} to synchronize.")
+
+        target_fingerprint = self.get_peer_fingerprint_for_verification(target_device_id)
+
+        encapsulation, wrapped_key = self.key_manager.wrap_key_for_member(target_device_id, key_bytes)
+
+        payload = canonical_device_key_sync_payload(
+            self.username, self.device_id, target_device_id, target_fingerprint,
+            conversation_id, epoch, package_type, encapsulation, wrapped_key,
+        )
+        signature = sign_device_payload(self.key_manager.ml_dsa, payload)
+
+        packet = create_device_key_sync_packet(
+            target_device_id=target_device_id,
+            target_fingerprint=target_fingerprint,
+            conversation_id=conversation_id,
+            epoch=epoch,
+            package_type=package_type,
+            encapsulation=encapsulation,
+            wrapped_key=wrapped_key,
+            sync_signature=base64.b64encode(signature).decode("ascii"),
+        )
+
+        return self.send_request(packet)
+
+    def handle_device_key_sync(self, packet):
+        """
+        Receive wrapped conversation/group key material from another
+        of THIS account's own devices. Mandatory order (identical
+        shape to handle_group_key_distribution()'s own, unmodified,
+        established ordering): resolve source device + require device-
+        peer VERIFIED -> resolve trusted signing key (from THIS
+        receiver's own local device-peer state, never from the packet)
+        -> verify signature (binding conversation_id/epoch/wrapped
+        material) -> THEN decapsulate/decrypt -> install. Any failure
+        returns before KeyManager.store_key() is ever reached, and is
+        routed through the existing _report_security_rejection()
+        exactly like every other key-establishment rejection in this
+        codebase -- no second, parallel rejection-reporting path.
+
+        Returns None on success, or the domain.security_rejection_
+        reason.SecurityRejectionReason that caused rejection --
+        matching handle_group_key_distribution()'s own contract.
+        """
+
+        source_device_id = packet.get("source_device_id")
+        conversation_id = packet.get("conversation_id")
+
+        if not source_device_id or not conversation_id:
+            self._report_security_rejection(
+                SecurityRejectionReason.MALFORMED_PACKET, source_device_id, conversation_id
+            )
+            return SecurityRejectionReason.MALFORMED_PACKET
+
+        if not self._peer_key_is_verified(source_device_id):
+            reason = self._sender_trust_rejection_reason(source_device_id)
+            self._report_security_rejection(reason, source_device_id, conversation_id)
+            return reason
+
+        signing_public_key = self._resolve_trusted_signing_key(source_device_id)
+        signature_b64 = packet.get("sync_signature")
+
+        if signature_b64 is None:
+            self._report_security_rejection(
+                SecurityRejectionReason.MISSING_SIGNATURE, source_device_id, conversation_id
+            )
+            return SecurityRejectionReason.MISSING_SIGNATURE
+
+        target_device_id = packet.get("target_device_id")
+        target_fingerprint = packet.get("target_fingerprint")
+        epoch = packet.get("epoch") or 1
+        package_type = packet.get("package_type")
+        encapsulation = packet.get("encapsulation")
+        wrapped_key = packet.get("wrapped_key")
+
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+
+            payload = canonical_device_key_sync_payload(
+                self.username, source_device_id, target_device_id, target_fingerprint,
+                conversation_id, epoch, package_type, encapsulation, wrapped_key,
+            )
+
+            verified = verify_device_payload(payload, signature, signing_public_key)
+        except (TypeError, ValueError):
+            self._report_security_rejection(
+                SecurityRejectionReason.MALFORMED_PACKET, source_device_id, conversation_id
+            )
+            return SecurityRejectionReason.MALFORMED_PACKET
+
+        if not verified:
+            self._report_security_rejection(
+                SecurityRejectionReason.INVALID_SIGNATURE, source_device_id, conversation_id
+            )
+            return SecurityRejectionReason.INVALID_SIGNATURE
+
+        # Only reached once verification has succeeded -- see this
+        # method's own docstring.
+        try:
+            key_bytes = self.key_manager.unwrap_received_key(encapsulation, wrapped_key)
+            self.key_manager.store_key(conversation_id, key_bytes, epoch=epoch)
+        except (ValueError, TypeError):
+            self._report_security_rejection(
+                SecurityRejectionReason.DECRYPTION_FAILURE, source_device_id, conversation_id
+            )
+            return SecurityRejectionReason.DECRYPTION_FAILURE
+
+        self.logger.info(
+            f"Synchronized conversation key for {conversation_id} (epoch {epoch}) "
+            f"from device {source_device_id}"
+        )
+
+        return None
 
     def start_receiver(self):
         """
@@ -1410,20 +2101,38 @@ class ClientSession(QObject):
 
         time.sleep(0.2)
 
-    def send_chat_message(self, message):
+    def send_chat_message(self, message, reply_to_message_id=None, client_message_id=None):
         """
         Encrypt and send a text message to the currently open
         conversation -- direct or group (Phase 4 -- Secure Group
         Messaging Foundation). A thin, TEXT-specific wrapper around
         _send_encrypted_payload() (Phase 8 -- File & Image Transfer):
         signature and behavior are unchanged from before Phase 8.
+
+        ``reply_to_message_id`` (Phase 19.24 -- Message Lifecycle
+        Events, Reply): optional, the real message_id (as returned by
+        history/live receipt) this send is a reply to. None for an
+        ordinary send -- every pre-existing caller is unaffected.
+
+        ``client_message_id`` (Phase 19.24 -- Message Retry
+        idempotency): pass the SAME value a previous, failed call to
+        this method returned to make a retry of the exact same content
+        idempotent -- see _send_encrypted_payload()'s own docstring.
+        None (the default) generates a fresh one, correct for a
+        brand-new send.
+
+        Returns the client_message_id actually used, so a caller that
+        might need to retry this exact send later (gui/chat_window.py::
+        send_message()'s failure path) can capture and re-supply it.
         """
 
-        self._send_encrypted_payload(
+        return self._send_encrypted_payload(
             PayloadType.TEXT,
             message,
             content_metadata=None,
             preview_text=message,
+            reply_to_message_id=reply_to_message_id,
+            client_message_id=client_message_id,
         )
 
     def send_attachment(self, file_path):
@@ -1482,7 +2191,10 @@ class ClientSession(QObject):
 
         return payload_type, data, content_metadata
 
-    def _send_encrypted_payload(self, payload_type, content, content_metadata, preview_text):
+    def _send_encrypted_payload(
+        self, payload_type, content, content_metadata, preview_text,
+        reply_to_message_id=None, client_message_id=None,
+    ):
         """
         Shared encrypt-and-send pipeline for every payload type (Phase
         8 -- File & Image Transfer): key lookup, epoch stamping, packet
@@ -1493,7 +2205,23 @@ class ClientSession(QObject):
         send_chat_message() used to have; send_chat_message() and
         send_attachment() are both thin callers now, so there is
         exactly one place this logic exists.
+
+        Phase 19.24 -- Message Retry idempotency: every send carries a
+        client_message_id -- a caller-supplied one (a retry, reusing
+        the value captured from the ORIGINAL attempt BEFORE it was
+        made, so it survives even if that attempt raised before ever
+        returning anything -- see gui/chat_window.py::send_message()'s
+        own comment) or, if none is given, a fresh one generated here
+        for an ordinary first send. Either way, persist_message() on
+        the server treats a second arrival of the SAME client_message_
+        id as the SAME message, never a duplicate -- see server/
+        client_handler.py::persist_message()'s own docstring. Returns
+        the id actually used so a caller that did NOT pre-generate one
+        (send_attachment() et al.) can still capture it if it wants
+        retry-safety for a later call.
         """
+
+        client_message_id = client_message_id or str(uuid.uuid4())
 
         if self.current_chat is None:
             raise ValueError(
@@ -1571,6 +2299,9 @@ class ClientSession(QObject):
                 conversation_id=self.current_chat,
                 epoch=epoch,
                 message_signature=base64.b64encode(message_signature).decode("ascii"),
+                sender_device_id=self.device_id,
+                reply_to_message_id=reply_to_message_id,
+                client_message_id=client_message_id,
             )
 
         else:
@@ -1582,6 +2313,9 @@ class ClientSession(QObject):
                 receiver=self.current_chat,
                 epoch=epoch,
                 message_signature=base64.b64encode(message_signature).decode("ascii"),
+                sender_device_id=self.device_id,
+                reply_to_message_id=reply_to_message_id,
+                client_message_id=client_message_id,
             )
 
         send_message(
@@ -1610,6 +2344,271 @@ class ClientSession(QObject):
             # by record_message() if an entry already exists.
             conversation_id=self.current_conversation_id,
         )
+
+        return client_message_id
+
+    # ==================================================================
+    # Phase 19.24 -- Message Lifecycle Events (edit/delete/reactions).
+    #
+    # Edit is scoped to PayloadType.TEXT messages only -- re-encrypting
+    # a FILE/IMAGE's binary content in place is out of scope for this
+    # phase (there is no UI to produce new binary content for an
+    # "edit"; the mandate's own examples are text-only). Reactions
+    # apply to any message kind.
+    # ==================================================================
+
+    def edit_message(self, conversation_id, message_id, new_text, expected_edit_version):
+        """
+        Re-encrypt ``message_id``'s content as ``new_text`` (Phase
+        19.24). Only the original sender can succeed -- enforced
+        server-side (server/client_handler.py::handle_message_edit()),
+        never merely by this client choosing not to offer the button;
+        a forged request from a non-sender is rejected there
+        regardless of what this method sends.
+
+        ``expected_edit_version``: this client's last-known edit_
+        version for the message (0 for never-edited) -- the caller
+        (GUI) is expected to pass back whatever it currently has
+        displayed, so a stale edit (based on an outdated view of the
+        message) is rejected server-side rather than silently
+        clobbering a newer one.
+
+        ``conversation_id`` is required explicitly (unlike a fresh
+        send, which addresses whatever self.current_chat is) --
+        editing/reacting to a message the user can already see does
+        not require that conversation to be the one currently open,
+        and this client already holds its key (it decrypted the
+        original message to display it), so no establish_session_key()
+        round trip is needed or attempted here.
+
+        Signed with EDIT_PAYLOAD_PURPOSE (continued Phase 19.24 --
+        receiver-side verification), addressed by the real
+        conversation_id alone (never receiver/None-conversation_id
+        direct-vs-group branching an ordinary send needs) -- a
+        deliberately simpler canonical shape than a fresh chat send,
+        since by the time a client is editing a message it already
+        knows exactly which conversation it belongs to.
+        """
+
+        session_key = self.key_manager.get_key(conversation_id)
+
+        if session_key is None:
+            raise RuntimeError(f"No encryption key for conversation {conversation_id}")
+
+        aes = AESCipher(session_key)
+
+        envelope = self._adapter_for(PayloadType.TEXT).encrypt(
+            new_text, aes, content_metadata=None
+        )
+
+        epoch = self.key_manager.current_epoch(conversation_id) or 1
+
+        message_signature = sign_message_payload(
+            self.key_manager.ml_dsa,
+            self.username,
+            None,
+            conversation_id,
+            envelope.payload_type,
+            envelope.ciphertext,
+            envelope.content_metadata,
+            epoch,
+            purpose=EDIT_PAYLOAD_PURPOSE,
+        )
+
+        send_message(
+            self.client_socket,
+            create_message_edit_packet(
+                message_id=message_id,
+                envelope=envelope,
+                epoch=epoch,
+                message_signature=base64.b64encode(message_signature).decode("ascii"),
+                expected_edit_version=expected_edit_version,
+            ),
+        )
+
+    def delete_message_for_me(self, message_id):
+        """
+        Hide ``message_id`` from this account's own view only, on
+        every one of this account's authorized devices (Phase 19.24).
+        Fire-and-forget, like send_chat_message() -- there is no
+        failure mode meaningful to surface synchronously beyond a
+        socket-level exception, which propagates to the caller exactly
+        like every other send_* method here.
+        """
+
+        send_message(
+            self.client_socket,
+            create_message_delete_for_me_packet(message_id=message_id),
+        )
+
+    def delete_message_for_everyone(self, message_id):
+        """
+        Request REAL, authorized global deletion of ``message_id``
+        (Phase 19.24). Only the original sender can succeed --
+        enforced server-side (server/client_handler.py::handle_
+        message_delete_for_everyone()), never merely by this client
+        choosing not to offer the button.
+        """
+
+        send_message(
+            self.client_socket,
+            create_message_delete_for_everyone_packet(message_id=message_id),
+        )
+
+    def add_reaction(self, conversation_id, message_id, reaction):
+        """
+        Set/replace this account's reaction on ``message_id`` (Phase
+        19.24). ``reaction`` is a short string (typically a single
+        emoji) -- E2E encrypted under the message's own conversation
+        key, exactly like a text message; the server never learns
+        which reaction was chosen (payload/reaction_adapter.py).
+
+        ``conversation_id`` is required explicitly -- see edit_
+        message()'s identical docstring note for why (reacting to a
+        message does not require that conversation to be the one
+        currently open).
+        """
+
+        session_key = self.key_manager.get_key(conversation_id)
+
+        if session_key is None:
+            raise RuntimeError(f"No encryption key for conversation {conversation_id}")
+
+        aes = AESCipher(session_key)
+
+        envelope = self._adapter_for(PayloadType.REACTION).encrypt(
+            reaction, aes, content_metadata=None
+        )
+
+        epoch = self.key_manager.current_epoch(conversation_id) or 1
+
+        # Continued Phase 19.24 -- receiver-side verification: signed
+        # exactly like edit_message(), with its own distinct purpose
+        # tag so an edit and a reaction (or an ordinary chat message)
+        # can never be confused for one another.
+        message_signature = sign_message_payload(
+            self.key_manager.ml_dsa,
+            self.username,
+            None,
+            conversation_id,
+            envelope.payload_type,
+            envelope.ciphertext,
+            envelope.content_metadata,
+            epoch,
+            purpose=REACTION_PAYLOAD_PURPOSE,
+        )
+
+        send_message(
+            self.client_socket,
+            create_reaction_add_packet(
+                message_id=message_id, envelope=envelope, epoch=epoch,
+                message_signature=base64.b64encode(message_signature).decode("ascii"),
+            ),
+        )
+
+    def remove_reaction(self, message_id):
+        """Remove this account's reaction from ``message_id``, if any
+        (Phase 19.24). Idempotent -- a no-op server-side if there was
+        nothing to remove."""
+
+        send_message(
+            self.client_socket,
+            create_reaction_remove_packet(message_id=message_id),
+        )
+
+    def pin_message(self, message_id):
+        """
+        Pin ``message_id`` for every member of its conversation (Phase
+        19.24 -- Pinned Messages). No content to encrypt -- see
+        database/models/message.py::pinned_at's own trust-model
+        docstring for why this needs no envelope/signature, unlike
+        add_reaction()/edit_message() just above.
+        """
+
+        send_message(
+            self.client_socket,
+            create_message_pin_packet(message_id=message_id),
+        )
+
+    def unpin_message(self, message_id):
+        """Unpin ``message_id``, if currently pinned (Phase 19.24).
+        Idempotent -- a no-op server-side if it was already unpinned."""
+
+        send_message(
+            self.client_socket,
+            create_message_unpin_packet(message_id=message_id),
+        )
+
+    def forward_message(self, target_chat, target_is_group, payload_type, content, content_metadata=None):
+        """
+        Forward already-decrypted local content to a DIFFERENT
+        recipient/conversation (Phase 19.24). Deliberately reuses the
+        NORMAL send pipeline end to end -- this method only swaps
+        self.current_chat/self.current_chat_is_group/self.current_
+        conversation_id to the forward TARGET first, exactly like
+        opening that conversation and composing fresh content into it,
+        restoring the caller's original open chat afterward regardless
+        of outcome.
+
+        This produces a genuinely NEW, independently encrypted message
+        under the TARGET conversation's own key -- never a reuse of
+        the original message's ciphertext (which was encrypted for a
+        different key/recipient entirely and is meaningless outside
+        that context). ``content_metadata`` carries {"forwarded": True}
+        forward, additively, alongside whatever the payload type's own
+        metadata already is (e.g. filename/mime_type for an
+        attachment) -- purely a client-side UI hint ("Forwarded"
+        label), never trusted for anything security-relevant.
+
+        BUG FIX (continued Phase 19.24): self.current_conversation_id
+        MUST also be swapped to the target's real conversation_id, not
+        merely self.current_chat/self.current_chat_is_group.
+        establish_session_key() (called by _send_encrypted_payload()
+        below for a direct target) addresses its "has a key already
+        been generated for this?"/"which conversation_id do I store
+        this new key under?" checks ENTIRELY via self.current_
+        conversation_id, never by re-deriving it from self.current_chat
+        -- left stale (still pointing at whatever conversation was
+        open before this call), a forward whose ORIGINAL conversation
+        already had an established key would silently reuse THAT
+        conversation's key for the target instead of generating (or
+        reusing) the TARGET's own, making the forwarded message
+        undecryptable by its actual recipient (or, worse, decryptable
+        under a key some other, unrelated conversation's members also
+        hold). A group target's conversation_id is already known
+        (target_chat itself, by the same convention ConversationSummary.
+        key uses); a direct target's is resolved via the same server
+        get-or-create request set_current_chat() itself would use.
+
+        Returns the client_message_id used, exactly like send_chat_
+        message()/send_attachment(), for retry-safety.
+        """
+
+        original_chat = self.current_chat
+        original_is_group = self.current_chat_is_group
+        original_conversation_id = self.current_conversation_id
+
+        try:
+            self.current_chat = target_chat
+            self.current_chat_is_group = target_is_group
+            self.current_conversation_id = (
+                target_chat if target_is_group
+                else self._resolve_direct_conversation_id(target_chat)
+            )
+
+            forward_metadata = dict(content_metadata or {})
+            forward_metadata["forwarded"] = True
+
+            return self._send_encrypted_payload(
+                payload_type,
+                content,
+                content_metadata=forward_metadata,
+                preview_text=content if payload_type == PayloadType.TEXT else None,
+            )
+        finally:
+            self.current_chat = original_chat
+            self.current_chat_is_group = original_is_group
+            self.current_conversation_id = original_conversation_id
 
     def _decrypt_history_message(self, conversation_id, ciphertext, epoch=1):
         """
@@ -1786,6 +2785,20 @@ class ClientSession(QObject):
             payload_type = entry.get("payload_type") or PayloadType.TEXT
             epoch = entry.get("epoch") or 1
 
+            # Phase 19.24 -- Message Lifecycle Events: a real delete-
+            # for-everyone has ALREADY nulled ciphertext/blob_ref/
+            # content_metadata/message_signature server-side (see
+            # handle_message_delete_for_everyone()) -- there is
+            # genuinely nothing left to verify or decrypt, and
+            # attempting either would misreport this row as merely
+            # "undecryptable" rather than deleted. Checked first, before
+            # any verify/decrypt/blob-fetch is even attempted.
+            is_deleted = bool(entry.get("deleted_at"))
+
+            if is_deleted:
+                text = ""
+                content = None
+
             # Message-Level ML-DSA Origin Authentication: verified
             # BEFORE any decryption is attempted, for own messages and
             # received ones alike -- a signature is exactly as required
@@ -1805,7 +2818,7 @@ class ClientSession(QObject):
             # fetched lazily, on demand, by _load_blob_history_content(),
             # which is where THAT ciphertext's signature is verified
             # instead (the exact bytes to verify do not exist here yet).
-            if payload_type in BLOB_STORAGE_PAYLOAD_TYPES:
+            elif payload_type in BLOB_STORAGE_PAYLOAD_TYPES:
                 text = None
                 content = self._load_blob_history_content(
                     self.current_conversation_id, entry, epoch
@@ -1823,6 +2836,42 @@ class ClientSession(QObject):
                 )
                 content = None
 
+            # Phase 19.24 -- Message Lifecycle Events: reactions are
+            # verified/decrypted the same way handle_reaction_updated()
+            # verifies/decrypts a LIVE one (_verify_lifecycle_event_
+            # signature()/_decrypt_lifecycle_event_content()) -- history
+            # recovery must apply the identical receiver-side trust
+            # check, not merely trust the server relayed the right
+            # ciphertext/reactor pairing. A reaction that fails
+            # verification is silently dropped from the rendered list
+            # (never shown, never fatal to the rest of history), exactly
+            # like an unverifiable edit/reaction is dropped live.
+            reactions = []
+
+            for reaction_entry in entry.get("reactions") or []:
+
+                reactor = reaction_entry.get("user") or ""
+                reaction_ciphertext = reaction_entry.get("ciphertext")
+
+                if not reactor or not reaction_ciphertext:
+                    continue
+
+                if not self._verify_lifecycle_event_signature(
+                    reactor, self.current_conversation_id, PayloadType.REACTION,
+                    reaction_ciphertext, None, reaction_entry.get("epoch"),
+                    reaction_entry.get("message_signature"), REACTION_PAYLOAD_PURPOSE,
+                    "reaction (history)",
+                ):
+                    continue
+
+                reactions.append({
+                    "user": reactor,
+                    "reaction": self._decrypt_lifecycle_event_content(
+                        self.current_conversation_id, PayloadType.REACTION,
+                        reaction_ciphertext, reaction_entry.get("epoch"),
+                    ),
+                })
+
             history.append({
                 "sender": entry.get("sender"),
                 "text": text,
@@ -1833,6 +2882,16 @@ class ClientSession(QObject):
                 "payload_type": payload_type,
                 "content": content,
                 "content_metadata": entry.get("content_metadata") or {},
+                "reply_to_message_id": entry.get("reply_to_message_id"),
+                "is_deleted": is_deleted,
+                "edit_version": int(entry.get("edit_version") or 0),
+                "reactions": reactions,
+                # Phase 19.24 -- Pinned Messages: recovered on every
+                # history load exactly like edit/delete/reaction state
+                # above (server/client_handler.py::handle_message_
+                # history_request()'s own identical comment).
+                "is_pinned": bool(entry.get("pinned_at")),
+                "pinned_by": entry.get("pinned_by"),
             })
 
         return history
@@ -1982,6 +3041,26 @@ class ClientSession(QObject):
             else None
         )
 
+        # Phase 19 manual acceptance defect fix: a real physical-device
+        # test found _UNDECRYPTABLE_PLACEHOLDER's internal diagnostic
+        # string leaking into the sidebar preview row, overlapping the
+        # unread indicator. _decrypt_history_message() is intentionally
+        # NOT changed -- gui/chat_window.py's open-conversation history
+        # rendering (the OTHER, legitimate caller, load_conversation_
+        # history() above) still shows that exact placeholder as a real
+        # message bubble for a genuinely undecryptable historical
+        # message, which is correct and must not change. Only THIS
+        # sidebar-preview call site substitutes None, which
+        # MessagePreview.render()'s "self.text or ''" already turns
+        # into an empty string -- gui/conversation_list_widget.py's
+        # existing "No messages yet" fallback only fires when
+        # summary.latest_message itself is None (a conversation with
+        # zero messages), so an undecryptable-but-real latest message
+        # now shows a blank preview line instead -- the same "no
+        # preview text" neutral state, not a new one.
+        if text == _UNDECRYPTABLE_PLACEHOLDER:
+            text = None
+
         return MessagePreview(
             payload_type=payload_type,
             text=text,
@@ -2056,6 +3135,7 @@ class ClientSession(QObject):
                         is_group=True,
                         group_name=conversation.get("group_name"),
                         participants=participant_usernames,
+                        admin=conversation.get("admin_username"),
                     )
                 )
 
@@ -2194,6 +3274,9 @@ class ClientSession(QObject):
         elif packet_type == "message_queued":
             self.handle_message_queued(packet)
 
+        elif packet_type == "message_delivered":
+            self.handle_message_delivered(packet)
+
         elif packet_type == "direct_key_recovery_available":
             self.handle_direct_key_recovery_available(packet)
 
@@ -2218,6 +3301,9 @@ class ClientSession(QObject):
         elif packet_type == "group_key_distribution":
             self.handle_group_key_distribution(packet)
 
+        elif packet_type == "device_key_sync":
+            self.handle_device_key_sync(packet)
+
         elif packet_type == "group_member_left":
             self.handle_group_member_left(packet)
 
@@ -2229,6 +3315,33 @@ class ClientSession(QObject):
 
         elif packet_type == "read_receipt_notification":
             self.handle_read_receipt_notification(packet)
+
+        # Phase 19.24 -- Message Lifecycle Events.
+        elif packet_type == "message_edited":
+            self.handle_message_edited(packet)
+
+        elif packet_type == "message_deleted":
+            self.handle_message_deleted(packet)
+
+        elif packet_type == "reaction_updated":
+            self.handle_reaction_updated(packet)
+
+        elif packet_type == "message_pinned":
+            self.handle_message_pinned(packet)
+
+        elif packet_type == "message_unpinned":
+            self.handle_message_unpinned(packet)
+
+        elif packet_type == "typing_indicator_notification":
+            self.handle_typing_indicator_notification(packet)
+
+        elif packet_type == "inbox_notification":
+            self.inbox_updated.emit(packet.get("notification") or {})
+
+        elif packet_type == "inbox_response_result":
+            notification = packet.get("notification") or {}
+            self._complete_requester_side_verification(notification)
+            self.inbox_updated.emit(notification)
 
         else:
 
@@ -2432,6 +3545,16 @@ class ClientSession(QObject):
                 decrypted_content
             )
 
+            # Phase 19.24 (continued) -- see message_id_received's own
+            # declaration. A relayed packet always carries message_id
+            # (server/client_handler.py stamps it before sending), but
+            # the guard keeps this additive-only in case of a malformed
+            #/legacy packet.
+            message_id = packet.get("message_id")
+
+            if message_id:
+                self.message_id_received.emit(identity_key, message_id)
+
             return
 
         # Binary payload (Phase 8 -- File & Image Transfer):
@@ -2465,7 +3588,122 @@ class ClientSession(QObject):
             envelope.content_metadata,
         )
 
-    def _resolve_trusted_signing_key(self, username):
+        # Phase 19.24 (continued) -- see message_id_received's own
+        # declaration, and the identical emission on the TEXT branch
+        # above.
+        message_id = packet.get("message_id")
+
+        if message_id:
+            self.message_id_received.emit(identity_key, message_id)
+
+    # Phase 16D -- Multi-Device Security Hardening + Device-Aware Peer
+    # Identity: every peer-trust-state method below (_resolve_trusted_
+    # signing_key, get_peer_verification_state, _peer_key_is_verified,
+    # _sender_trust_rejection_reason, _is_verified_identity_mismatch,
+    # _flag_peer_identity_changed, _record_peer_identity_observation,
+    # _currently_observed_peer_identity, get_peer_fingerprint_for_
+    # verification, confirm_peer_verification,
+    # confirm_combined_peer_verification, observe_peer_identity) takes
+    # an OPTIONAL trailing ``device_id`` parameter and, as its very
+    # first step, rewrites its own ``username`` argument through this
+    # helper before doing anything else. Every one of these methods
+    # already treats "username" as a fully opaque string key into a
+    # dict or into SecureKeyStore (Phase 16C already proved this by
+    # passing a bare device_id in as the "username" argument for
+    # device-peer trust, with zero changes needed) -- so composing the
+    # key here, once, is sufficient to make the WHOLE existing trust
+    # machinery (VERIFIED/UNVERIFIED/KEY_CHANGED, unchanged) track a
+    # SPECIFIC (account, device) pair instead of colliding every
+    # device of the same account into one slot, without duplicating or
+    # rewriting a single line of the state machine itself.
+    #
+    # device_id defaults to None everywhere a caller does not pass it
+    # (every pre-existing call site, and every one of the 122 baseline
+    # regression tests) -- in that case this returns ``username``
+    # completely unchanged, so behavior is byte-for-byte identical to
+    # before this phase. Only a caller that is genuinely device-aware
+    # (the identity-broadcast path once self.device_id is set, and the
+    # ordinary chat-message path once a packet carries a
+    # sender_device_id) ever passes a real device_id, and only then
+    # does a second, independently-tracked device identity slot come
+    # into existence for that (username, device_id) pair -- this is
+    # the "logical account identity vs. cryptographic device identity"
+    # split docs/architecture/multi_device_identity.md's Phase 16D
+    # section describes.
+    #
+    # Deliberately NOT applied to KeyManager.public_keys (the KEM
+    # encryption-target cache) -- that remains a single, account-level
+    # "most recently observed key for this username" convenience slot,
+    # exactly as before. Splitting THAT by device as well would change
+    # which key ordinary establish_session_key()/wrap_key_for_member()
+    # calls encrypt to, a materially larger behavior change than this
+    # phase's "smallest architecture necessary" scope calls for; the
+    # dedicated device_key_sync protocol (Phase 16C) already exists for
+    # the case where a SPECIFIC device needs to be the encryption
+    # target.
+    _DEVICE_IDENTITY_KEY_SEPARATOR = "\x1f"
+
+    def _peer_identity_key(self, username, device_id=None):
+        if device_id:
+            return f"{username}{self._DEVICE_IDENTITY_KEY_SEPARATOR}{device_id}"
+
+        return username
+
+    def _effective_peer_identity_key(self, username, device_id=None):
+        """
+        Same as _peer_identity_key(), except a caller that does not
+        know a specific device_id (device_id=None -- every ordinary
+        "do I trust this account" caller: get_peer_verification_state,
+        _resolve_trusted_signing_key, _currently_observed_peer_public_
+        key/_currently_observed_peer_identity, confirm_peer_
+        verification/confirm_combined_peer_verification) is redirected
+        to whatever device-scoped slot _device_scoped_identity_keys
+        last recorded for this username, but ONLY when the plain
+        account-level key has no record of its own -- checked first,
+        against every source get_peer_verification_state()/
+        _currently_observed_peer_public_key() themselves already read.
+
+        This ordering matters: a peer can legitimately have BOTH a
+        plain-key record (e.g. observe_peer_identity() called directly
+        with no device_id, or a genuinely non-device-announced
+        contact) and a stale/unrelated device-scoped record (e.g. a
+        one-off device_id-carrying announcement from earlier in this
+        peer's connection history). The plain key, when present, is
+        always this account's current, authoritative identity -- never
+        shadowed by a same-username device-scoped slot that some other
+        call path happened to populate. The redirect exists solely for
+        the case the plain key was NEVER populated at all (every
+        enrolled mobile device's ordinary announcement, which is the
+        gap this method exists to close).
+
+        A caller that DOES pass a real device_id is never redirected
+        -- this only ever changes the device_id=None case.
+        """
+
+        if device_id:
+            return self._peer_identity_key(username, device_id)
+
+        has_plain_record = (
+            username in self._pending_key_changed_raw_keys
+            or username in self._observed_peer_raw_public_keys
+            or username in self._peer_keys_changed
+            or (
+                self.key_store is not None
+                and self.key_store.get_peer_verification(username) is not None
+            )
+        )
+
+        if has_plain_record:
+            return username
+
+        fallback_device_id = self._device_scoped_identity_keys.get(username)
+
+        if fallback_device_id:
+            return self._peer_identity_key(username, fallback_device_id)
+
+        return username
+
+    def _resolve_trusted_signing_key(self, username, device_id=None):
         """
         Returns the raw ML-DSA public-key bytes this RECEIVER currently
         trusts/observes for ``username``, or None if nothing is known
@@ -2497,7 +3735,13 @@ class ClientSession(QObject):
         persisted (see _flag_peer_identity_changed()) and so is never
         found here -- only the still-trusted, previously-recorded key
         is.
+
+        ``device_id`` (Phase 16D): see this class's _peer_identity_key()
+        for the composite-key convention this optionally routes
+        through.
         """
+
+        username = self._effective_peer_identity_key(username, device_id)
 
         if username in self._pending_key_changed_signing_raw_keys:
             return self._pending_key_changed_signing_raw_keys[username]
@@ -2555,7 +3799,17 @@ class ClientSession(QObject):
             )
             return False
 
-        signing_public_key = self._resolve_trusted_signing_key(sender)
+        # Phase 16D -- Device-Aware Peer Identity: sender_device_id is
+        # unsigned transport metadata (see create_payload_packet()'s
+        # own comment) -- it only SELECTS which trust-state slot to
+        # check; the ML-DSA signature below is still verified against
+        # whatever key that resolves to, so a tampered/forged value
+        # can only cause a fail-closed rejection, never a false accept.
+        sender_device_id = packet.get("sender_device_id")
+
+        signing_public_key = self._resolve_trusted_signing_key(
+            sender, device_id=sender_device_id
+        )
 
         if signing_public_key is None:
             self.logger.warning(
@@ -2662,19 +3916,49 @@ class ClientSession(QObject):
             )
             return False
 
+        # BUG FIX (continued Phase 19.24): an EDITED message's stored
+        # message_signature column was overwritten by apply_edit() with
+        # the EDIT's own signature (server/client_handler.py::handle_
+        # message_edit() persists exactly the signature edit_message()
+        # produced, under EDIT_PAYLOAD_PURPOSE and edit_message()'s own
+        # simpler (receiver=None, conversation_id=<real conversation_id>)
+        # addressing -- see its docstring) -- NOT the original send's
+        # ordinary-purpose signature, which no longer exists anywhere.
+        # Verifying such a row under the ordinary MESSAGE_PAYLOAD_
+        # PURPOSE (and the history row's own receiver/conversation_id
+        # fields, which reflect the ORIGINAL message's addressing, not
+        # the edit's) always failed, silently turning every edited
+        # message into "undecryptable" (or, on mobile, into a message
+        # that vanishes from history entirely) on every reload after
+        # the first edit -- a real bug, not a security finding: the
+        # signature is genuinely valid, just under a different,
+        # entirely legitimate canonical construction this check never
+        # tried.
+        edit_version = entry.get("edit_version") or 0
+
+        if edit_version:
+            receiver = None
+            conversation_id = self.current_conversation_id
+            purpose = EDIT_PAYLOAD_PURPOSE
+        else:
+            receiver = entry.get("receiver")
+            conversation_id = entry.get("conversation_id")
+            purpose = MESSAGE_PAYLOAD_PURPOSE
+
         try:
             signature = base64.b64decode(signature_b64, validate=True)
 
             verified = verify_message_payload(
                 sender,
-                entry.get("receiver"),
-                entry.get("conversation_id"),
+                receiver,
+                conversation_id,
                 entry.get("payload_type") or PayloadType.TEXT,
                 ciphertext,
                 entry.get("content_metadata"),
                 entry.get("epoch"),
                 signature,
                 signing_public_key,
+                purpose=purpose,
             )
 
         except (TypeError, ValueError) as error:
@@ -2734,6 +4018,39 @@ class ClientSession(QObject):
         self.logger.info(
             f"Message to {receiver} queued for delivery (recipient offline)"
         )
+
+        conversation_id = packet.get("conversation_id")
+        message_id = packet.get("message_id")
+
+        if conversation_id and message_id:
+            self.own_message_id_resolved.emit(conversation_id, message_id)
+
+    # ----------------------------------------------------------
+
+    def handle_message_delivered(self, packet):
+        """
+        Phase 19.23 -- Issue 3: the live relay just reached one of
+        ``receiver``'s connected devices (server/client_handler.py's
+        existing Phase 19.14 "message_delivered" packet). Purely a
+        live-update hint, exactly like read_receipt_updated -- the
+        authoritative status is always re-derived from history's own
+        new "delivery_status" field (see server/client_handler.py::
+        _delivery_status_for_own_message()), so a client that never
+        receives this signal (conversation not open, or this client
+        was offline) is not out of sync; it just sees the correct
+        status next time it loads history.
+        """
+
+        conversation_id = packet.get("conversation_id")
+        receiver = packet.get("receiver")
+
+        if conversation_id and receiver:
+            self.message_delivered_updated.emit(conversation_id, receiver)
+
+        message_id = packet.get("message_id")
+
+        if conversation_id and message_id:
+            self.own_message_id_resolved.emit(conversation_id, message_id)
 
     # ----------------------------------------------------------
 
@@ -2873,6 +4190,12 @@ class ClientSession(QObject):
                 f"peer is not verified "
                 f"({self.get_peer_verification_state(recipient)})."
             )
+
+            # See _declined_redeliveries_awaiting_verification's own
+            # comment: retried once this client verifies ``recipient``.
+            self._declined_redeliveries_awaiting_verification.setdefault(
+                recipient, []
+            ).append((conversation_id, epoch))
 
             return
 
@@ -3094,6 +4417,15 @@ class ClientSession(QObject):
         algorithm = packet["algorithm"]
         kem_public_key = packet["public_key"]
         signing_public_key_b64 = packet["signing_public_key"]
+
+        # Phase 16D -- Device-Aware Peer Identity: transport metadata
+        # only (see create_public_key_packet()'s own comment) -- not
+        # part of the ML-DSA-signed identity payload, so it plays no
+        # role in verify_identity_payload() below and cannot be used to
+        # forge a signature. It only selects WHICH (username, device_id)
+        # trust-state slot this identity is recorded under once the
+        # signature has already been proven valid.
+        device_id = packet.get("device_id")
         signature_b64 = packet.get("identity_signature")
 
         try:
@@ -3146,14 +4478,14 @@ class ClientSession(QObject):
         # a caller polling for the state to become UNVERIFIED could
         # observe it before the KEM key was actually installed).
         if self._is_verified_identity_mismatch(
-            username, kem_public_key, signing_public_key
+            username, kem_public_key, signing_public_key, device_id=device_id
         ):
             # Fail closed: KeyManager.add_public_key() below is skipped
             # entirely -- the substituted identity is never imported or
             # cached, so the trusted key already in KeyManager.
             # public_keys[username] (if any) remains in effect.
             self._flag_peer_identity_changed(
-                username, kem_public_key, signing_public_key
+                username, kem_public_key, signing_public_key, device_id=device_id
             )
             return
 
@@ -3177,8 +4509,15 @@ class ClientSession(QObject):
         # records the observation as UNVERIFIED (or a no-op if already
         # VERIFIED with matching keys); never promotes to VERIFIED.
         self._record_peer_identity_observation(
-            username, kem_public_key, signing_public_key
+            username, kem_public_key, signing_public_key, device_id=device_id
         )
+
+        # See _device_scoped_identity_keys' own comment: a plain dict
+        # assignment, not a new store write, so _effective_peer_
+        # identity_key() can redirect device_id=None callers to the
+        # slot this announcement actually populated above.
+        if device_id:
+            self._device_scoped_identity_keys[username] = device_id
 
         self.public_key_received.emit(username)
 
@@ -3355,7 +4694,7 @@ class ClientSession(QObject):
         self._pending_key_changed_raw_keys.pop(username, None)
         self._pending_key_changed_signing_raw_keys.pop(username, None)
 
-    def get_peer_verification_state(self, username):
+    def get_peer_verification_state(self, username, device_id=None):
         """
         Returns this user's current knowledge of ``username``'s
         identity-key verification (Server-Untrusted Identity
@@ -3368,7 +4707,11 @@ class ClientSession(QObject):
         whatever SecureKeyStore itself reports: it means the most
         recent observation disagreed with the still-intact VERIFIED
         record underneath it (see _evaluate_peer_key_verification()).
+
+        ``device_id`` (Phase 16D): see _peer_identity_key().
         """
+
+        username = self._effective_peer_identity_key(username, device_id)
 
         if username in self._peer_keys_changed:
             return PEER_KEY_STATE_CHANGED
@@ -3380,7 +4723,7 @@ class ClientSession(QObject):
 
         return entry["state"] if entry is not None else None
 
-    def _peer_key_is_verified(self, username):
+    def _peer_key_is_verified(self, username, device_id=None):
         """
         True only if ``username``'s CURRENT verification state is
         exactly PEER_STATE_VERIFIED (Server-Untrusted Identity
@@ -3395,11 +4738,13 @@ class ClientSession(QObject):
         establish_session_key(), handle_direct_key_redelivery_
         required(), and _distribute_group_key(), the three (and only
         three) places KeyManager.wrap_key_for_member() is ever called.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key().
         """
 
-        return self.get_peer_verification_state(username) == PEER_STATE_VERIFIED
+        return self.get_peer_verification_state(username, device_id) == PEER_STATE_VERIFIED
 
-    def _sender_trust_rejection_reason(self, sender):
+    def _sender_trust_rejection_reason(self, sender, device_id=None):
         """
         Phase 13.7: distinguishes WHY _peer_key_is_verified(sender)
         returned False, using only state this receiver already has
@@ -3416,9 +4761,11 @@ class ClientSession(QObject):
         UNKNOWN_SENDER if nothing has ever been recorded for
         ``sender`` at all (state is None -- never observed, or no
         local key store this session).
+
+        ``device_id`` (Phase 16D): see _peer_identity_key().
         """
 
-        state = self.get_peer_verification_state(sender)
+        state = self.get_peer_verification_state(sender, device_id)
 
         if state == PEER_KEY_STATE_CHANGED:
             return SecurityRejectionReason.KEY_CHANGED
@@ -3472,7 +4819,7 @@ class ClientSession(QObject):
             conversation_id or "",
         )
 
-    def get_peer_fingerprint_for_verification(self, username):
+    def get_peer_fingerprint_for_verification(self, username, device_id=None):
         """
         Returns the fingerprint a verification dialog should display
         and, on explicit user confirmation, pass to
@@ -3489,7 +4836,11 @@ class ClientSession(QObject):
         VERIFIED key both compare against the same, currently-active
         fingerprint. None if nothing has ever been recorded, or the
         local key store is unavailable this session.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key().
         """
+
+        username = self._effective_peer_identity_key(username, device_id)
 
         if username in self._pending_key_changed_fingerprints:
             return self._pending_key_changed_fingerprints[username]
@@ -3501,7 +4852,7 @@ class ClientSession(QObject):
 
         return entry["fingerprint"] if entry is not None else None
 
-    def _currently_observed_peer_public_key(self, username):
+    def _currently_observed_peer_public_key(self, username, device_id=None):
         """
         Returns the raw public-key bytes confirm_peer_verification()
         must independently derive ``username``'s fingerprint from
@@ -3535,14 +4886,141 @@ class ClientSession(QObject):
 
         None if nothing has ever been observed for this peer at all --
         there is nothing to verify against.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key().
         """
+
+        username = self._effective_peer_identity_key(username, device_id)
 
         if username in self._pending_key_changed_raw_keys:
             return self._pending_key_changed_raw_keys[username]
 
         return self._observed_peer_raw_public_keys.get(username)
 
-    def confirm_peer_verification(self, username, fingerprint):
+    def _retry_pending_key_requests(self, sender):
+        """
+        Re-requests every (conversation_id, epoch) this client
+        received from ``sender`` and rejected only because ``sender``
+        was not yet VERIFIED (recorded in _pending_key_requests_
+        awaiting_verification -- see its own comment). Called after
+        confirm_peer_verification()/confirm_combined_peer_
+        verification() successfully promotes a peer to VERIFIED, using
+        the SAME request handle_direct_key_recovery_available() sends
+        on an ordinary reconnect (create_direct_key_recovery_request_
+        packet) -- this only ever asks again for something already
+        legitimately offered once; it grants no new access and skips
+        anything already installed by the time this runs (e.g. a later
+        reconnect already recovered it).
+
+        No-op if this client never rejected anything from ``sender``,
+        or is not currently connected -- exactly the same "nothing
+        lost, nothing to do" outcome as any other missed redelivery.
+
+        Accepts either a plain username or an already device-scoped
+        key (see _peer_identity_key()) and always reduces to the
+        plain username before looking anything up -- _pending_key_
+        requests_awaiting_verification is keyed by the raw "sender"
+        field of a rejected network packet, which is never device-
+        scoped, regardless of which form a caller (confirm_peer_
+        verification()/confirm_combined_peer_verification(), which
+        may reach this having already resolved a device-scoped key)
+        happens to hold at the point it calls this.
+        """
+
+        sender = sender.split(self._DEVICE_IDENTITY_KEY_SEPARATOR, 1)[0]
+
+        pending = self._pending_key_requests_awaiting_verification.pop(sender, None)
+
+        if not pending or self.client_socket is None:
+            return
+
+        for conversation_id, epoch in pending:
+
+            if self.key_manager.has_key(conversation_id, epoch=epoch):
+                continue
+
+            # Best-effort, exactly like the "not connected" no-op above:
+            # self.client_socket being non-None does not guarantee it is
+            # still a live, connected socket (a real, physically-
+            # reproduced regression -- test_attack_d_forged_packet_no_
+            # longer_wins_the_race_against_the_real_key -- found this
+            # raising OSError and aborting confirm_combined_peer_
+            # verification() itself, which must never fail just because
+            # this opportunistic re-request could not be sent). A failed
+            # send here loses nothing new: the same redelivery this
+            # would have asked for early still happens on the recipient's
+            # next ordinary reconnect, per this method's own docstring.
+            try:
+                send_message(
+                    self.client_socket,
+                    create_direct_key_recovery_request_packet(
+                        conversation_id=conversation_id,
+                        epochs=[epoch],
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001
+                self.logger.warning(
+                    f"Failed to re-request recovery of {conversation_id} "
+                    f"epoch {epoch} from {sender}: {error}"
+                )
+                continue
+
+            self.logger.info(
+                f"Re-requested recovery of {conversation_id} epoch "
+                f"{epoch} from {sender} now that they are verified"
+            )
+
+    def _retry_declined_redeliveries(self, recipient):
+        """
+        The other half of "verify late, in either order": re-attempts
+        every (conversation_id, epoch) this client itself declined to
+        REDELIVER to ``recipient`` -- handle_direct_key_redelivery_
+        required()'s own "SECURITY: refusing to redeliver" branch --
+        purely because this client had not yet verified ``recipient``
+        at the time. Re-runs that exact same handler with a
+        reconstructed packet, so every one of its checks (still holds
+        the key, ``recipient`` is now verified, wrap/sign/send) apply
+        fresh -- this grants nothing that handler would not have
+        already granted the first time, had verification simply
+        happened a moment sooner.
+
+        See _retry_pending_key_requests()'s docstring for the
+        device_id-key-reduction and no-op conditions -- identical
+        here, since both draw from the same _effective_peer_identity_
+        key()-resolved ``username``.
+        """
+
+        recipient = recipient.split(self._DEVICE_IDENTITY_KEY_SEPARATOR, 1)[0]
+
+        pending = self._declined_redeliveries_awaiting_verification.pop(recipient, None)
+
+        if not pending:
+            return
+
+        for conversation_id, epoch in pending:
+            # Best-effort, same reasoning as _retry_pending_key_
+            # requests()'s own try/except just above: this handler's
+            # OTHER call site (a live inbound packet, on the receiver
+            # thread) can reasonably let a send failure propagate
+            # because the connection is already known-live at that
+            # point; called from here, as a side effect of a purely
+            # local confirm_peer_verification(), that guarantee does
+            # not hold, and a failed opportunistic send must not break
+            # the verification call itself. Nothing is lost either way
+            # -- see this method's own docstring.
+            try:
+                self.handle_direct_key_redelivery_required({
+                    "conversation_id": conversation_id,
+                    "epoch": epoch,
+                    "recipient": recipient,
+                })
+            except Exception as error:  # noqa: BLE001
+                self.logger.warning(
+                    f"Failed to retry declined redelivery of {conversation_id} "
+                    f"epoch {epoch} to {recipient}: {error}"
+                )
+
+    def confirm_peer_verification(self, username, fingerprint, device_id=None):
         """
         The ONLY method the GUI should ever call to promote a peer to
         PEER_STATE_VERIFIED (Server-Untrusted Identity Verification,
@@ -3625,6 +5103,14 @@ class ClientSession(QObject):
 
         A peer only ever reached through the legacy unsigned path falls
         through to the unchanged single-key logic below.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key(). Applied
+        once, here, before any of the pending/observed-dict checks
+        below -- the recursive call into confirm_combined_peer_
+        verification() below passes the already-composed key with no
+        device_id of its own, which is safe/idempotent (composing an
+        already-composite key with device_id=None returns it
+        unchanged).
         """
 
         if self.key_store is None:
@@ -3632,6 +5118,8 @@ class ClientSession(QObject):
                 "The local key store is not available; identity "
                 "verification cannot be saved."
             )
+
+        username = self._effective_peer_identity_key(username, device_id)
 
         if username in self._pending_key_changed_raw_keys:
             use_combined = username in self._pending_key_changed_signing_raw_keys
@@ -3666,6 +5154,9 @@ class ClientSession(QObject):
         self._pending_key_changed_fingerprints.pop(username, None)
 
         self._pending_key_changed_raw_keys.pop(username, None)
+
+        self._retry_pending_key_requests(username)
+        self._retry_declined_redeliveries(username)
 
     # ----------------------------------------------------------
     # ML-DSA identity/key-persistence foundation phase: combined
@@ -3702,7 +5193,9 @@ class ClientSession(QObject):
 
         return fingerprint_combined_identity(kem_public_key, signing_public_key)
 
-    def _is_verified_identity_mismatch(self, username, kem_public_key, signing_public_key):
+    def _is_verified_identity_mismatch(
+        self, username, kem_public_key, signing_public_key, device_id=None
+    ):
         """
         True only if this user has an existing VERIFIED combined-
         identity fingerprint for ``username`` AND the (KEM, signing)
@@ -3714,7 +5207,16 @@ class ClientSession(QObject):
         UNVERIFIED one -- a first-contact or still-unverified peer's
         identity is never blocked here, exactly like the single-key
         version.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key(). This is
+        the mechanism that lets a second device belonging to the SAME
+        account be recorded as its own distinct, independently-tracked
+        identity rather than colliding with (and potentially flagging
+        KEY_CHANGED against) a different, already-VERIFIED device of
+        that same account.
         """
+
+        username = self._peer_identity_key(username, device_id)
 
         if self.key_store is None:
             return False
@@ -3728,7 +5230,9 @@ class ClientSession(QObject):
             kem_public_key, signing_public_key
         )
 
-    def _flag_peer_identity_changed(self, username, kem_public_key, signing_public_key):
+    def _flag_peer_identity_changed(
+        self, username, kem_public_key, signing_public_key, device_id=None
+    ):
         """
         Record, session-locally only, that the most recently observed
         (KEM, signing) identity for ``username`` disagreed with their
@@ -3745,7 +5249,18 @@ class ClientSession(QObject):
         signing key's raw bytes in _pending_key_changed_signing_raw_
         keys, since neither of the existing dicts has room for a
         second key.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key(). Only a
+        DEVICE-SCOPED mismatch (the composite key's own prior VERIFIED
+        record disagreeing with what was just observed for that SAME
+        device_id) ever reaches this method when the caller is device-
+        aware -- a different device_id belonging to the same account
+        producing a different key is a NEW, distinct identity slot
+        (handled by _record_peer_identity_observation() instead), never
+        a KEY_CHANGED event against an unrelated device's slot.
         """
+
+        username = self._peer_identity_key(username, device_id)
 
         self._peer_keys_changed.add(username)
 
@@ -3767,7 +5282,9 @@ class ClientSession(QObject):
 
         self.peer_key_changed.emit(username)
 
-    def _record_peer_identity_observation(self, username, kem_public_key, signing_public_key):
+    def _record_peer_identity_observation(
+        self, username, kem_public_key, signing_public_key, device_id=None
+    ):
         """
         Record this newly observed (KEM, signing) identity's combined
         fingerprint -- the combined-identity counterpart of
@@ -3786,7 +5303,14 @@ class ClientSession(QObject):
 
         Never promotes a peer to VERIFIED -- that remains exclusively
         confirm_peer_verification(), a future explicit user action.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key(). This is
+        what lets a second, third, ... device of the same account each
+        get recorded as its own UNVERIFIED entry, independently of
+        whatever is on file for any other device_id of that account.
         """
+
+        username = self._peer_identity_key(username, device_id)
 
         self._observed_peer_raw_public_keys[username] = kem_public_key
         self._observed_peer_signing_public_keys[username] = signing_public_key
@@ -3814,7 +5338,9 @@ class ClientSession(QObject):
         self._pending_key_changed_raw_keys.pop(username, None)
         self._pending_key_changed_signing_raw_keys.pop(username, None)
 
-    def observe_peer_identity(self, username, kem_public_key, signing_public_key):
+    def observe_peer_identity(
+        self, username, kem_public_key, signing_public_key, device_id=None
+    ):
         """
         Top-level entry point for observing a peer's combined (ML-KEM +
         ML-DSA) identity -- the combined-identity counterpart of
@@ -3828,21 +5354,31 @@ class ClientSession(QObject):
         identity -- the previously trusted identity remains in effect
         and recoverable. Only when there is no such conflict is the
         observation recorded.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key(). Passed
+        straight through, unmodified, to every helper below -- this
+        method itself does not need to compose the key, since each of
+        those already does. observe_device_peer_identity() (Phase 16C)
+        continues to call this with device_id omitted and ``device_id``
+        (the parameter named that in THIS method's own signature)
+        passed positionally as ``username`` instead -- unaffected by
+        this addition, since a plain string with no device_id kwarg
+        composes to itself.
         """
 
         if self._is_verified_identity_mismatch(
-            username, kem_public_key, signing_public_key
+            username, kem_public_key, signing_public_key, device_id=device_id
         ):
             self._flag_peer_identity_changed(
-                username, kem_public_key, signing_public_key
+                username, kem_public_key, signing_public_key, device_id=device_id
             )
             return
 
         self._record_peer_identity_observation(
-            username, kem_public_key, signing_public_key
+            username, kem_public_key, signing_public_key, device_id=device_id
         )
 
-    def _currently_observed_peer_identity(self, username):
+    def _currently_observed_peer_identity(self, username, device_id=None):
         """
         Returns ``(kem_public_key, signing_public_key)`` raw bytes --
         the combined-identity counterpart of
@@ -3856,7 +5392,11 @@ class ClientSession(QObject):
         whatever _observed_peer_raw_public_keys /
         _observed_peer_signing_public_keys currently hold -- the last
         identity _record_peer_identity_observation() recorded.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key().
         """
+
+        username = self._effective_peer_identity_key(username, device_id)
 
         if username in self._pending_key_changed_raw_keys:
             kem_public_key = self._pending_key_changed_raw_keys[username]
@@ -3870,7 +5410,30 @@ class ClientSession(QObject):
 
         return kem_public_key, signing_public_key
 
-    def confirm_combined_peer_verification(self, username, fingerprint):
+    def has_observed_combined_identity(self, username, device_id=None):
+        """
+        True only if this session currently holds BOTH halves of
+        ``username``'s combined identity in memory -- the exact
+        precondition confirm_combined_peer_verification() requires
+        before it will independently re-derive and accept a
+        fingerprint (Phase 19.22).
+
+        A read-only query, not a new trust decision: the actual
+        security gate is entirely unchanged and lives only in
+        confirm_combined_peer_verification()/_currently_observed_peer_
+        identity() below. This exists so a caller (the Inbox Approve
+        handler) can wait for a fresh, in-progress identity exchange
+        to land before attempting verification, instead of racing it
+        and surfacing a fail-closed error for an ordinary timing
+        window where both users are, in fact, online.
+        """
+
+        kem_public_key, signing_public_key = self._currently_observed_peer_identity(
+            username, device_id=device_id
+        )
+        return kem_public_key is not None and signing_public_key is not None
+
+    def confirm_combined_peer_verification(self, username, fingerprint, device_id=None):
         """
         The combined-identity counterpart of confirm_peer_verification()
         -- the ONLY method that should ever promote a peer's COMBINED
@@ -3895,6 +5458,16 @@ class ClientSession(QObject):
         identity has never been observed, or if ``fingerprint`` does
         not match. Raises KeyStoreError if the local key store is
         unavailable this session.
+
+        ``device_id`` (Phase 16D): see _peer_identity_key(). Composed
+        once, here, at the top -- confirm_peer_verification() may also
+        reach this method having already composed the key itself and
+        calling with device_id omitted; re-composing an already-
+        composite key with device_id=None is a no-op, so this is safe
+        either way. confirm_device_peer_verification() (Phase 16C)
+        continues to call this with device_id omitted and its own
+        device_id passed positionally as ``username`` instead --
+        unaffected by this addition for the same reason.
         """
 
         if self.key_store is None:
@@ -3902,6 +5475,8 @@ class ClientSession(QObject):
                 "The local key store is not available; identity "
                 "verification cannot be saved."
             )
+
+        username = self._effective_peer_identity_key(username, device_id)
 
         kem_public_key, signing_public_key = self._currently_observed_peer_identity(
             username
@@ -3933,11 +5508,32 @@ class ClientSession(QObject):
             username, derived_fingerprint, signing_public_key=signing_public_key
         )
 
+        # Bug fix (Phase 16C -- discovered while testing device-key
+        # sync, but not specific to devices: this is the general
+        # VERIFIED -> KEY_CHANGED -> re-confirm sequence for any
+        # peer). _resolve_trusted_signing_key()/_currently_observed_
+        # peer_identity() both check _pending_key_changed_*_raw_keys
+        # FIRST, then fall back to _observed_peer_*_public_keys -- but
+        # until this fix, confirming a KEY_CHANGED identity cleared the
+        # pending dicts above WITHOUT promoting the newly-confirmed
+        # (kem_public_key, signing_public_key) into the fallback caches,
+        # which still held the OLD, now-superseded identity. The next
+        # signature verification for this username would then resolve
+        # the WRONG (stale) trusted key and incorrectly reject a
+        # genuine, freshly-VERIFIED sender's messages -- a false
+        # rejection of legitimate traffic, never a false acceptance;
+        # fixing it makes verification MORE correct, not weaker.
+        self._observed_peer_raw_public_keys[username] = kem_public_key
+        self._observed_peer_signing_public_keys[username] = signing_public_key
+
         self._peer_keys_changed.discard(username)
 
         self._pending_key_changed_fingerprints.pop(username, None)
         self._pending_key_changed_raw_keys.pop(username, None)
         self._pending_key_changed_signing_raw_keys.pop(username, None)
+
+        self._retry_pending_key_requests(username)
+        self._retry_declined_redeliveries(username)
 
     # ----------------------------------------------------------
 
@@ -4236,7 +5832,7 @@ class ClientSession(QObject):
         participants = [m for m in members if m != self.username]
 
         self.conversation_store.add_or_update_group(
-            conversation_id, name, participants
+            conversation_id, name, participants, admin=creator
         )
 
         self.logger.info(
@@ -4487,6 +6083,14 @@ class ClientSession(QObject):
         wrapped_key = packet.get("wrapped_key")
 
         if not self._peer_key_is_verified(sender):
+            # See _pending_key_requests_awaiting_verification's own
+            # comment: remembered so confirm_peer_verification()/
+            # confirm_combined_peer_verification() can ask ``sender``
+            # to redeliver this once this client verifies them,
+            # instead of silently requiring a manual reconnect.
+            self._pending_key_requests_awaiting_verification.setdefault(
+                sender, []
+            ).append((conversation_id, epoch))
             reason = self._sender_trust_rejection_reason(sender)
             self._report_security_rejection(reason, sender, conversation_id)
             return reason
@@ -4711,6 +6315,266 @@ class ClientSession(QObject):
 
         self.read_receipt_updated.emit(conversation_id, reader)
 
+    def handle_typing_indicator_notification(self, packet):
+        """
+        Another active member of a conversation has started (or
+        stopped) typing (Phase 19.24 -- Typing Indicator). Purely a
+        live-update hint, exactly like handle_read_receipt_
+        notification() above -- re-emitted as a Qt signal, never
+        persisted, never affects message delivery or history in any
+        way. A missing/malformed field is silently ignored rather than
+        raising -- this is best-effort UI decoration, not a security-
+        or correctness-relevant packet.
+        """
+
+        conversation_id = packet.get("conversation_id")
+        username = packet.get("username")
+
+        if not conversation_id or not username:
+            return
+
+        self.typing_indicator_received.emit(
+            conversation_id, username, bool(packet.get("is_typing"))
+        )
+
+    def _decrypt_lifecycle_event_content(self, conversation_id, payload_type, ciphertext, epoch):
+        """
+        Shared best-effort decryption for a Phase 19.24 lifecycle
+        event's content (an edit's new text, a reaction's emoji
+        string) -- mirrors _decrypt_history_message()'s exact fail-
+        soft contract (never raises; returns a placeholder if this
+        client has no key for that epoch, or if AES-GCM authentication
+        fails) but generalized to any PayloadAdapter-registered
+        payload_type, since a reaction is PayloadType.REACTION, not
+        TEXT.
+        """
+
+        session_key = self.key_manager.get_key(conversation_id, epoch=epoch or 1)
+
+        if session_key is None:
+            return _UNDECRYPTABLE_PLACEHOLDER
+
+        try:
+            envelope = PayloadEnvelope(
+                payload_type=payload_type, ciphertext=ciphertext, content_metadata={}
+            )
+            return self._adapter_for(payload_type).decrypt(envelope, AESCipher(session_key))
+        except Exception:  # noqa: BLE001
+            return _UNDECRYPTABLE_PLACEHOLDER
+
+    def _verify_lifecycle_event_signature(
+        self, actor, conversation_id, payload_type, ciphertext, content_metadata, epoch,
+        signature_b64, purpose, event_label,
+    ):
+        """
+        Continued Phase 19.24 -- receiver-side verification. Mirrors
+        _verify_chat_message_signature()'s exact trust model (resolve
+        the CLAIMED actor's trusted signing key from THIS client's own
+        already-established peer state, never from anything inside the
+        packet; verify; fail closed) for the edit/reaction event
+        types, distinguished from an ordinary chat message and from
+        each other by ``purpose`` (EDIT_PAYLOAD_PURPOSE/REACTION_
+        PAYLOAD_PURPOSE). This is what makes this client's trust in
+        ``actor`` independent of merely trusting the server relayed it
+        correctly -- the same reason ordinary chat messages carry a
+        signature at all.
+
+        Returns True only if the signature verified. A missing
+        signature, an unresolvable signing key, or a failed
+        verification are all rejected identically -- logged, never
+        fatal to the receiver thread, exactly like an ordinary chat
+        message's identical three failure modes.
+        """
+
+        if not signature_b64:
+            self.logger.warning(
+                f"SECURITY: rejected unsigned {event_label} claiming to be "
+                f"from {actor}; ML-DSA signature is required."
+            )
+            return False
+
+        # BUG FIX (continued Phase 19.24): the server broadcasts an
+        # edit/reaction notification to EVERY conversation member,
+        # including the ORIGINATING actor themselves (server/client_
+        # handler.py's handle_message_edit()/handle_reaction_add()
+        # never pass exclude_socket to _broadcast_to_conversation_
+        # members() for these) -- exactly what lets a sender's own
+        # bubble update in place without a history reload. But
+        # _resolve_trusted_signing_key() only ever caches OTHER
+        # accounts' OBSERVED identities (nobody "observes" their own
+        # public key arriving over the wire -- it never does), so
+        # actor == self.username always missed there, incorrectly
+        # rejecting a sender's own, perfectly genuine signature as
+        # unverifiable. Resolved from this session's own KeyManager
+        # instead for that one case -- mirrors load_conversation_
+        # history()'s identical is_own branch, and is exactly as safe:
+        # this is still real cryptographic verification against a
+        # public key this client unquestionably controls the private
+        # half of, never a bypass.
+        if actor == self.username:
+            signing_public_key = self.key_manager.ml_dsa.export_public_key()
+        else:
+            signing_public_key = self._resolve_trusted_signing_key(actor)
+
+        if signing_public_key is None:
+            self.logger.warning(
+                f"SECURITY: rejected {event_label} from {actor}: no ML-DSA "
+                f"identity has ever been observed for them; cannot verify origin."
+            )
+            return False
+
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+
+            verified = verify_message_payload(
+                actor, None, conversation_id, payload_type, ciphertext,
+                content_metadata, epoch, signature, signing_public_key,
+                purpose=purpose,
+            )
+        except (TypeError, ValueError) as error:
+            self.logger.warning(
+                f"SECURITY: rejected malformed signed {event_label} from "
+                f"{actor}: {error}"
+            )
+            return False
+
+        if not verified:
+            self.logger.warning(
+                f"SECURITY: ML-DSA signature verification FAILED for a "
+                f"{event_label} claiming to be from {actor}; rejecting."
+            )
+            return False
+
+        return True
+
+    def handle_message_edited(self, packet):
+        """
+        Another of this conversation's participants (or this
+        account's OWN other device) successfully edited a message
+        (Phase 19.24). Decrypts the new content here -- the GUI never
+        touches ciphertext, exactly like message_received/payload_
+        message_received. ``editor``/``edited_at``/``edit_version`` are
+        the server's own authenticated answer for AUTHORIZATION
+        (server/client_handler.py already confirmed editor == the
+        message's real sender before ever broadcasting this); the
+        ML-DSA signature below is verified independently so this
+        client's trust in ``editor`` does not rest on the server alone.
+        """
+
+        message_id = packet.get("message_id")
+        conversation_id = packet.get("conversation_id")
+        ciphertext = packet.get("ciphertext")
+        editor = packet.get("editor") or ""
+
+        if not message_id or not conversation_id or not ciphertext or not editor:
+            return
+
+        if not self._verify_lifecycle_event_signature(
+            editor, conversation_id, PayloadType.TEXT, ciphertext,
+            packet.get("content_metadata"), packet.get("epoch"),
+            packet.get("message_signature"), EDIT_PAYLOAD_PURPOSE, "message edit",
+        ):
+            return
+
+        new_text = self._decrypt_lifecycle_event_content(
+            conversation_id, PayloadType.TEXT, ciphertext, packet.get("epoch"),
+        )
+
+        self.message_edited_received.emit(
+            conversation_id,
+            message_id,
+            new_text,
+            editor,
+            packet.get("edited_at") or "",
+            int(packet.get("edit_version") or 0),
+        )
+
+    def handle_message_deleted(self, packet):
+        """
+        A message was deleted for everyone (Phase 19.24). Carries no
+        content to decrypt -- the server already nulled it server-side
+        before sending this notification at all (server/client_
+        handler.py::handle_message_delete_for_everyone()).
+        """
+
+        message_id = packet.get("message_id")
+        conversation_id = packet.get("conversation_id")
+
+        if not message_id or not conversation_id:
+            return
+
+        self.message_deleted_received.emit(
+            conversation_id,
+            message_id,
+            packet.get("deleted_by") or "",
+            packet.get("deleted_at") or "",
+        )
+
+    def handle_reaction_updated(self, packet):
+        """
+        A reaction was added or removed on a message this account can
+        see (Phase 19.24). Decrypts the reaction string for "add"
+        (empty string for "remove" -- there is nothing to decrypt).
+        """
+
+        message_id = packet.get("message_id")
+        conversation_id = packet.get("conversation_id")
+        action = packet.get("action")
+        actor = packet.get("actor") or ""
+
+        if not message_id or not conversation_id or action not in ("add", "remove") or not actor:
+            return
+
+        reaction = ""
+
+        if action == "add":
+            ciphertext = packet.get("ciphertext")
+            if not ciphertext:
+                return
+
+            if not self._verify_lifecycle_event_signature(
+                actor, conversation_id, PayloadType.REACTION, ciphertext,
+                None, packet.get("epoch"),
+                packet.get("message_signature"), REACTION_PAYLOAD_PURPOSE, "reaction",
+            ):
+                return
+
+            reaction = self._decrypt_lifecycle_event_content(
+                conversation_id, PayloadType.REACTION, ciphertext, packet.get("epoch"),
+            )
+
+        self.reaction_updated_received.emit(
+            conversation_id, message_id, actor, action, reaction,
+        )
+
+    def handle_message_pinned(self, packet):
+        """A message was pinned (Phase 19.24 -- Pinned Messages). No
+        decryption/verification needed -- see message_pinned_received's
+        own docstring for the trust-model note."""
+
+        message_id = packet.get("message_id")
+        conversation_id = packet.get("conversation_id")
+        pinned_by = packet.get("pinned_by") or ""
+
+        if not message_id or not conversation_id or not pinned_by:
+            return
+
+        self.message_pinned_received.emit(
+            conversation_id, message_id, pinned_by, packet.get("pinned_at") or "",
+        )
+
+    def handle_message_unpinned(self, packet):
+        """A message was unpinned (Phase 19.24 -- Pinned Messages)."""
+
+        message_id = packet.get("message_id")
+        conversation_id = packet.get("conversation_id")
+        unpinned_by = packet.get("unpinned_by") or ""
+
+        if not message_id or not conversation_id or not unpinned_by:
+            return
+
+        self.message_unpinned_received.emit(conversation_id, message_id, unpinned_by)
+
     def mark_conversation_read(self, conversation_id):
         """
         Tell the server every currently-unread message in this
@@ -4734,6 +6598,49 @@ class ClientSession(QObject):
             return
 
         packet = create_read_receipt_packet(conversation_id=conversation_id)
+
+        send_message(
+            self.client_socket,
+            packet
+        )
+
+    def send_typing_indicator(self, conversation_id, is_typing):
+        """
+        Tell the server this account is (or has just stopped) typing
+        in ``conversation_id`` (Phase 19.24 -- Typing Indicator).
+        Fire-and-forget, like mark_conversation_read() -- carries no
+        sender identity of its own; the server derives that exclusively
+        from this socket's authenticated session. A no-op if there's no
+        real conversation_id yet, for the identical reason mark_
+        conversation_read() already has one.
+
+        The caller (GUI) owns ALL debounce/timeout decisions -- when to
+        send is_typing=True (e.g. on the first keystroke after being
+        idle), when to send is_typing=False (idle timeout, or the
+        message was actually sent) -- this method only ever puts
+        exactly the packet it's asked for on the wire, never inferring
+        timing on its own.
+
+        Safe to call after disconnect() -- a no-op rather than an
+        AttributeError on a None client_socket. Unlike an ordinary
+        user-initiated send (send_chat_message() et al., where a
+        failure is real, actionable information the GUI surfaces),
+        this one is reached from a QTimer callback that can legitimately
+        still be armed and fire well after the window/session it
+        belongs to has already been torn down (the idle-typing timer
+        does not know or care whether anyone is still listening) -- see
+        gui/chat_window.py::_on_composer_text_changed()'s own debounce
+        contract. There is nothing for a caller to react to either way:
+        a typing hint that never arrives changes nothing but a cosmetic
+        indicator on the other end.
+        """
+
+        if not conversation_id or not self.connected:
+            return
+
+        packet = create_typing_indicator_packet(
+            conversation_id=conversation_id, is_typing=is_typing
+        )
 
         send_message(
             self.client_socket,
@@ -4802,6 +6709,158 @@ class ClientSession(QObject):
             self.client_socket,
             packet
         )
+
+    def remove_group_member(self, conversation_id, target_username):
+        """
+        Ask the server to remove ``target_username`` from a group
+        (Phase 19.13 -- Group Admin). Admin-only, server-enforced --
+        see server/client_handler.py::handle_group_remove_member()'s
+        own docstring; this call raises nothing locally and performs
+        no local authorization check of its own (the GUI hiding the
+        Remove Member button for a non-admin is a convenience, not the
+        enforcement). Unlike add/leave/create above, this uses
+        send_request() rather than fire-and-forget: the caller needs
+        the definite success/error (e.g. "you are not the admin") to
+        show immediately, not only the eventual group_member_left
+        broadcast every other member also receives.
+        """
+
+        return self.send_request(
+            create_group_remove_member_packet(
+                conversation_id=conversation_id, target_username=target_username,
+            )
+        )
+
+    # ==========================================================
+    # Inbox: verification requests + group member-add approval
+    # (Phase 19.13 -- User Manual Feedback Implementation)
+    # ==========================================================
+
+    def request_verification(self, target_username):
+        """
+        Ask ``target_username`` to verify this account's identity --
+        creates a pending verification_request inbox notification on
+        the server for them to Approve/Deny (server/client_handler.py
+        ::handle_verification_request()). Performs no cryptography
+        itself: this is only the "ask" half. The actual verification
+        happens on the OTHER side when they approve (see
+        respond_to_inbox()'s own docstring) -- exactly the same
+        confirm_combined_peer_verification() call the existing Verify
+        Identity dialog already makes, just triggered from the Inbox
+        instead of that dialog.
+        """
+
+        send_message(
+            self.client_socket,
+            create_verification_request_packet(target_username),
+        )
+
+    def load_inbox(self):
+        """
+        Fetch every inbox notification (pending or resolved) where
+        this account is either the recipient or the original
+        requester -- mirrors load_conversations()'s request/response
+        shape exactly (conversation_list_request -> here, inbox_list_
+        request). Returns the raw list of notification dicts; the
+        caller (GUI) renders it, there is no local cache to keep in
+        sync -- inbox_updated only ever signals "go call this again".
+        """
+
+        response = self.send_request(create_inbox_list_request_packet())
+
+        return response.get("notifications") or []
+
+    def respond_to_inbox(self, notification, approve):
+        """
+        Approve or deny one pending inbox notification (Phase 19.13).
+
+        Security -- verification_request: approving here is the ONLY
+        place a verification_request's Approve button is allowed to
+        take effect, and it does so by calling THIS client's own
+        already-existing, unweakened confirm_combined_peer_
+        verification() with the fingerprint THIS client has already
+        independently observed for the requester -- never a value
+        taken from the notification itself (which carries no key
+        material at all). If nothing has been observed yet for the
+        requester (they have never been online since this client last
+        restarted, or never sent a signed identity packet at all),
+        PeerVerificationMismatchError propagates to the caller exactly
+        as it would from the existing Verify Identity dialog -- the
+        GUI is expected to show it as a friendly "cannot verify them
+        yet" message, same as everywhere else that error already
+        surfaces, and MUST NOT send approve=True to the server in that
+        case (a caught exception here means this method returns
+        without sending anything). Denying, or a group_add_request
+        either way, performs no cryptography -- only the server-side
+        record + (if approved) the existing add-member path runs.
+        """
+
+        if approve and notification.get("type") == "verification_request":
+
+            requester_username = notification.get("requester_username")
+
+            fingerprint = self.get_peer_fingerprint_for_verification(requester_username)
+
+            if fingerprint is None:
+                raise PeerVerificationMismatchError(
+                    f"No observed identity for {requester_username} yet; "
+                    f"cannot verify them until they are online and you "
+                    f"have exchanged keys."
+                )
+
+            self.confirm_combined_peer_verification(requester_username, fingerprint)
+
+        send_message(
+            self.client_socket,
+            create_inbox_response_packet(
+                notification_id=notification.get("notification_id"), approve=approve,
+            ),
+        )
+
+    def _complete_requester_side_verification(self, notification):
+        """
+        Phase 19.22B -- respond_to_inbox()'s approve path already
+        promotes the APPROVER's own combined identity for the
+        requester to VERIFIED before it ever sends approve=True.
+        Nothing completed the mirror half on the REQUESTER's side:
+        this client sent the original verification_request and then
+        just... waited, so only one of the two participants ever left
+        the async Inbox-mediated flow actually VERIFIED, despite Approve
+        having succeeded. Runs only when THIS user is the original
+        requester (never the recipient/approver -- they already
+        confirmed their own half inside respond_to_inbox()) and the
+        resolution is an approval, using the exact same fail-closed
+        get_peer_fingerprint_for_verification() + confirm_combined_
+        peer_verification() gate as every other verification path --
+        never a blind trust of anything in the notification itself,
+        which carries no key material at all. A failure here (this
+        client has not yet observed the approver's identity) is
+        swallowed exactly like every other fail-closed gate already
+        does -- the user can still finish manually via Verify Identity.
+        """
+
+        if notification.get("type") != "verification_request":
+            return
+        if notification.get("status") != "approved":
+            return
+        if notification.get("requester_username") != self.username:
+            return
+
+        approver_username = notification.get("recipient_username")
+
+        if not approver_username:
+            return
+
+        try:
+            fingerprint = self.get_peer_fingerprint_for_verification(approver_username)
+            if fingerprint is None:
+                return
+            self.confirm_combined_peer_verification(approver_username, fingerprint)
+        except Exception as error:  # noqa: BLE001
+            self.logger.warning(
+                f"Could not auto-complete verification with {approver_username} "
+                f"after their approval: {error}"
+            )
 
     # ==========================================================
     # Utility Methods
@@ -4940,3 +6999,100 @@ class ClientSession(QObject):
         Returns the current unread count for a user.
         """
         return self.unread_counts.get(username, 0)
+
+    # ------------------------------------------------------------------
+    # Phase 19.24 -- Mute: local-only, per-conversation. Affects
+    # notifications (the sidebar's unread badge -- the only "notify the
+    # user" surface this desktop client actually has; there is no OS
+    # toast/sound system in this codebase to suppress), never delivery
+    # -- a muted conversation's messages still arrive, decrypt, persist,
+    # and mark read exactly as before. Thin wrappers over self.key_store
+    # (storage/secure_key_store.py's own new conversation_prefs
+    # section) -- gui/ code goes through these, never self.key_store
+    # directly, mirroring every other local-preference access in this
+    # class.
+    # ------------------------------------------------------------------
+
+    MUTE_DURATIONS = {
+        "1h": timedelta(hours=1),
+        "8h": timedelta(hours=8),
+        "1w": timedelta(weeks=1),
+    }
+
+    def mute_conversation(self, key, duration):
+        """
+        Mute conversation ``key`` (a username for direct, a
+        conversation_id for group -- same identity ConversationStore
+        already uses). ``duration`` is one of MUTE_DURATIONS's keys
+        ("1h", "8h", "1w") or the literal string "forever".
+        """
+
+        if self.key_store is None:
+            return
+
+        if duration == "forever":
+            muted_until = "forever"
+        else:
+            delta = self.MUTE_DURATIONS.get(duration)
+            if delta is None:
+                raise ValueError(f"Unknown mute duration: {duration!r}")
+            muted_until = (datetime.now(timezone.utc) + delta).isoformat()
+
+        self.key_store.set_conversation_muted_until(key, muted_until)
+
+    def unmute_conversation(self, key):
+        """Clear conversation ``key``'s mute state, if any."""
+
+        if self.key_store is None:
+            return
+
+        self.key_store.set_conversation_muted_until(key, None)
+
+    def is_conversation_muted(self, key):
+        """True if conversation ``key`` is currently muted (an already-
+        expired timed mute reads as False -- see SecureKeyStore.
+        is_conversation_muted()'s own docstring)."""
+
+        if self.key_store is None:
+            return False
+
+        return self.key_store.is_conversation_muted(key)
+
+    # ------------------------------------------------------------------
+    # Phase 19.24 -- Archive: local-only, per-conversation. Retains
+    # history -- archiving never deletes or hides anything server-side,
+    # purely a "don't show this in my main list" local preference. Thin
+    # wrappers over self.key_store, same shape as the Mute wrappers
+    # above.
+    # ------------------------------------------------------------------
+
+    def archive_conversation(self, key):
+        if self.key_store is None:
+            return
+        self.key_store.set_conversation_archived(key, True)
+
+    def unarchive_conversation(self, key):
+        if self.key_store is None:
+            return
+        self.key_store.set_conversation_archived(key, False)
+
+    def is_conversation_archived(self, key):
+        if self.key_store is None:
+            return False
+        return self.key_store.is_conversation_archived(key)
+
+    # ------------------------------------------------------------------
+    # Phase 19.24 -- Chat Wallpaper: local-only, per-conversation, same
+    # shape as Mute/Archive above -- never sent to or stored by the
+    # server.
+    # ------------------------------------------------------------------
+
+    def get_conversation_wallpaper(self, key):
+        if self.key_store is None:
+            return None
+        return self.key_store.get_conversation_wallpaper(key)
+
+    def set_conversation_wallpaper(self, key, wallpaper_id):
+        if self.key_store is None:
+            return
+        self.key_store.set_conversation_wallpaper(key, wallpaper_id)

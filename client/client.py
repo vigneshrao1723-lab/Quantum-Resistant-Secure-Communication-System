@@ -31,7 +31,10 @@ def authenticate(session):
     JWT via session.login(), both now happen only once this returns).
     """
 
-    identifier = input("Username or email: ").strip()
+    # UI Finalization -- Login Identifier: phone number, not username/
+    # email, is the only identifier the server now accepts -- see
+    # AuthenticationService.authenticate_user().
+    identifier = input("Phone number: ").strip()
     password = getpass.getpass("Password: ")
 
     result = session.authenticate_credentials(identifier, password)

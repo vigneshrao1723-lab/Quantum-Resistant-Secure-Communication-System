@@ -1,7 +1,7 @@
 """
 Login Window
 
-Allows the user to enter a username and
+Allows the user to enter their phone number and
 connect to the secure chat server.
 """
 
@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.styles import COLOR_OFFLINE, COLOR_TEXT_MUTED
+from gui.styles import COLOR_DANGER, COLOR_TEXT_MUTED
 from security.phone_number import is_valid_phone_number
 
 
@@ -25,6 +25,7 @@ class LoginWindow(QWidget):
     Login and registration page for the application.
     """
 
+    # UI Finalization -- Login Identifier: phone_number, password.
     login_requested = Signal(str, str)
     # username, phone_number, password, confirm_password
     register_requested = Signal(str, str, str, str)
@@ -117,10 +118,16 @@ class LoginWindow(QWidget):
         # ----------------------------------
         # Username
         #
-        # The application identity and the name shown to other users.
-        # Full name and email were removed from this form: the identity
-        # model is username (displayed) + phone number (searchable), so
-        # neither was carrying its weight. See
+        # REGISTRATION ONLY (UI Finalization -- Login Identifier): the
+        # application identity and the name shown to other users. Not
+        # collected at login -- see set_mode(), which hides this field
+        # entirely outside register mode -- because the authenticated
+        # user's username is obtained from the server/database profile
+        # AuthenticationService.authenticate_user() returns, never
+        # re-entered by hand (see MainWindow.handle_login()). Full name
+        # and email were removed from this form entirely: the identity
+        # model is username (displayed) + phone number (login +
+        # searchable), so neither was carrying its weight. See
         # MainWindow.handle_registration() for how the two database
         # columns that still exist are populated without asking the
         # user for them.
@@ -141,10 +148,15 @@ class LoginWindow(QWidget):
         # ----------------------------------
         # Phone Number
         #
-        # BUG 7 -- the discovery identifier. Mandatory, because other
-        # users find this account by it; registration is rejected
-        # server-side without one. Distinct from the username: this is
-        # what other people search for, the username is what they see.
+        # BUG 7 -- the discovery identifier other users search by.
+        # Mandatory at registration; registration is rejected
+        # server-side without one.
+        #
+        # UI Finalization -- Login Identifier: also the ONLY login
+        # identifier -- shown in both modes now (see set_mode(), which
+        # no longer hides this field for login). Username and email are
+        # never accepted as login identifiers -- see
+        # AuthenticationService.authenticate_user().
         # ----------------------------------
 
         self.phone_label = QLabel("PHONE NUMBER")
@@ -239,8 +251,8 @@ class LoginWindow(QWidget):
 
         # Field order matches the registration spec:
         # USERNAME, PHONE NUMBER, PASSWORD, CONFIRM PASSWORD.
-        # In login mode the phone and confirm-password rows hide, which
-        # leaves USERNAME + PASSWORD in the same positions.
+        # In login mode the username and confirm-password rows hide,
+        # which leaves PHONE NUMBER + PASSWORD in the same positions.
         card_layout.addWidget(self.username_label)
         card_layout.addWidget(self.username_input)
         card_layout.addWidget(self.phone_label)
@@ -258,8 +270,11 @@ class LoginWindow(QWidget):
 
         outer_layout.addWidget(card)
 
-        self.username_input.setFocus()
         self.set_mode(register=False)
+
+        # Login mode starts with the username field hidden -- focus the
+        # field that's actually shown and actually the login identifier.
+        self.phone_input.setFocus()
 
     # ======================================================
     # Private Helpers
@@ -268,22 +283,15 @@ class LoginWindow(QWidget):
     def set_mode(self, register: bool):
         self.is_register_mode = register
 
-        self.phone_label.setVisible(register)
-        self.phone_input.setVisible(register)
+        # UI Finalization -- Login Identifier: the phone number field is
+        # now shown in BOTH modes (it's the login identifier as well as
+        # the registration-only discovery identifier); only username
+        # (register-only, the display identity) and confirm-password
+        # (register-only) toggle with the mode.
+        self.username_label.setVisible(register)
+        self.username_input.setVisible(register)
         self.confirm_password_label.setVisible(register)
         self.confirm_password_input.setVisible(register)
-
-        # Existing accounts registered before this form change may still
-        # have a real email, and the server accepts either identifier --
-        # so login keeps offering both, while registration asks only for
-        # the username it will actually display.
-        self.username_label.setText(
-            "USERNAME" if register else "USERNAME OR EMAIL"
-        )
-        self.username_input.setPlaceholderText(
-            "Enter your username" if register
-            else "Enter your username or email"
-        )
 
         self.submit_button.setText("Register" if register else "Login")
         self.toggle_mode_button.setText(
@@ -324,7 +332,7 @@ class LoginWindow(QWidget):
 
         self.status.setText(f"Authentication failed: {message}")
         self.status.setStyleSheet(
-            f"color: {COLOR_OFFLINE}; font-size: 9.5pt;"
+            f"color: {COLOR_DANGER}; font-size: 9.5pt;"
         )
 
     def show_validation_error(self, message):
@@ -343,7 +351,7 @@ class LoginWindow(QWidget):
 
         self.status.setText(message)
         self.status.setStyleSheet(
-            f"color: {COLOR_OFFLINE}; font-size: 9.5pt;"
+            f"color: {COLOR_DANGER}; font-size: 9.5pt;"
         )
 
     # ======================================================
@@ -355,40 +363,45 @@ class LoginWindow(QWidget):
         if not self.submit_button.isEnabled():
             return
 
-        username = self.username_input.text().strip()
+        # UI Finalization -- Login Identifier: phone number + password
+        # is the credential pair in BOTH modes now -- register mode
+        # additionally needs username + confirm_password, checked
+        # below.
+        phone_number = self.phone_input.text().strip()
         password = self.password_input.text()
 
-        if not username:
-            self.show_validation_error("Please enter your username or email.")
+        if not phone_number:
+            self.show_validation_error("Please enter your phone number.")
             return
 
         if not password:
             self.show_validation_error("Please enter a password.")
             return
 
+        # Checked here only to fail fast with a clear message -- the
+        # server validates and normalises independently, and is the
+        # actual boundary. Applies to login too now, not just
+        # registration: an unparsable phone number can never match a
+        # stored (already-normalised) one.
+        if not is_valid_phone_number(phone_number):
+            self.show_validation_error(
+                "Enter a valid phone number, for example +91 98765 43210."
+            )
+            return
+
         self.set_connecting(True)
 
         if self.is_register_mode:
-            phone_number = self.phone_input.text().strip()
+            username = self.username_input.text().strip()
             confirm_password = self.confirm_password_input.text()
 
-            if not phone_number or not confirm_password:
+            if not username or not confirm_password:
                 # set_connecting(False) first: it overwrites the status
                 # text with "Not connected", so calling it before the
                 # validation message would immediately erase what we
                 # just told the user.
                 self.set_connecting(False)
                 self.show_validation_error("Please complete all registration fields.")
-                return
-
-            # Checked here only to fail fast with a clear message --
-            # the server validates and normalises independently, and
-            # is the actual boundary.
-            if not is_valid_phone_number(phone_number):
-                self.set_connecting(False)
-                self.show_validation_error(
-                    "Enter a valid phone number, for example +91 98765 43210."
-                )
                 return
 
             self.register_requested.emit(
@@ -398,7 +411,7 @@ class LoginWindow(QWidget):
                 confirm_password,
             )
         else:
-            self.login_requested.emit(username, password)
+            self.login_requested.emit(phone_number, password)
 
     def toggle_mode(self):
         self.set_mode(not self.is_register_mode)

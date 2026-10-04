@@ -2,14 +2,23 @@
 Message repository.
 """
 
+from datetime import datetime, timezone
+
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from database.models.conversation import Conversation
 from database.models.conversation_member import ConversationMember
 from database.models.message import Message
+from database.models.message_hidden_for_user import MessageHiddenForUser
+from database.models.message_reaction import MessageReaction
 from database.models.message_recipient import MessageRecipient
 from database.repositories.base_repository import BaseRepository
 from domain.message_delivery_status import MessageDeliveryStatus
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class MessageRepository(BaseRepository):
@@ -19,6 +28,61 @@ class MessageRepository(BaseRepository):
         message = Message(**kwargs)
         self.add(message)
         return message
+
+    def save_message_idempotent(self, **kwargs):
+        """
+        Phase 19.24 -- Message Retry idempotency. Identical to
+        save_message(), except a UNIQUE-constraint collision on
+        client_message_id (a client-generated UUID a sender optionally
+        attaches to a live send -- see database/models/message.py::
+        client_message_id's own docstring) is treated as "this exact
+        send already succeeded", not an error: the caller's retry
+        after an ambiguous network failure gets back the ALREADY-
+        persisted row instead of creating a duplicate message.
+
+        A no-op (returns None) when client_message_id was not
+        supplied at all -- there is nothing to deduplicate against,
+        identical to save_message()'s behavior for every pre-Phase-
+        19.24 caller.
+
+        Callers MUST call self.db.flush() (this uses self.add(), which
+        already does) inside a savepoint-safe context; on IntegrityError
+        this method rolls back only to before its own flush attempt
+        (via a nested transaction) so the caller's surrounding
+        transaction is not aborted.
+        """
+
+        client_message_id = kwargs.get("client_message_id")
+
+        if not client_message_id:
+            return self.save_message(**kwargs), False
+
+        existing = self.db.scalar(
+            select(Message).where(Message.client_message_id == client_message_id)
+        )
+
+        if existing is not None:
+            return existing, True
+
+        try:
+            with self.db.begin_nested():
+                message = Message(**kwargs)
+                self.db.add(message)
+                self.db.flush()
+        except IntegrityError:
+            # A genuine race: two concurrent requests for the SAME
+            # client_message_id both passed the SELECT above before
+            # either flushed. The loser here simply re-reads what the
+            # winner just committed -- still a correct, idempotent
+            # result, not an error surfaced to the caller.
+            existing = self.db.scalar(
+                select(Message).where(Message.client_message_id == client_message_id)
+            )
+            if existing is None:
+                raise
+            return existing, True
+
+        return message, False
 
     def get_message(self, message_id):
         statement = select(Message).where(Message.id == message_id)
@@ -35,7 +99,24 @@ class MessageRepository(BaseRepository):
                     & (Message.receiver_id == user_a_id),
                 )
             )
-            .order_by(Message.timestamp)
+            # Phase 19.18: Message.timestamp is client-supplied (see
+            # server/client_handler.py::_parse_message_timestamp()) --
+            # two messages sent in quick succession from the same
+            # client can round-trip through JSON with an identical
+            # value (e.g. web/client's millisecond-resolution
+            # `Date.toISOString()`), and a single-column ORDER BY gives
+            # ties no defined order. Message.created_at is never
+            # client-suppliable -- always the server-side
+            # datetime.now() default assigned when this row is
+            # persisted -- and since one connection's packets are
+            # always handled by one thread in strict arrival order
+            # (docs/architecture/server_architecture.md, Concurrency),
+            # it reflects true receipt order even when `timestamp`
+            # ties. Kept as a secondary key, not primary, so a
+            # legitimately later message with an earlier client
+            # timestamp (e.g. clock skew across devices) still sorts
+            # by when it was actually sent in the common case.
+            .order_by(Message.timestamp, Message.created_at)
         )
         return self.db.scalars(statement).all()
 
@@ -51,7 +132,10 @@ class MessageRepository(BaseRepository):
         statement = (
             select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(Message.timestamp)
+            # Phase 19.18: see get_conversation()'s identical comment --
+            # created_at breaks a timestamp tie using true server
+            # receipt order.
+            .order_by(Message.timestamp, Message.created_at)
         )
         return self.db.scalars(statement).all()
 
@@ -277,3 +361,226 @@ class MessageRepository(BaseRepository):
             message_ids.append(row.message_id)
 
         return message_ids
+
+    # ==================================================================
+    # Phase 19.24 -- Message Lifecycle Events
+    # ==================================================================
+
+    def apply_edit(self, message, ciphertext, content_metadata, epoch, message_signature):
+        """
+        Overwrite ``message``'s content in place and bump its edit
+        bookkeeping. Authorization (actor == message.sender_id) and
+        edit_version staleness checks are the CALLER's responsibility
+        (server/client_handler.py::handle_message_edit()) -- this
+        method only performs the mutation, exactly like every other
+        repository method in this class leaves authorization to its
+        caller (see mark_conversation_read()'s identical division of
+        responsibility).
+
+        Same logical message_id, never a new row -- there is no
+        "second fake message" for an edit.
+        """
+
+        message.ciphertext = ciphertext
+        message.content_metadata = content_metadata
+        message.epoch = epoch
+        message.message_signature = message_signature
+        message.edited_at = _utc_now()
+        message.edit_version += 1
+
+        return message
+
+    def apply_delete_for_everyone(self, message, deleted_by_user_id):
+        """
+        REAL data minimization, not a soft UI flag: nulls the
+        columns that actually reconstruct plaintext (ciphertext,
+        content_metadata, message_signature) -- blob_ref is left for
+        the caller to read BEFORE calling this (so it can still delete
+        the referenced encrypted_blob_store file) and is nulled here
+        too, after. deleted_at/deleted_by are the only things that
+        survive, for UI attribution and for history filtering to
+        recognize this row as "deleted" rather than merely empty.
+        """
+
+        message.ciphertext = None
+        message.content_metadata = None
+        message.message_signature = None
+        message.blob_ref = None
+        message.deleted_at = _utc_now()
+        message.deleted_by = deleted_by_user_id
+
+        return message
+
+    def hide_for_user(self, message_id, user_id):
+        """
+        "Delete for me" (database/models/message_hidden_for_user.py).
+        Idempotent: a second hide request for an already-hidden
+        message is a silent no-op, never a duplicate-row error.
+        """
+
+        existing = self.db.scalar(
+            select(MessageHiddenForUser).where(
+                MessageHiddenForUser.message_id == message_id,
+                MessageHiddenForUser.user_id == user_id,
+            )
+        )
+
+        if existing is not None:
+            return existing
+
+        return self.add(MessageHiddenForUser(message_id=message_id, user_id=user_id))
+
+    def get_hidden_message_ids_for_user(self, user_id, message_ids):
+        """
+        Which of ``message_ids`` this user has hidden for themself --
+        used to filter history/search results. Scoped to a specific
+        set of ids (rather than "every hidden message ever") so a
+        caller already holding one conversation's message list can
+        filter it with a single indexed query.
+        """
+
+        if not message_ids:
+            return set()
+
+        statement = select(MessageHiddenForUser.message_id).where(
+            MessageHiddenForUser.user_id == user_id,
+            MessageHiddenForUser.message_id.in_(message_ids),
+        )
+        return set(self.db.scalars(statement).all())
+
+    def upsert_reaction(self, message_id, user_id, ciphertext, epoch, message_signature=None):
+        """
+        Set/replace ``user_id``'s reaction on ``message_id`` (add
+        semantics -- a user has at most one active reaction per
+        message; adding a new one replaces, never stacks, the old
+        one). Returns the row. ``message_signature`` (continued Phase
+        19.24 -- receiver-side verification) is persisted alongside
+        the ciphertext so history recovery can verify it too, not only
+        a live notification.
+        """
+
+        existing = self.db.scalar(
+            select(MessageReaction).where(
+                MessageReaction.message_id == message_id,
+                MessageReaction.user_id == user_id,
+            )
+        )
+
+        if existing is not None:
+            existing.ciphertext = ciphertext
+            existing.epoch = epoch
+            existing.message_signature = message_signature
+            existing.updated_at = _utc_now()
+            return existing
+
+        return self.add(
+            MessageReaction(
+                message_id=message_id, user_id=user_id,
+                ciphertext=ciphertext, epoch=epoch,
+                message_signature=message_signature,
+            )
+        )
+
+    def remove_reaction(self, message_id, user_id):
+        """Remove ``user_id``'s reaction on ``message_id``, if any.
+        Returns True if a row was actually removed (so the caller
+        knows whether a reaction_updated notification is worth
+        sending), False if there was nothing to remove."""
+
+        existing = self.db.scalar(
+            select(MessageReaction).where(
+                MessageReaction.message_id == message_id,
+                MessageReaction.user_id == user_id,
+            )
+        )
+
+        if existing is None:
+            return False
+
+        self.delete(existing)
+        return True
+
+    def pin_message(self, message_id, user_id):
+        """
+        Mark ``message_id`` pinned by ``user_id``. Idempotent-ish: a
+        re-pin (already pinned, by anyone) simply overwrites pinned_at/
+        pinned_by to reflect this latest pin action -- mirrors
+        upsert_reaction()'s own "replace, never stack" semantics.
+        Authorization (active conversation membership) is the CALLER's
+        responsibility (server/client_handler.py::handle_message_pin()),
+        exactly like apply_edit()'s identical division of
+        responsibility. Returns the row, or None if message_id does not
+        exist.
+        """
+
+        message = self.get_message(message_id)
+
+        if message is None:
+            return None
+
+        message.pinned_at = _utc_now()
+        message.pinned_by = user_id
+
+        return message
+
+    def unpin_message(self, message_id):
+        """
+        Clear message_id's pin state. Idempotent: unpinning an already-
+        unpinned message is a silent no-op. Returns the row, or None if
+        message_id does not exist.
+        """
+
+        message = self.get_message(message_id)
+
+        if message is None:
+            return None
+
+        message.pinned_at = None
+        message.pinned_by = None
+
+        return message
+
+    def get_pinned_messages(self, conversation_id):
+        """
+        Every currently-pinned message in a conversation, most-
+        recently-pinned first -- the server-side source of truth
+        handle_pinned_messages_list_request() answers with, so a
+        client (including one just reconnecting, or a newly-authorized
+        device with no local history of its own yet) can always
+        recover the CURRENT pinned set rather than relying only on live
+        message_pinned/message_unpinned notifications it may have
+        missed while offline.
+        """
+
+        statement = (
+            select(Message)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.pinned_at.is_not(None),
+            )
+            .order_by(Message.pinned_at.desc())
+        )
+        return self.db.scalars(statement).all()
+
+    def get_reactions_for_messages(self, message_ids):
+        """
+        {message_id: [(user_id, ciphertext, epoch, message_signature), ...]}
+        for every reaction on any of ``message_ids`` -- used by history
+        reload to restore reaction state (Phase 19.24's own "history
+        recovery" requirement) in one batched query rather than one per
+        message.
+        """
+
+        if not message_ids:
+            return {}
+
+        statement = select(MessageReaction).where(
+            MessageReaction.message_id.in_(message_ids)
+        )
+
+        by_message = {}
+        for row in self.db.scalars(statement).all():
+            by_message.setdefault(row.message_id, []).append(
+                (row.user_id, row.ciphertext, row.epoch, row.message_signature)
+            )
+        return by_message

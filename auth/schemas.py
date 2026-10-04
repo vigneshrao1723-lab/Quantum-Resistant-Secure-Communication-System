@@ -20,6 +20,11 @@ class RegisterRequest:
 
 @dataclass
 class LoginRequest:
+    # UI Finalization -- Login Identifier: the registered phone number
+    # (any of its accepted written forms -- see
+    # security/phone_number.py -- AuthenticationService.authenticate_
+    # user() normalises it before lookup). Username and email are not
+    # accepted here.
     identifier: str
     password: str
     remember_me: bool = False

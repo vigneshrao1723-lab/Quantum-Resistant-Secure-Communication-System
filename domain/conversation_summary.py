@@ -68,6 +68,7 @@ class ConversationSummary:
     is_group: bool = False
     group_name: str | None = None
     participants: list[str] | None = None
+    admin: str | None = None
 
     @property
     def key(self) -> str:

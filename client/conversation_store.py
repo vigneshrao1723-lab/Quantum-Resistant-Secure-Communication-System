@@ -23,6 +23,19 @@ record_direct_conversation_id(), a pure in-memory operation with no
 database access at all. A group conversation never needs this either
 -- its conversation_id is already known synchronously at creation
 (see add_or_update_group()).
+
+Sidebar visibility tracks real activity, not mere existence. A direct
+conversation's identity can be (and is) resolved before any message
+is ever sent -- ClientSession.set_current_chat() needs a
+conversation_id for key-manager/epoch setup the instant a chat is
+opened, whether or not anything gets typed. That resolution
+deliberately does NOT, by itself, create an entry in this store: only
+record_message() (real, attributable activity -- a message actually
+sent or received) or add_or_update_group()/a group notification (a
+group's membership is real the moment it's created, unlike a lazily-
+resolved direct conversation) make an entry appear here, and therefore
+in the sidebar. update_online_status() only ever updates existing
+entries' presence, never adds one for its own sake.
 """
 
 from datetime import datetime
@@ -61,14 +74,31 @@ class ConversationStore(QObject):
 
         self.conversations_changed.emit()
 
-    def record_message(self, key, preview, is_own, is_online):
+    def record_message(self, key, preview, is_own, is_online, conversation_id=None):
         """
-        Record the latest message for a conversation, creating a new
-        (placeholder, conversation_id-less) direct entry if this is
-        the first activity with this partner this session. ``key`` is
-        a username for a direct conversation or a conversation_id for
-        a group one (Phase 4 -- Secure Group Messaging Foundation) --
-        see ConversationSummary.key.
+        Record the latest message for a conversation -- the point a
+        direct conversation becomes eligible for sidebar display (see
+        this module's docstring: sidebar visibility tracks real
+        activity, not mere DB/key-manager existence). Creates a new
+        entry if this is the first activity with this partner this
+        session. ``key`` is a username for a direct conversation or a
+        conversation_id for a group one (Phase 4 -- Secure Group
+        Messaging Foundation) -- see ConversationSummary.key.
+
+        ``conversation_id`` (optional): the real, already-resolved
+        conversation_id for a brand-new entry. A direct conversation's
+        id is resolved server-side when the chat is opened (see
+        ClientSession.set_current_chat()), before any message exists,
+        but is deliberately NOT cached into this store at that point
+        (that would make an empty conversation sidebar-visible) -- the
+        sender's own send path is therefore the first time this store
+        ever learns of it, and must pass the id it already has rather
+        than leaving it None. The receive path doesn't need this: an
+        incoming message's conversation_id is always cached first via
+        record_direct_conversation_id()/handle_session_key(), so
+        ``existing`` is already populated with the real id by the time
+        this runs. Ignored when updating an existing entry, which
+        always keeps its own conversation_id.
 
         Used identically for outgoing and incoming text messages
         today. A future file, image, voice, or reaction update calls
@@ -83,14 +113,16 @@ class ConversationStore(QObject):
 
         existing = self._summaries.get(key)
 
-        conversation_id = existing.conversation_id if existing else None
+        resolved_conversation_id = (
+            existing.conversation_id if existing else conversation_id
+        )
         is_group = existing.is_group if existing else False
         group_name = existing.group_name if existing else None
         participants = existing.participants if existing else None
         username = existing.username if existing else key
 
         self._summaries[key] = ConversationSummary(
-            conversation_id=conversation_id,
+            conversation_id=resolved_conversation_id,
             username=username,
             is_online=is_online,
             latest_message=preview,
@@ -101,19 +133,30 @@ class ConversationStore(QObject):
 
         self.conversations_changed.emit()
 
-    def add_or_update_group(self, conversation_id, group_name, participant_usernames):
+    def add_or_update_group(self, conversation_id, group_name, participant_usernames, admin=None):
         """
         Ensure a group conversation entry exists (or refresh its name/
         participants) -- called once when a group is created or when
         this client first learns about an existing one. Never touches
         latest_message; record_message() is still the only place that
         updates it, for groups exactly as for direct conversations.
+
+        ``admin`` (Phase 19.18 -- Desktop Group Info/Remove Member
+        parity): the group's admin username, when the caller has it
+        (group_create_result's own "creator" field, or the
+        conversation-list preview's "admin_username"). group_members_
+        added carries neither -- that packet's own docstring already
+        establishes the "preserve what wasn't sent" precedent this
+        follows for latest_message/is_online, so a member-added update
+        with no admin argument keeps whatever admin was already on
+        file rather than wiping it back to unknown.
         """
 
         existing = self._summaries.get(conversation_id)
 
         latest_message = existing.latest_message if existing else None
         is_online = existing.is_online if existing else False
+        resolved_admin = admin if admin is not None else (existing.admin if existing else None)
 
         self._summaries[conversation_id] = ConversationSummary(
             conversation_id=conversation_id,
@@ -123,6 +166,7 @@ class ConversationStore(QObject):
             is_group=True,
             group_name=group_name,
             participants=list(participant_usernames),
+            admin=resolved_admin,
         )
 
         self.conversations_changed.emit()
@@ -151,6 +195,7 @@ class ConversationStore(QObject):
             is_group=True,
             group_name=existing.group_name,
             participants=list(participant_usernames),
+            admin=existing.admin,
         )
 
         self.conversations_changed.emit()
@@ -210,26 +255,24 @@ class ConversationStore(QObject):
 
     def update_online_status(self, usernames_online):
         """
-        Refresh online/offline status for existing conversations, and
-        add a placeholder entry (no conversation yet, no preview) for
-        any online user who isn't already represented -- preserving
-        the ability to start a new chat with anyone online, exactly
-        as before Phase 2.
+        Refresh online/offline status for existing conversations only.
+
+        Deliberately does NOT add an entry for an online user who
+        isn't already represented (that was the "before Phase 2"
+        behavior, and the other of the two mechanisms -- alongside
+        record_direct_conversation_id() being called merely from
+        opening a chat -- that made the sidebar double as an
+        online-user picker regardless of whether any real conversation
+        existed). Starting a chat with someone not yet in this store
+        is Find User's job (gui/find_user_dialog.py); this store's
+        sidebar-visible set is scoped to conversations with real
+        activity, per this module's docstring.
         """
 
         online_set = set(usernames_online)
 
         for username, summary in self._summaries.items():
             summary.is_online = username in online_set
-
-        for username in online_set:
-            if username not in self._summaries:
-                self._summaries[username] = ConversationSummary(
-                    conversation_id=None,
-                    username=username,
-                    is_online=True,
-                    latest_message=None,
-                )
 
         self.conversations_changed.emit()
 

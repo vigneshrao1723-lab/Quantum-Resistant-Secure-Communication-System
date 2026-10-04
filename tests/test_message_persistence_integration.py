@@ -19,6 +19,7 @@ Run with:
     pytest tests/test_message_persistence_integration.py -v
 """
 
+import base64
 import json
 import socket
 import struct
@@ -47,11 +48,51 @@ from tests.tls_test_support import (
     start_test_server,
     wrap_client_socket,
 )
+from crypto.message_protocol import sign_message_payload
+from crypto.ml_dsa import MLDSASigner
 from utils.protocol import (
     create_auth_packet,
     create_chat_packet,
     create_public_key_packet,
 )
+
+
+def _signed_chat_packet(sender, receiver, plaintext_message, timestamp):
+    """
+    Message-Level ML-DSA Origin Authentication: builds a real, validly
+    signed "chat" packet from a fresh, one-off ML-DSA identity for a
+    raw-socket ``sender`` (which has no real ClientSession/identity of
+    its own) -- required for a real recipient ClientSession's
+    load_conversation_history() to accept and decrypt it at all (see
+    handle_chat()'s/_verify_history_message_signature()'s own
+    docstrings: there is no unsigned message path).
+
+    Returns (packet, signing_public_key). The recipient ClientSession
+    (created AFTER the packet is sent, in every caller below) must
+    have signing_public_key seeded into its own
+    _observed_peer_signing_public_keys[sender] before calling
+    load_conversation_history() -- mirroring how these tests already
+    manually seed the AES session key, since this raw-socket sender
+    never went through a real signed public-key exchange for the
+    recipient to have observed it through.
+    """
+
+    signer = MLDSASigner()
+    signer.generate_keys()
+
+    signature = sign_message_payload(
+        signer, sender, receiver, None, "text", plaintext_message, None, None
+    )
+
+    packet = create_chat_packet(
+        sender=sender,
+        receiver=receiver,
+        message=plaintext_message,
+        timestamp=timestamp,
+        message_signature=base64.b64encode(signature).decode("ascii"),
+    )
+
+    return packet, signer.export_public_key()
 
 
 def _send(sock, message):
@@ -143,7 +184,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -805,15 +846,13 @@ def test_load_conversation_history_decrypts_with_cached_session_key(
     session_key = b"K" * 32
     plaintext = "a real decryptable message"
 
-    _send(
-        sender_sock,
-        create_chat_packet(
-            sender=sender_name,
-            receiver=recipient_name,
-            message=AESCipher(session_key).encrypt(plaintext),
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        ),
+    packet, sender_signing_public_key = _signed_chat_packet(
+        sender_name,
+        recipient_name,
+        AESCipher(session_key).encrypt(plaintext),
+        datetime.now(timezone.utc).isoformat(),
     )
+    _send(sender_sock, packet)
     _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
     _wait_for_conversation_length(sender_id, recipient_id, 1)
 
@@ -827,6 +866,9 @@ def test_load_conversation_history_decrypts_with_cached_session_key(
         _open_direct_chat(recipient_view, sender_name)
         recipient_view.key_manager.store_key(
             recipient_view.current_conversation_id, session_key
+        )
+        recipient_view._observed_peer_signing_public_keys[sender_name] = (
+            sender_signing_public_key
         )
 
         history = recipient_view.load_conversation_history(sender_name)
@@ -923,6 +965,89 @@ def test_image_payload_also_routed_to_blob_storage(sender_and_recipient):
     try:
         assert encrypted_blob_store.load_blob(saved.blob_ref) == (
             b"fake-image-ciphertext-blob"
+        )
+    finally:
+        encrypted_blob_store.delete_blob(saved.blob_ref)
+
+
+def test_voice_payload_also_routed_to_blob_storage(sender_and_recipient):
+    """Phase 19.24 -- Voice Messages: proves voice is FILE/IMAGE's
+    exact same blob-storage routing, not a new pipeline of its own."""
+    from domain.payload_envelope import PayloadEnvelope
+    from domain.payload_type import PayloadType
+    from storage import encrypted_blob_store
+    from utils.protocol import create_payload_packet
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    envelope = PayloadEnvelope(
+        payload_type=PayloadType.VOICE,
+        ciphertext="fake-voice-ciphertext-blob",
+        content_metadata={"filename": "clip.m4a", "mime_type": "audio/mp4"},
+    )
+
+    _send(
+        sender_sock,
+        create_payload_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            envelope=envelope,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.payload_type == PayloadType.VOICE
+    assert saved.ciphertext is None
+    assert saved.blob_ref is not None
+
+    try:
+        assert encrypted_blob_store.load_blob(saved.blob_ref) == (
+            b"fake-voice-ciphertext-blob"
+        )
+    finally:
+        encrypted_blob_store.delete_blob(saved.blob_ref)
+
+
+def test_video_payload_also_routed_to_blob_storage(sender_and_recipient):
+    """Phase 19.24 -- Video Messages: same proof as voice, above."""
+    from domain.payload_envelope import PayloadEnvelope
+    from domain.payload_type import PayloadType
+    from storage import encrypted_blob_store
+    from utils.protocol import create_payload_packet
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    envelope = PayloadEnvelope(
+        payload_type=PayloadType.VIDEO,
+        ciphertext="fake-video-ciphertext-blob",
+        content_metadata={"filename": "clip.mp4", "mime_type": "video/mp4"},
+    )
+
+    _send(
+        sender_sock,
+        create_payload_packet(
+            sender=sender_name,
+            receiver=recipient_name,
+            envelope=envelope,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+
+    saved = _wait_for_persisted_message(sender_id, recipient_id)
+    assert saved is not None
+    assert saved.payload_type == PayloadType.VIDEO
+    assert saved.ciphertext is None
+    assert saved.blob_ref is not None
+
+    try:
+        assert encrypted_blob_store.load_blob(saved.blob_ref) == (
+            b"fake-video-ciphertext-blob"
         )
     finally:
         encrypted_blob_store.delete_blob(saved.blob_ref)
@@ -1089,15 +1214,13 @@ def test_offline_message_appears_and_decrypts_in_recipient_history_after_reconne
     ciphertext = AESCipher(session_key).encrypt(plaintext)
 
     try:
-        _send(
-            sender_sock,
-            create_chat_packet(
-                sender=sender_name,
-                receiver=recipient_name,
-                message=ciphertext,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            ),
+        packet, sender_signing_public_key = _signed_chat_packet(
+            sender_name,
+            recipient_name,
+            ciphertext,
+            datetime.now(timezone.utc).isoformat(),
         )
+        _send(sender_sock, packet)
         _recv_until(sender_sock, lambda p: p.get("type") == "message_queued")
 
         saved = _wait_for_persisted_message(
@@ -1113,6 +1236,9 @@ def test_offline_message_appears_and_decrypts_in_recipient_history_after_reconne
             _open_direct_chat(recipient_view, sender_name)
             recipient_view.key_manager.store_key(
                 recipient_view.current_conversation_id, session_key
+            )
+            recipient_view._observed_peer_signing_public_keys[sender_name] = (
+                sender_signing_public_key
             )
 
             history = recipient_view.load_conversation_history(sender_name)

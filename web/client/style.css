@@ -1,0 +1,960 @@
+/*
+ * QRSCS Web Client -- Design System (Phase 19.17A)
+ *
+ * The Android APK (mobile/app.py) is this project's design reference
+ * across all three clients. Every token below is taken directly from
+ * mobile/app.py's own PURPLE/BG/SURFACE/TEXT_DARK/TEXT_GRAY/
+ * ONLINE_GREEN/OFFLINE_GRAY/DANGER/BORDER constants (its RGBA floats
+ * converted to hex) -- the same values gui/styles.py now uses for the
+ * desktop client. This file is presentation only: it does not touch
+ * WebClientSession, protocol.js, or crypto.js, and every existing
+ * element id main.js already queries is preserved so no session/
+ * crypto call site changes.
+ */
+
+:root {
+  --bg: #F3F3F6;
+  --surface: #FFFFFF;
+  --surface-alt: #ECECF2;
+  --border: #E6E6ED;
+
+  --text: #1D1D2E;
+  --text-muted: #8E8E98;
+  --text-on-accent: #FFFFFF;
+
+  --accent: #765CF2;
+  --accent-hover: #8B74F5;
+  --accent-pressed: #5E44E0;
+  --accent-soft: #765CF215;
+
+  --online: #2DC8A4;
+  --offline: #B5B5BA;
+  --danger: #D95252;
+  --danger-soft: #FBE6EA;
+
+  --bubble-sent: var(--accent);
+  --bubble-received: #D9D9E6;
+  --read-tick: #59ADF7;
+
+  --radius-pill: 999px;
+  --radius-lg: 18px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+
+  --shadow-card: 0 1px 2px rgba(20,15,60,.04), 0 8px 24px -12px rgba(20,15,60,.14);
+  --font: "Roboto", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font-family: inherit; }
+input { font-family: inherit; }
+
+/* ==================================================================
+   Screen switcher -- #screen-login / #screen-app. main.js toggles a
+   `hidden` attribute on these two containers; nothing else about the
+   existing DOM contract changes.
+   ================================================================== */
+
+[hidden] { display: none !important; }
+
+/* ==================================================================
+   LOGIN SCREEN -- matches mobile/app.py LoginScreen: centered card,
+   QRSCS wordmark + full name + subtitle, phone/password fields, a
+   purple pill primary button, a ghost secondary action.
+   ================================================================== */
+
+#screen-login {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--surface);
+  border-radius: 24px;
+  box-shadow: var(--shadow-card);
+  padding: 40px 36px 32px;
+}
+
+.brand-mark {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -.01em;
+  margin: 0;
+}
+
+.brand-full {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 4px 0 0;
+}
+
+.brand-subtitle {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin: 10px 0 26px;
+}
+
+.field-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 16px 0 6px;
+}
+
+.field-label:first-of-type { margin-top: 0; }
+
+.input {
+  width: 100%;
+  background: var(--surface-alt);
+  border: 2px solid transparent;
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  font-size: 14px;
+  color: var(--text);
+  outline: none;
+  transition: border-color .12s ease, background .12s ease;
+}
+
+.input::placeholder { color: var(--text-muted); }
+
+.input:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 12px 22px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .12s ease, opacity .12s ease, transform .05s ease;
+  white-space: nowrap;
+}
+
+.btn:active { transform: scale(.98); }
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:disabled { background: var(--surface-alt); color: var(--text-muted); cursor: default; }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--accent);
+  border: 1.5px solid var(--border);
+}
+.btn-ghost:hover { border-color: var(--accent); background: var(--accent-soft); }
+
+.btn-danger {
+  background: transparent;
+  color: var(--danger);
+  border: 1.5px solid var(--danger-soft);
+}
+.btn-danger:hover { background: var(--danger-soft); }
+
+.btn-block { width: 100%; margin-top: 10px; }
+.btn-sm { padding: 8px 16px; font-size: 12.5px; }
+.btn-icon {
+  width: 38px; height: 38px; padding: 0; border-radius: var(--radius-pill);
+  background: var(--surface-alt); color: var(--text); border: none; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 16px;
+}
+.btn-icon:hover { background: var(--border); }
+
+.auth-status {
+  margin-top: 16px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  text-align: center;
+  min-height: 16px;
+}
+.auth-status.is-error { color: var(--danger); font-weight: 600; }
+
+.auth-switch {
+  text-align: center;
+  margin-top: 18px;
+  font-size: 12.5px;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 600;
+}
+.auth-switch:hover { text-decoration: underline; }
+
+.gateway-field {
+  margin-top: 14px;
+  opacity: 0.7;
+}
+.gateway-field .field-label { font-size: 10px; }
+.gateway-field .input { height: 34px; font-size: 12px; }
+
+/* ==================================================================
+   APP SHELL -- sidebar (search/tabs/list) + main pane (header/
+   messages/composer), matching the Android chat-list <-> chat-screen
+   relationship adapted to a wide viewport.
+   ================================================================== */
+
+#screen-app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  height: 56px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 18px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar .brand-mark { font-size: 17px; }
+
+.topbar-spacer { flex: 1; }
+
+.connection-pill {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  padding: 5px 12px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-alt);
+  color: var(--text-muted);
+}
+.connection-pill[data-state="connected"] { background: var(--online)25; color: #16805F; }
+.connection-pill[data-state="connecting"],
+.connection-pill[data-state="reconnecting"] { background: #FBF0DA; color: #93650B; }
+.connection-pill[data-state="disconnected"] { background: var(--danger-soft); color: var(--danger); }
+
+.app-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  min-height: 0;
+}
+
+@media (max-width: 860px) {
+  .app-body { grid-template-columns: 260px 1fr; }
+}
+
+@media (max-width: 640px) {
+  .app-body { grid-template-columns: 1fr; }
+  .sidebar.is-chat-open { display: none; }
+  .main-pane.is-empty { display: none; }
+}
+
+/* ---- Sidebar ---- */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  min-height: 0;
+}
+
+.sidebar-search {
+  padding: 14px;
+  flex: none;
+}
+
+.sidebar-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 14px 10px;
+  flex: none;
+}
+
+.tab-btn {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 8px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  position: relative;
+}
+.tab-btn:hover { background: var(--surface-alt); }
+.tab-btn.is-active { background: var(--accent-soft); color: var(--accent); }
+
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 4px;
+}
+
+.sidebar-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+}
+
+/* Phase 19.24 -- Archive: the toggle between the main (non-archived)
+   list and the archived one, above #chatList/#groupList. */
+.sidebar-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 8px 6px;
+  flex: none;
+}
+
+.sidebar-panel { display: none; flex-direction: column; min-height: 0; flex: 1; }
+.sidebar-panel.is-active { display: flex; }
+
+.device-panel {
+  flex: 0 0 auto;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 10px 14px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-alt);
+}
+
+.sidebar-footer {
+  flex: none;
+  border-top: 1px solid var(--border);
+  padding: 10px;
+  display: flex;
+  gap: 8px;
+}
+
+/* ---- Row card (conversation / group / device / member) ---- */
+
+.row-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  margin-bottom: 2px;
+}
+.row-card:hover { background: var(--surface-alt); }
+.row-card.is-selected { background: var(--accent-soft); }
+
+/* Phase 19.24 -- Mute: a small, always-present icon button per row --
+   Web has no native right-click menu or long-press gesture of its own
+   to piggyback on (unlike Desktop's real context menu / mobile's
+   long-press), so this is the tap/click entry point instead. */
+.row-mute-btn {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.row-mute-btn:hover { background: var(--surface-alt); }
+
+.avatar {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--navy, #1E1B44);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 16px;
+  position: relative;
+  overflow: hidden;
+}
+.avatar.sm { width: 32px; height: 32px; font-size: 13px; }
+
+/* Phase 19.17C -- a real profile picture fully fills the circular
+   avatar with a centered crop (never stretched, any source aspect
+   ratio) instead of the initial-letter fallback text. */
+.avatar img {
+  width: 100%; height: 100%; border-radius: 50%;
+  object-fit: cover; object-position: center;
+}
+
+.presence-dot {
+  position: absolute;
+  right: -1px; bottom: -1px;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--surface);
+  background: var(--offline);
+}
+.presence-dot.is-online { background: var(--online); }
+
+.row-main { flex: 1; min-width: 0; }
+.row-title {
+  font-weight: 700;
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.row-meta {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+.row-time { font-size: 10.5px; color: var(--text-muted); }
+
+.empty-hint {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  text-align: center;
+  padding: 24px 16px;
+}
+
+/* ---- Main pane ---- */
+
+.main-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-header {
+  flex: none;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 18px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-header-back {
+  display: none;
+}
+@media (max-width: 640px) {
+  .chat-header-back { display: inline-flex; }
+}
+
+.chat-header-info { flex: 1; min-width: 0; }
+.chat-header-title { font-weight: 700; font-size: 14.5px; display: flex; align-items: center; gap: 6px; }
+.chat-header-sub { font-size: 11.5px; color: var(--text-muted); margin-top: 1px; }
+
+.verified-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--online)22;
+  color: #16805F;
+}
+.verified-badge.is-unverified { background: var(--surface-alt); color: var(--text-muted); }
+
+.message-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Phase 19.24 -- Chat Wallpaper: local-only, per-conversation (main.js
+   applies/removes one of these classes on #messages/#groupMessages) --
+   never sent to or stored by the server. Same preset ids and colors
+   as gui/styles.py::WALLPAPER_PRESETS/mobile/app.py's own WALLPAPER_
+   PRESETS, so switching clients feels like the same app. Deliberately
+   low-contrast -- the existing solid, opaque .bubble background always
+   renders on top, so readability is never at risk. */
+.message-scroll.wallpaper-lavender { background: linear-gradient(135deg, #EDE9FE, #DCD3FB); }
+.message-scroll.wallpaper-ocean { background: linear-gradient(135deg, #E3F2FD, #BBDEFB); }
+.message-scroll.wallpaper-sunset { background: linear-gradient(135deg, #FFF3E0, #FFE0B2); }
+.message-scroll.wallpaper-mint { background: linear-gradient(135deg, #E0F5EC, #C8ECDE); }
+.message-scroll.wallpaper-midnight { background: linear-gradient(135deg, #2A2A3D, #1D1D2E); }
+
+.date-sep {
+  align-self: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  background: var(--surface-alt);
+  padding: 4px 12px;
+  border-radius: var(--radius-pill);
+  margin: 10px 0;
+}
+
+.msg-row { display: flex; max-width: 72%; }
+.msg-row.is-mine { align-self: flex-end; justify-content: flex-end; }
+.msg-row.is-theirs { align-self: flex-start; }
+.msg-row.is-system { align-self: center; max-width: 90%; }
+
+.bubble {
+  padding: 9px 13px;
+  font-size: 13.5px;
+  border-radius: 16px;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.msg-row.is-mine .bubble {
+  background: var(--bubble-sent);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+.msg-row.is-theirs .bubble {
+  background: var(--bubble-received);
+  color: var(--text);
+  border-bottom-left-radius: 4px;
+}
+.msg-row.is-system .bubble {
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  text-align: center;
+}
+.msg-row.is-historical .bubble { opacity: .7; }
+
+.bubble-sender {
+  font-size: 10.5px;
+  font-weight: 700;
+  opacity: .85;
+  margin-bottom: 2px;
+}
+
+.bubble-footer {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  font-size: 10px;
+  opacity: .8;
+}
+.tick-read { color: var(--read-tick); font-weight: 700; }
+.tick-failed { color: #FFD9DF; font-weight: 700; }
+/* Phase 19.23 -- Issue 5: no extra letter-spacing/margin added here on
+   top of the single space already in TICK_TEXT (main.js) -- the two
+   check marks in "✓✓" are adjacent characters in that one string, not
+   two separate elements, so there is nothing here that could
+   introduce the "too much gap" defect this issue exists to avoid. */
+.msg-tick { font-weight: 700; }
+
+/* Phase 19.24 -- Message Retry: a failed send's own bubble, rendered
+   directly into the transcript (not bubbleShell()-based -- see main.js
+   ::renderFailedBubble()'s own comment for why) so the failure and its
+   Retry control stay visible and addressable, not just a transient
+   #log line. */
+.bubble.is-failed { opacity: .85; }
+.bubble.is-failed .bubble-footer { color: var(--danger); opacity: 1; }
+.bubble-retry-btn {
+  margin-top: 6px;
+  border: 1px solid var(--danger);
+  background: transparent;
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.bubble-retry-btn:hover { background: var(--danger); color: #fff; }
+.bubble-retry-btn:disabled { opacity: .6; cursor: default; }
+
+/* Phase 19.23 -- Issue 4: always visible, never opacity/visibility
+   gated behind :hover -- see main.js::renderAttachment()'s own
+   comment for why an image bubble previously had no Save affordance
+   at all. */
+.msg-image-actions { display: flex; gap: 6px; margin-top: 6px; }
+.msg-image-actions .btn { text-decoration: none; }
+
+.bubble-image { max-width: 260px; border-radius: 12px; display: block; margin-top: 4px; cursor: zoom-in; }
+.bubble-file {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(255,255,255,.14);
+  border-radius: 10px; padding: 8px 10px; margin-top: 4px;
+  text-decoration: none; color: inherit; font-size: 12.5px; font-weight: 600;
+}
+.msg-row.is-theirs .bubble-file { background: var(--surface); }
+
+.composer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 18px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+.composer .input { flex: 1; }
+
+.main-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 13.5px;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ---- Image lightbox ---- */
+
+.lightbox {
+  position: fixed; inset: 0; background: rgba(10,8,20,.82);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+  cursor: zoom-out;
+}
+.lightbox img { max-width: 90vw; max-height: 90vh; border-radius: 8px; }
+
+/* Phase 19.24 -- Voice/Video Messages: the recorder modal, same
+   overlay pattern as .lightbox above. */
+.media-recorder-modal {
+  position: fixed; inset: 0; background: rgba(10,8,20,.82);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+.media-recorder-card {
+  background: var(--surface); border-radius: 12px; padding: 20px;
+  width: 340px; max-width: 92vw; display: flex; flex-direction: column;
+  gap: 12px; align-items: stretch;
+}
+.media-recorder-timer {
+  text-align: center; font-size: 24px; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.media-recorder-status { text-align: center; font-size: 12px; color: var(--text-muted); }
+.media-recorder-actions { display: flex; justify-content: space-between; gap: 8px; }
+.media-recorder-preview { width: 100%; max-height: 220px; border-radius: 8px; background: #000; }
+
+.confirm-modal {
+  position: fixed; inset: 0; background: rgba(10,8,20,.82);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+.confirm-modal-card {
+  background: var(--surface); border-radius: 12px; padding: 20px;
+  width: 320px; max-width: 92vw; display: flex; flex-direction: column;
+  gap: 14px; align-items: stretch;
+}
+.confirm-modal-title { font-size: 16px; font-weight: 700; }
+.confirm-modal-message { font-size: 13px; color: var(--text-muted); line-height: 1.4; }
+.confirm-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+.gallery-card { width: 420px; max-width: 94vw; max-height: 82vh; overflow-y: auto; }
+.gallery-header { display: flex; align-items: center; justify-content: space-between; }
+.gallery-section-heading { font-size: 12px; font-weight: 700; color: var(--text-muted); margin-top: 6px; }
+.gallery-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.gallery-tile {
+  aspect-ratio: 1; border-radius: 8px; overflow: hidden; cursor: pointer;
+  background: var(--bg-subtle, rgba(120,110,160,.12)); display: flex; align-items: center; justify-content: center;
+}
+.gallery-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.gallery-tile-label { font-size: 12px; text-align: center; color: var(--text-muted); padding: 4px; }
+.gallery-list { display: flex; flex-direction: column; gap: 4px; }
+.gallery-file-row {
+  text-align: left; padding: 8px 10px; border-radius: 8px; border: none;
+  background: var(--bg-subtle, rgba(120,110,160,.12)); color: var(--text); font-size: 13px; cursor: pointer;
+}
+.gallery-file-row:hover { filter: brightness(0.97); }
+
+/* ---- Cards / panels shared by Groups, Inbox, Settings, Devices ---- */
+
+.panel-header {
+  padding: 16px 18px 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  margin: 10px 14px;
+  box-shadow: var(--shadow-card);
+}
+
+.notif-card { display: flex; flex-direction: column; gap: 10px; }
+.notif-title { font-size: 13px; font-weight: 700; }
+.notif-body { font-size: 12.5px; color: var(--text-muted); }
+.notif-actions { display: flex; gap: 8px; margin-top: 4px; }
+.notif-resolved { font-size: 11.5px; font-weight: 700; color: var(--online); }
+
+.member-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.member-row:last-child { border-bottom: none; }
+.member-row .row-title { flex: 1; }
+.member-role { font-size: 10.5px; font-weight: 700; color: var(--accent); background: var(--accent-soft); padding: 2px 8px; border-radius: var(--radius-pill); }
+.member-role.is-online { color: var(--online); background: rgba(45, 200, 164, 0.14); }
+.member-role.is-offline { color: var(--text-muted); background: var(--surface-alt); }
+
+.group-info-name { font-size: 17px; font-weight: 700; color: var(--text); }
+.group-info-sub { font-size: 12.5px; color: var(--text-muted); margin-top: 3px; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--surface-alt); border-radius: var(--radius-pill);
+  padding: 4px 6px 4px 4px; font-size: 12px; font-weight: 600;
+}
+.chip .btn-icon { width: 20px; height: 20px; font-size: 11px; background: transparent; }
+
+/* ---- Settings ---- */
+
+.settings-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 4px; border-bottom: 1px solid var(--border);
+}
+.settings-item:last-child { border-bottom: none; }
+.settings-item-label { font-size: 13.5px; font-weight: 600; }
+.settings-item-hint { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+
+/* ---- Security warning banner ---- */
+
+#securityWarning {
+  display: none;
+  background: var(--danger);
+  color: #fff;
+  padding: 10px 18px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+/* ---- Dev/log drawer (kept, de-emphasized: useful for debugging,
+   not part of the product surface) ---- */
+
+#devLog {
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.dev-log-label {
+  padding: 6px 18px; font-size: 11px; color: var(--text-muted);
+  font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+}
+#log {
+  white-space: pre-wrap; background: #14131F; color: #C9C6DA;
+  padding: 10px 18px; height: 140px; overflow-y: auto; font-size: 11px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace; margin: 0;
+}
+
+/* ---- Scrollbars ---- */
+
+.sidebar-list::-webkit-scrollbar, .message-scroll::-webkit-scrollbar, #log::-webkit-scrollbar { width: 8px; }
+.sidebar-list::-webkit-scrollbar-thumb, .message-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ---- Phase 19.24 (continued) -- Message Lifecycle Events UI ---- */
+
+/* The Reply/Edit context bar shown above the composer -- mirrors
+   gui/chat_window.py's composer_context_bar / mobile/app.py's
+   composer_context row: hidden ([hidden]) until a reply or edit is
+   pending. */
+.composer-context {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 18px;
+  background: var(--surface-alt);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--accent);
+}
+.composer-context span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Phase 19.24 -- Typing Indicator: a live hint only, mirrors gui/
+   chat_window.py's typing_status_label (muted, italic, hidden when
+   empty). */
+.typing-status {
+  flex: none;
+  padding: 4px 18px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+/* Phase 19.24 -- Message Search: hidden until the header search
+   button toggles it, same "zero space until relevant" pattern as
+   .composer-context/.typing-status above. Operates only on already-
+   decrypted, already-rendered bubbles -- see main.js's own
+   searchMatchingBubbles() docstring. */
+.search-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 18px;
+  background: var(--surface-alt);
+  border-top: 1px solid var(--border);
+}
+
+.search-bar input {
+  flex: 1;
+}
+
+.search-result-label {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 52px;
+  text-align: right;
+}
+
+.bubble.is-search-match {
+  outline: 2px solid var(--accent, #6d5ff0);
+  outline-offset: 2px;
+}
+
+/* A quoted reply-preview snippet inside a bubble -- mirrors gui/
+   message_widget.py::MessageBubble's identical always-present-but-
+   hidden reply label. */
+.bubble-reply-preview {
+  font-size: 11px;
+  font-style: italic;
+  opacity: .8;
+  border-left: 2px solid currentColor;
+  padding-left: 6px;
+  margin-bottom: 4px;
+}
+
+/* Reaction badges row -- "emoji×count" chips below the message text. */
+.bubble-reactions {
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.bubble-pinned {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: .85;
+  margin-bottom: 4px;
+}
+
+.bubble.is-deleted {
+  font-style: italic;
+  opacity: .7;
+}
+
+/* The long-press-equivalent right-click context menu (see
+   gui/message_widget.py::_build_message_context_menu()'s exact action
+   set/conditions, mirrored in main.js::buildBubbleContextActions()). */
+.bubble-context-menu {
+  position: fixed;
+  z-index: 500;
+  min-width: 160px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bubble-context-menu button {
+  all: unset;
+  cursor: pointer;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+.bubble-context-menu button:hover { background: var(--accent-soft); color: var(--accent); }
+.bubble-context-menu button.is-danger { color: var(--danger); }
+.bubble-context-menu button.is-danger:hover { background: var(--danger-soft); }
+
+/* A small popup listing emoji choices (React) or existing
+   conversations (Forward) -- reuses the same shell. */
+.bubble-popup {
+  position: fixed;
+  z-index: 500;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+  padding: 10px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.bubble-popup-emoji-row {
+  display: flex;
+  gap: 8px;
+}
+.bubble-popup-emoji-row button {
+  all: unset;
+  cursor: pointer;
+  font-size: 22px;
+  padding: 6px;
+  border-radius: 8px;
+}
+.bubble-popup-emoji-row button:hover { background: var(--accent-soft); }
+.bubble-popup-list button {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+.bubble-popup-list button:hover { background: var(--accent-soft); color: var(--accent); }

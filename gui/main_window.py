@@ -130,19 +130,34 @@ class MainWindow(QMainWindow):
             return
 
         self.login_window.set_mode(False)
-        self.login_window.username_input.setText(username)
+        # UI Finalization -- Login Identifier: login now asks for phone
+        # number, not username -- prefill the one the user just
+        # registered with so they can log in immediately without
+        # retyping it. username_input is cleared instead: it's hidden
+        # in login mode and would otherwise carry stale text into the
+        # next register-mode visit.
+        self.login_window.phone_input.setText(phone_number)
         self.login_window.password_input.clear()
         self.login_window.confirm_password_input.clear()
-        self.login_window.phone_input.clear()
+        self.login_window.username_input.clear()
         self.login_window.set_connecting(False)
         self.login_window.status.setText(
             "Registration successful. Please login."
         )
 
-    def handle_login(self, username, password):
+    def handle_login(self, phone_number, password):
+        """
+        UI Finalization -- Login Identifier: ``phone_number`` is exactly
+        what the user typed into LoginWindow's phone field (login_
+        requested's first argument -- see LoginWindow.handle_submit()).
+        Passed straight through as the generic ``identifier`` the
+        server/AuthenticationService already accepted before this
+        change; only what that identifier is now REQUIRED to be
+        changed, not the plumbing that carries it.
+        """
 
         try:
-            result = self.session.authenticate_credentials(username, password)
+            result = self.session.authenticate_credentials(phone_number, password)
         except Exception as error:
             self.login_window.show_connection_error(str(error))
             return

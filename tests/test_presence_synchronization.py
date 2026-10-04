@@ -35,10 +35,24 @@ past its own startup when the second connects, so it renders the
 broadcast normally; the second client is still starting up, so its copy
 is thrown away.
 
-These tests drive real ClientSession objects over the real TLS server,
-and assert against ConversationStore -- the store the sidebar actually
-renders from -- not merely ``session.online_users``, because the bug
-lost the store entry while leaving the raw list intact.
+These tests originally drove real ClientSession objects over the real
+TLS server and asserted against ConversationStore -- the store the
+sidebar actually rendered from -- specifically NOT ``session.
+online_users``, because the bug lost the store entry while leaving the
+raw list intact.
+
+UI Finalization Decision 1 removed the mechanism this race depended
+on: ConversationStore.update_online_status() no longer creates a
+placeholder entry for an online user at all (a conversation is sidebar
+-visible only once it has real message activity -- see conversation_
+store.py's docstring), so there is no longer a presence-derived store
+entry for set_initial() to race with and discard. That specific class
+of regression is now structurally impossible, not merely re-tested
+differently. These tests therefore assert against ``session.
+online_users`` (via get_online_users()) instead -- still the real
+property users care about (does a late-joining client correctly learn
+who's already online), just observed at its own source now that the
+sidebar no longer doubles as a presence view.
 
 Run with:
     pytest tests/test_presence_synchronization.py -v
@@ -107,7 +121,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -146,15 +160,12 @@ def _start_chat_window(session):
     session.load_conversations()
 
 
-def _sidebar_usernames(session):
-    """What the sidebar would actually render -- ConversationStore is
-    its only source (see ChatWindow.render_conversations())."""
-
-    return {summary.key for summary in session.conversation_store.get_all()}
-
-
 def _sees(session, username):
-    return username in _sidebar_usernames(session)
+    """Does this session currently know ``username`` is online -- the
+    actual presence signal (see module docstring for why this is no
+    longer observed via the sidebar)."""
+
+    return username in session.get_online_users()
 
 
 @pytest.fixture()
@@ -259,16 +270,16 @@ def test_three_clients_all_see_each_other(presence_env):
 
     assert _wait_for(
         lambda: _sees(alice, names["bob"]) and _sees(alice, names["carol"])
-    ), f"Alice sees {_sidebar_usernames(alice)}"
+    ), f"Alice sees {alice.get_online_users()}"
 
     assert _wait_for(
         lambda: _sees(bob, names["alice"]) and _sees(bob, names["carol"])
-    ), f"Bob sees {_sidebar_usernames(bob)}"
+    ), f"Bob sees {bob.get_online_users()}"
 
     # The last joiner is the case that used to fail.
     assert _wait_for(
         lambda: _sees(carol, names["alice"]) and _sees(carol, names["bob"])
-    ), f"Carol sees {_sidebar_usernames(carol)}"
+    ), f"Carol sees {carol.get_online_users()}"
 
 
 # ----------------------------------------------------------------------

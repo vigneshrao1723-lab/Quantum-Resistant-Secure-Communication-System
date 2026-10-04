@@ -4,6 +4,8 @@ Broadcaster Module
 Handles broadcasting and sending packets to clients.
 """
 
+from database.connection import SessionLocal
+from database.repositories.blocked_user_repository import BlockedUserRepository
 from logger_config import setup_logger
 from utils.network import send_message
 from utils.protocol import create_public_key_packet, create_user_list_packet
@@ -101,7 +103,16 @@ def distribute_public_keys(state, new_client_socket):
             packet = create_public_key_packet(
                 username=client["username"],
                 algorithm=client["algorithm"],
-                public_key=client["public_key"]
+                public_key=client["public_key"],
+                signing_public_key=client.get("signing_public_key"),
+                identity_signature=client.get("identity_signature"),
+                # Phase 18.5: "announced_device_id" (client-claimed,
+                # relayed as transport metadata only) -- deliberately
+                # NOT "device_id" (that key is reserved for a
+                # cryptographically-verified device_session_bind()
+                # result; see server_state.py::set_public_key()'s own
+                # docstring for why the two must never collide).
+                device_id=client.get("announced_device_id"),
             )
 
             send_to_client(
@@ -115,7 +126,10 @@ def distribute_public_keys(state, new_client_socket):
         packet = create_public_key_packet(
             username=new_client["username"],
             algorithm=new_client["algorithm"],
-            public_key=new_client["public_key"]
+            public_key=new_client["public_key"],
+            signing_public_key=new_client.get("signing_public_key"),
+            identity_signature=new_client.get("identity_signature"),
+            device_id=new_client.get("announced_device_id"),
         )
 
         send_to_client(
@@ -135,6 +149,28 @@ def broadcast_user_list(state):
     print("\n========== USER LIST BROADCAST ==========")
     state.logger.info("Broadcasting online user lists...")
 
+    # Phase 19.24 -- Block User: presence is a form of "can this
+    # person see something about me", so a block in EITHER direction
+    # hides each party from the other's online list, one query for
+    # every pair rather than one query per pair (this runs on every
+    # broadcast, potentially per connect/disconnect).
+    db = SessionLocal()
+    try:
+        # state.clients stores user_id as a plain string (see e.g.
+        # this module's own handle_client() connection setup), while
+        # BlockedUser's columns come back as uuid.UUID objects -- both
+        # sides of the comparison below are normalized to strings so
+        # they actually compare equal.
+        block_pairs = {
+            (str(blocker_id), str(blocked_id))
+            for blocker_id, blocked_id in BlockedUserRepository(db).get_all_block_pairs()
+        }
+    finally:
+        db.close()
+
+    def _blocked(user_id_a, user_id_b):
+        return (user_id_a, user_id_b) in block_pairs or (user_id_b, user_id_a) in block_pairs
+
     for client_socket, client in list(state.clients.items()):
 
         users = []
@@ -142,6 +178,11 @@ def broadcast_user_list(state):
         for other_socket, other_client in list(state.clients.items()):
 
             if other_socket == client_socket:
+                continue
+
+            if client.get("user_id") and other_client.get("user_id") and _blocked(
+                client["user_id"], other_client["user_id"]
+            ):
                 continue
 
             users.append(other_client["username"])

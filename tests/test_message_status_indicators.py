@@ -11,6 +11,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from gui.message_widget import (
+    STATUS_DELIVERED,
     STATUS_FAILED,
     MessageBubble,
     MessageWidget,
@@ -102,18 +103,65 @@ def test_timestamp_always_comes_first():
 # ----------------------------------------------------------------------
 
 
-def test_no_status_renders_a_grey_double_check():
-    """There is no sender-facing DELIVERED signal in the protocol: the
-    relay path sends the sender nothing, and the history packet
-    flattens QUEUED and DELIVERED into the same False. A grey ✓✓ would
-    therefore be an invention."""
+def test_none_false_and_failed_never_render_a_double_check():
+    """None/False/STATUS_FAILED must never claim a stronger state than
+    they represent -- the only ways to get a double check are the real
+    STATUS_DELIVERED (Phase 19.23) and True (read)."""
 
     for status in (None, False, STATUS_FAILED):
         text = _read_status_suffix(status)
         assert "✓✓" not in text
 
-    # The only ✓✓ in the vocabulary is the blue, read one.
     assert COLOR_READ_RECEIPT in _read_status_suffix(True)
+
+
+def test_delivered_renders_a_grey_double_check():
+    """Phase 19.23 -- Issue 3: server/client_handler.py now sends this
+    client a real message_delivered packet (Phase 19.14) AND a real
+    history delivery_status field (_delivery_status_for_own_message()),
+    so DELIVERED is a genuine, server-derived event, not a guess. Grey,
+    not blue -- deliberately the SAME colour as a plain "Sent" ✓ (no
+    inline colour span at all), so DELIVERED and READ differ by tick
+    count, exactly like WhatsApp's own convention."""
+
+    bubble = _sent(STATUS_DELIVERED)
+    text = bubble.time_label.text()
+
+    assert "✓✓" in text
+    assert COLOR_READ_RECEIPT not in text
+
+
+def test_delivered_is_stronger_than_sent_but_weaker_than_read():
+    """set_read_status() must let Sent -> Delivered -> Read progress
+    forward, and must never let Read regress back to Delivered."""
+
+    bubble = _sent(False)
+    assert "✓✓" not in bubble.time_label.text()
+
+    bubble.set_read_status(STATUS_DELIVERED)
+    assert "✓✓" in bubble.time_label.text()
+    assert COLOR_READ_RECEIPT not in bubble.time_label.text()
+
+    bubble.set_read_status(True)
+    assert COLOR_READ_RECEIPT in bubble.time_label.text()
+
+    # A stray/duplicate message_delivered ack after a read receipt
+    # must never downgrade an already-read bubble back to grey.
+    bubble.set_read_status(STATUS_DELIVERED)
+    assert COLOR_READ_RECEIPT in bubble.time_label.text()
+
+
+def test_tick_suffix_uses_single_space_not_double():
+    """Phase 19.23 -- Issue 5: "✓        ✓"-style over-wide spacing --
+    the fix here is one space between the timestamp and the tick
+    glyph(s), not two, and the two check marks within "✓✓" itself are
+    already adjacent characters in one string, never two separately
+    spaced glyphs."""
+
+    assert _read_status_suffix(False) == " ✓"
+    assert _read_status_suffix(STATUS_DELIVERED) == " ✓✓"
+    assert "✓  ✓" not in _read_status_suffix(True)
+    assert "✓  ✓" not in _read_status_suffix(STATUS_DELIVERED)
 
 
 def test_a_failed_send_is_never_promoted_to_read():
@@ -132,6 +180,33 @@ def test_a_failed_send_is_never_promoted_to_read():
     assert any("✓✓" in t for t in texts)
     assert any("⚠" in t for t in texts)
     assert not any("✓✓" in t and "⚠" in t for t in texts)
+
+
+def test_mark_oldest_undelivered_sent_resolves_in_send_order():
+    """Phase 19.23 -- Issue 3: a live-sent bubble has no server message_
+    id yet (it is tracked under a "live-N" placeholder until the next
+    history reload), so a message_delivered packet's real id cannot be
+    matched directly -- the oldest still-plain-"Sent" bubble is, by
+    construction, the one it is for."""
+
+    widget = MessageWidget()
+    widget.add_sent_message("first", read_status=False)
+    widget.add_sent_message("second", read_status=False)
+
+    bubbles = list(widget._sent_bubbles_by_message_id.values())
+    assert all("✓✓" not in b.time_label.text() for b in bubbles)
+
+    widget.mark_oldest_undelivered_sent()
+
+    assert "✓✓" in bubbles[0].time_label.text()
+    assert "✓✓" not in bubbles[1].time_label.text()
+
+    widget.mark_oldest_undelivered_sent()
+
+    assert "✓✓" in bubbles[1].time_label.text()
+
+    # Nothing left in plain "Sent" -- a further ack is a safe no-op.
+    widget.mark_oldest_undelivered_sent()
 
 
 def test_failed_status_survives_a_direct_set_read_status_call():

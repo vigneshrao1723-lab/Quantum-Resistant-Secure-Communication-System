@@ -56,8 +56,13 @@ from PySide6.QtWidgets import QApplication
 import client.session as client_session_module
 from auth.authentication_service import AuthenticationService
 from auth.schemas import RegisterRequest
-from client.session import ClientSession, PEER_KEY_STATE_CHANGED, PeerNotVerifiedError
-from crypto.key_manager import KeyManager, fingerprint_public_key
+from client.session import (
+    ClientSession,
+    PEER_KEY_STATE_CHANGED,
+    PeerNotVerifiedError,
+    PeerVerificationMismatchError,
+)
+from crypto.key_manager import KeyManager, fingerprint_combined_identity, fingerprint_public_key
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
@@ -200,10 +205,23 @@ def _verify(alice, bob, bob_session):
     """Simulates a successful, explicit, out-of-band-confirmed
     verification -- exactly what VerifyIdentityDialog does internally
     on a confirming click, called directly here so tests can set up
-    a VERIFIED baseline without a real dialog interaction."""
+    a VERIFIED baseline without a real dialog interaction.
+
+    Protocol-Level ML-DSA Origin Authentication: a real bob_session's
+    send_public_key() now always attaches an ML-DSA signature, so
+    Alice observes Bob's identity through the combined-identity path
+    (client/session.py::_handle_signed_public_key()) -- the fingerprint
+    on file is therefore the COMBINED (ML-KEM + ML-DSA) one, not the
+    legacy single-key one. confirm_peer_verification() itself already
+    detects this and dispatches to confirm_combined_peer_verification()
+    transparently (see its own docstring) -- this helper's asserted
+    value must match what it will actually re-derive."""
 
     fingerprint = alice.get_peer_fingerprint_for_verification(bob)
-    assert fingerprint == fingerprint_public_key(bob_session.key_manager.public_key)
+    assert fingerprint == fingerprint_combined_identity(
+        bob_session.key_manager.public_key,
+        bob_session.key_manager.ml_dsa.export_public_key(),
+    )
     alice.confirm_peer_verification(bob, fingerprint)
 
 
@@ -292,17 +310,23 @@ def test_c_correct_fingerprint_becomes_verified(app):
     )
 
 
-def test_d_confirming_a_wrong_fingerprint_still_verifies_it(app):
-    """confirm_peer_verification() is a faithful, unconditional
-    pass-through to SecureKeyStore.verify_peer_fingerprint() -- it
-    performs no independent comparison of its own. The security
-    property "a wrong fingerprint never gets confirmed" therefore does
-    NOT rest on a check at this layer; it rests entirely on the UI
-    never calling this method with anything except the exact,
-    unmodified value it displayed and the user compared out-of-band
-    (see test_s_dialog_never_calls_verify_without_explicit_confirm and
-    VerifyIdentityDialog's own docstring). This test makes that
-    boundary explicit rather than leaving it implicit."""
+def test_d_confirming_a_wrong_fingerprint_is_refused_and_does_not_verify(app):
+    """Historical note: this test originally proved the opposite --
+    that confirm_peer_verification() was a faithful, unconditional
+    pass-through with no independent comparison of its own, so "a
+    wrong fingerprint never gets confirmed" rested entirely on the UI
+    layer never misusing it. A follow-up hardening pass closed that
+    gap: confirm_peer_verification() now independently re-derives the
+    fingerprint from the actual currently observed peer public key
+    (crypto/key_manager.py::fingerprint_public_key(), same function,
+    now called a second time server-side of the API boundary) and
+    raises PeerVerificationMismatchError -- a KeyStoreError subclass,
+    so gui/verify_identity_dialog.py's existing handler still reports
+    it correctly with no GUI code change -- whenever the caller-
+    supplied value disagrees. This test now proves that: an arbitrary,
+    unrelated string can never become the persisted VERIFIED
+    fingerprint, and Bob remains exactly as UNVERIFIED as before the
+    attempt."""
 
     alice_payload = app["register"]("alice_")
     bob_payload = app["register"]("bob_")
@@ -316,10 +340,16 @@ def test_d_confirming_a_wrong_fingerprint_still_verifies_it(app):
     )
 
     wrong_fingerprint = "0000 0000 0000 0000"
-    alice.confirm_peer_verification(bob_payload["username"], wrong_fingerprint)
+
+    with pytest.raises(PeerVerificationMismatchError):
+        alice.confirm_peer_verification(bob_payload["username"], wrong_fingerprint)
 
     entry = alice.key_store.get_peer_verification(bob_payload["username"])
-    assert entry == {"fingerprint": wrong_fingerprint, "state": PEER_STATE_VERIFIED}
+    assert entry["state"] == PEER_STATE_UNVERIFIED
+    assert entry["fingerprint"] != wrong_fingerprint
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_STATE_UNVERIFIED
+    )
 
 
 def test_e_cancel_leaves_peer_unverified(app):
@@ -351,6 +381,13 @@ def test_e_cancel_leaves_peer_unverified(app):
 
 
 def test_f_verified_peer_communicates_normally(app):
+    """Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    establishing a session key now requires the RECEIVER to have the
+    SENDER verified too (establish_session_key() reuses the group_
+    key_distribution channel) -- bob must verify alice as well, not
+    only the reverse, or he would reject her key-establishment packet
+    before any message could ever arrive."""
+
     alice_payload = app["register"]("alice_")
     bob_payload = app["register"]("bob_")
 
@@ -362,6 +399,7 @@ def test_f_verified_peer_communicates_normally(app):
         == PEER_STATE_UNVERIFIED
     )
     _verify(alice, bob_payload["username"], bob)
+    _verify(bob, alice_payload["username"], alice)
 
     _open_direct(alice, bob_payload["username"])
     alice.send_chat_message("verified and working")
@@ -376,6 +414,11 @@ def test_f_verified_peer_communicates_normally(app):
 
 
 def test_g_verified_peer_survives_restart(app):
+    """Phase 13: bob must also verify alice (her persisted identity
+    survives her restart unchanged, so verifying the original alice
+    session here covers alice_again too -- see establish_session_key()'s
+    reuse of the group_key_distribution channel)."""
+
     alice_payload = app["register"]("alice_")
     bob_payload = app["register"]("bob_")
 
@@ -387,6 +430,7 @@ def test_g_verified_peer_survives_restart(app):
         == PEER_STATE_UNVERIFIED
     )
     _verify(alice, bob_payload["username"], bob)
+    _verify(bob, alice_payload["username"], alice)
     alice.disconnect()
 
     alice_again = app["launch"](alice_payload)
@@ -538,11 +582,17 @@ def test_j_correct_reverification_becomes_verified_again(app):
     }
 
 
-def test_k_wrong_reverification_still_verifies_the_value_passed(app):
-    """Mirrors test_d_confirming_a_wrong_fingerprint_still_verifies_it
-    for the KEY_CHANGED case -- confirm_peer_verification() performs
-    no comparison, here either; correctness rests entirely on the
-    dialog only ever passing back the exact value it displayed."""
+def test_k_wrong_reverification_is_refused_and_leaves_key_changed(app):
+    """Historical note: mirrors test_d's own history -- this test
+    originally proved a wrong re-verification fingerprint still got
+    silently persisted as VERIFIED for the KEY_CHANGED case too. Same
+    hardening, same fix: confirm_peer_verification() now independently
+    re-derives the fingerprint from _pending_key_changed_raw_keys (the
+    actual NEW/rejected key's raw bytes -- see
+    _currently_observed_peer_public_key()) and refuses on a mismatch.
+    This test now proves an arbitrary string cannot re-verify a
+    KEY_CHANGED peer, and the peer remains exactly as KEY_CHANGED as
+    before the attempt."""
 
     alice_payload = app["register"]("alice_")
     bob_payload = app["register"]("bob_")
@@ -568,10 +618,183 @@ def test_k_wrong_reverification_still_verifies_the_value_passed(app):
     )
 
     wrong_fingerprint = "1111 2222 3333 4444"
-    alice.confirm_peer_verification(bob_payload["username"], wrong_fingerprint)
+
+    with pytest.raises(PeerVerificationMismatchError):
+        alice.confirm_peer_verification(bob_payload["username"], wrong_fingerprint)
 
     entry = alice.key_store.get_peer_verification(bob_payload["username"])
-    assert entry == {"fingerprint": wrong_fingerprint, "state": PEER_STATE_VERIFIED}
+    assert entry["fingerprint"] != wrong_fingerprint
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_KEY_STATE_CHANGED
+    )
+
+
+# ----------------------------------------------------------------------
+# K.1-K.3 -- confirm_peer_verification() binds independently to the
+# actual currently observed peer key (Server-Untrusted Identity
+# Verification hardening), not merely to whatever string it is handed
+# -- see ClientSession._currently_observed_peer_public_key().
+# ----------------------------------------------------------------------
+
+
+def test_confirm_peer_verification_accepts_the_correct_currently_observed_fingerprint(
+    app,
+):
+    """The positive case: the exact fingerprint of the actual,
+    currently observed peer key succeeds and persists as VERIFIED --
+    proving the independent re-derivation added by the hardening pass
+    does not merely reject everything."""
+
+    alice_payload = app["register"]("alice_")
+    bob_payload = app["register"]("bob_")
+
+    alice = app["launch"](alice_payload)
+    bob = app["launch"](bob_payload)
+
+    assert _wait_for(
+        lambda: alice.get_peer_verification_state(bob_payload["username"])
+        == PEER_STATE_UNVERIFIED
+    )
+
+    correct_fingerprint = alice.get_peer_fingerprint_for_verification(
+        bob_payload["username"]
+    )
+    assert correct_fingerprint == fingerprint_combined_identity(
+        bob.key_manager.public_key, bob.key_manager.ml_dsa.export_public_key()
+    )
+
+    alice.confirm_peer_verification(bob_payload["username"], correct_fingerprint)
+
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_STATE_VERIFIED
+    )
+
+
+def test_confirm_peer_verification_rejects_a_different_peers_real_fingerprint(app):
+    """A fingerprint that is completely real -- but belongs to a
+    DIFFERENT peer's actual observed key, not the one being verified
+    -- must be refused exactly like an arbitrary made-up string. Proves
+    the check is bound to THIS peer's specific observed key, not merely
+    "is this fingerprint the right shape / a real one that exists
+    somewhere"."""
+
+    alice_payload = app["register"]("alice_")
+    bob_payload = app["register"]("bob_")
+    charlie_payload = app["register"]("charlie_")
+
+    alice = app["launch"](alice_payload)
+    bob = app["launch"](bob_payload)
+    charlie = app["launch"](charlie_payload)
+
+    assert _wait_for(
+        lambda: alice.get_peer_verification_state(bob_payload["username"])
+        == PEER_STATE_UNVERIFIED
+        and alice.get_peer_verification_state(charlie_payload["username"])
+        == PEER_STATE_UNVERIFIED
+    )
+
+    charlies_real_fingerprint = alice.get_peer_fingerprint_for_verification(
+        charlie_payload["username"]
+    )
+    assert charlies_real_fingerprint is not None
+    assert charlies_real_fingerprint != alice.get_peer_fingerprint_for_verification(
+        bob_payload["username"]
+    )
+
+    with pytest.raises(PeerVerificationMismatchError):
+        alice.confirm_peer_verification(
+            bob_payload["username"], charlies_real_fingerprint
+        )
+
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_STATE_UNVERIFIED
+    )
+    # Charlie himself is untouched by an attempt naming him as the
+    # comparison value for someone else's verification.
+    assert alice.get_peer_verification_state(charlie_payload["username"]) == (
+        PEER_STATE_UNVERIFIED
+    )
+
+
+def test_confirm_peer_verification_rejects_a_stale_fingerprint_after_the_key_changes_again(
+    app,
+):
+    """A fingerprint captured for one observed key must not remain
+    valid to verify a DIFFERENT key that has since arrived for the
+    same peer -- i.e. changing/replacing the observed peer key must
+    never leave an earlier, now-stale verification value silently
+    usable. Simulates a dialog that captured KEY_CHANGED's first
+    pending fingerprint, then a second, different key arrives for the
+    same peer before the user ever confirms: the stale, first-captured
+    value must be refused, and the peer must end up KEY_CHANGED for the
+    SECOND (current) key -- never silently valid for the first."""
+
+    alice_payload = app["register"]("alice_")
+    bob_payload = app["register"]("bob_")
+
+    alice = app["launch"](alice_payload)
+    bob = app["launch"](bob_payload)
+
+    assert _wait_for(
+        lambda: alice.get_peer_verification_state(bob_payload["username"])
+        == PEER_STATE_UNVERIFIED
+    )
+    _verify(alice, bob_payload["username"], bob)
+
+    first_attacker = KeyManager()
+    alice.handle_public_key(
+        _fake_public_key_packet(
+            bob_payload["username"], bob.key_manager.algorithm,
+            _wire_text(first_attacker.public_key),
+        )
+    )
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_KEY_STATE_CHANGED
+    )
+
+    # Captured, as a real dialog would on construction, before the
+    # user acts on it.
+    stale_pending_fingerprint = alice.get_peer_fingerprint_for_verification(
+        bob_payload["username"]
+    )
+
+    # A second, different key arrives before the stale value is ever
+    # confirmed -- the pending state now describes THIS key, not the
+    # first attacker's.
+    second_attacker = KeyManager()
+    alice.handle_public_key(
+        _fake_public_key_packet(
+            bob_payload["username"], bob.key_manager.algorithm,
+            _wire_text(second_attacker.public_key),
+        )
+    )
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_KEY_STATE_CHANGED
+    )
+
+    current_pending_fingerprint = alice.get_peer_fingerprint_for_verification(
+        bob_payload["username"]
+    )
+    assert current_pending_fingerprint != stale_pending_fingerprint
+
+    with pytest.raises(PeerVerificationMismatchError):
+        alice.confirm_peer_verification(
+            bob_payload["username"], stale_pending_fingerprint
+        )
+
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_KEY_STATE_CHANGED
+    )
+
+    # The current (second) pending key remains correctly confirmable,
+    # proving the refusal above was specific to the stale value, not a
+    # side effect that broke the pending state itself.
+    alice.confirm_peer_verification(
+        bob_payload["username"], current_pending_fingerprint
+    )
+    assert alice.get_peer_verification_state(bob_payload["username"]) == (
+        PEER_STATE_VERIFIED
+    )
 
 
 def test_l_cancel_reverification_leaves_peer_key_changed(app):
@@ -738,8 +961,15 @@ def test_p_group_key_distribution_skips_unverified_members_only(app):
         == PEER_STATE_UNVERIFIED
     )
 
-    # Alice verifies Bob, but never verifies Charlie.
+    # Alice verifies Bob, but never verifies Charlie. Bob also
+    # verifies Alice (Phase 13: handle_group_key_distribution() now
+    # requires the RECEIVER to have the SENDER verified too, or Bob
+    # himself would reject the key delivery regardless of Charlie's
+    # status). Charlie deliberately never verifies Alice either way --
+    # he must be skipped by the SENDING side (existing, pre-Phase-13
+    # behavior) before this new receiving-side rule is even reached.
     _verify(alice, bob_payload["username"], bob)
+    _verify(bob, alice_payload["username"], alice)
     assert alice.get_peer_verification_state(charlie_payload["username"]) == (
         PEER_STATE_UNVERIFIED
     )
@@ -966,6 +1196,20 @@ def test_attack_first_contact_malicious_server_substitution(app):
 
     # The malicious server supplies an attacker-controlled key
     # claiming to be Bob's -- Bob himself is never actually online.
+    #
+    # Phase 12A security audit (downgrade attack): this packet has no
+    # "signing_public_key" at all -- exactly what a malicious server
+    # would send, either because it never bothered signing anything to
+    # begin with, or because it stripped Phase 11's two new fields from
+    # a real signed packet before relaying it. handle_public_key()'s
+    # legacy branch no longer accepts an unsigned packet as first
+    # contact at all (see its own docstring for the traced
+    # vulnerability this closes) -- the attacker's key is REJECTED
+    # outright, not merely left UNVERIFIED. This is a strictly
+    # stronger property than what this test originally proved (that an
+    # UNVERIFIED attacker key couldn't be used for protected
+    # communication): now the attacker's key is never recorded or
+    # installed anywhere at all.
     attacker = KeyManager()
     alice.handle_public_key(
         _fake_public_key_packet(
@@ -973,9 +1217,9 @@ def test_attack_first_contact_malicious_server_substitution(app):
         )
     )
 
-    assert alice.get_peer_verification_state(bob_payload["username"]) == (
-        PEER_STATE_UNVERIFIED
-    )
+    assert alice.get_peer_verification_state(bob_payload["username"]) is None
+    assert alice.key_store.get_peer_verification(bob_payload["username"]) is None
+    assert alice.key_manager.get_public_key(bob_payload["username"]) is None
 
     # Alice already has a real, protected AES session key of her own
     # (e.g. from an earlier, different conversation) -- prove it can
@@ -985,9 +1229,21 @@ def test_attack_first_contact_malicious_server_substitution(app):
     conversation_id = str(uuid.uuid4())
     alice.key_manager.store_key(conversation_id, real_session_key, epoch=1)
 
+    # No public key was ever observed for "Bob" at all (proven above --
+    # the attacker's was rejected, not cached), so wrap_key_for_member()
+    # -- the one call site that would ever hand key material to a peer,
+    # shared by establish_session_key(), handle_direct_key_redelivery_
+    # required(), and _distribute_group_key() -- has nothing to wrap
+    # under, attacker-controlled or otherwise. Checked directly (rather
+    # than via send_chat_message(), whose Offline-First-Contact deferred
+    # -delivery side effects on conversation/epoch state would only
+    # complicate, not strengthen, this specific proof).
+    with pytest.raises((KeyError, ValueError, TypeError)):
+        alice.key_manager.wrap_key_for_member(
+            bob_payload["username"], real_session_key
+        )
+
     _open_direct(alice, bob_payload["username"])
-    with pytest.raises(PeerNotVerifiedError):
-        alice.send_chat_message("must not reach the attacker")
 
     sent_packets = []
     real_send_message = client_session_module.send_message
@@ -1016,12 +1272,12 @@ def test_attack_first_contact_malicious_server_substitution(app):
         "attacker-controlled key"
     )
 
-    # None of the three production call sites reached
-    # wrap_key_for_member() at all while unverified -- proven above by
-    # the raise and the two empty send lists. real_session_key was
-    # therefore never wrapped under the attacker's key by anything
-    # this application would actually do; there is nothing further to
-    # attempt to recover.
+    # None of the three production call sites reached a successful
+    # wrap_key_for_member() call while Bob's key was never recorded --
+    # proven above by the raise and the two empty send lists.
+    # real_session_key was therefore never wrapped under the attacker's
+    # key by anything this application would actually do; there is
+    # nothing further to attempt to recover.
 
     # Now the REAL Bob comes online and Alice performs correct,
     # explicit, out-of-band-confirmed verification of his GENUINE key.
@@ -1043,9 +1299,13 @@ def test_attack_first_contact_malicious_server_substitution(app):
     # attacker's observation -- state alone was already UNVERIFIED
     # from the attacker's key, so checking only that would race ahead
     # of Bob's key actually arriving.
+    real_combined_fingerprint = fingerprint_combined_identity(
+        bob.key_manager.public_key, bob.key_manager.ml_dsa.export_public_key()
+    )
+
     assert _wait_for(
         lambda: alice.get_peer_fingerprint_for_verification(bob_payload["username"])
-        == fingerprint_public_key(bob.key_manager.public_key)
+        == real_combined_fingerprint
     )
     assert alice.get_peer_verification_state(bob_payload["username"]) == (
         PEER_STATE_UNVERIFIED
@@ -1054,7 +1314,7 @@ def test_attack_first_contact_malicious_server_substitution(app):
     real_fingerprint = alice.get_peer_fingerprint_for_verification(
         bob_payload["username"]
     )
-    assert real_fingerprint == fingerprint_public_key(bob.key_manager.public_key)
+    assert real_fingerprint == real_combined_fingerprint
     assert real_fingerprint != fingerprint_public_key(attacker.public_key)
 
     alice.confirm_peer_verification(bob_payload["username"], real_fingerprint)
@@ -1073,6 +1333,19 @@ def test_attack_first_contact_malicious_server_substitution(app):
     ) == real_session_key
     with pytest.raises((ValueError, TypeError)):
         attacker.unwrap_received_key(encapsulation, wrapped_key)
+
+    # Phase 13: establishing the real session key (below, via
+    # send_chat_message() -> establish_session_key()) now also
+    # requires BOB to have ALICE verified, not only the reverse --
+    # handle_group_key_distribution() requires a VERIFIED sender.
+    assert _wait_for(
+        lambda: bob._observed_peer_signing_public_keys.get(alice_payload["username"])
+        is not None
+    )
+    bob_fingerprint = fingerprint_combined_identity(
+        alice.key_manager.public_key, alice.key_manager.ml_dsa.export_public_key()
+    )
+    bob.confirm_combined_peer_verification(alice_payload["username"], bob_fingerprint)
 
     alice.send_chat_message("now verified and working")
     assert _wait_for(

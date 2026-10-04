@@ -34,3 +34,6 @@ MarkupSafe==3.0.3
 
 # --- Configuration ---
 python-dotenv==1.0.0
+
+# --- Web gateway (web/gateway/, Phase 15 -- Web Interoperability) ---
+websockets==17.1

@@ -27,6 +27,7 @@ Run with:
     pytest tests/test_message_history_request_response.py -v
 """
 
+import base64
 import json
 import socket
 import struct
@@ -41,6 +42,8 @@ from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.session import ClientSession
 from crypto.aes import AESCipher
+from crypto.message_protocol import sign_message_payload
+from crypto.ml_dsa import MLDSASigner
 from database.connection import SessionLocal
 from database.repositories.conversation_repository import ConversationRepository
 from database.repositories.message_repository import MessageRepository
@@ -151,7 +154,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -251,12 +254,17 @@ def _insert_message(
     payload_type=None,
     epoch=None,
     content_metadata=None,
+    message_signature=None,
 ):
     """Test-setup helper: insert a message row directly, exactly as
     persist_message() would -- optionally routing its content to real
     blob storage (blob_content) instead of the ciphertext column,
     matching persist_message()'s own BLOB_STORAGE_PAYLOAD_TYPES
-    routing exactly."""
+    routing exactly.
+
+    ``message_signature`` (Message-Level ML-DSA Origin Authentication):
+    passed straight through to save_message() -- see _signed_history_
+    row()'s docstring for how callers below produce a real one."""
     blob_ref = None
     if blob_content is not None:
         blob_ref = encrypted_blob_store.store_blob(blob_content.encode("utf-8"))
@@ -276,11 +284,45 @@ def _insert_message(
             content_metadata=content_metadata,
             algorithm="KYBER",
             timestamp=timestamp or datetime.now(timezone.utc).replace(tzinfo=None),
+            message_signature=message_signature,
         )
         message_repo.commit()
         return str(message.id), blob_ref
     finally:
         db.close()
+
+
+def _signed_history_row(
+    sender_username, receiver_username=None, conversation_id=None,
+    payload_type="text", ciphertext="", content_metadata=None, epoch=None,
+):
+    """
+    Message-Level ML-DSA Origin Authentication: builds a real, validly
+    signed message_signature for a message inserted directly via
+    _insert_message() (which has no real ClientSession/sender identity
+    of its own) -- required for a real recipient ClientSession's
+    load_conversation_history() to accept and decrypt it at all (see
+    handle_chat()'s/_verify_history_message_signature()'s own
+    docstrings: there is no unsigned message path).
+
+    Returns (message_signature_b64, signing_public_key). The caller
+    must seed signing_public_key into the reading ClientSession's own
+    _observed_peer_signing_public_keys[sender_username] before calling
+    load_conversation_history() -- mirroring how these tests already
+    manually seed the AES session key, since this directly-inserted
+    row never went through a real signed public-key exchange for the
+    reader to have observed it through.
+    """
+
+    signer = MLDSASigner()
+    signer.generate_keys()
+
+    signature = sign_message_payload(
+        signer, sender_username, receiver_username, conversation_id,
+        payload_type, ciphertext, content_metadata, epoch,
+    )
+
+    return base64.b64encode(signature).decode("ascii"), signer.export_public_key()
 
 
 def _mark_read(message_id, recipient_id):
@@ -939,9 +981,13 @@ def test_load_conversation_history_direct_end_to_end(running_server, monkeypatch
     conversation_id = _create_direct_conversation(
         alice_payload["user_id"], bob_payload["user_id"]
     )
+    message_signature, bob_signing_public_key = _signed_history_row(
+        bob_payload["username"], receiver_username=alice_payload["username"],
+        ciphertext=ciphertext,
+    )
     _insert_message(
         conversation_id, bob_payload["user_id"], alice_payload["user_id"],
-        ciphertext=ciphertext,
+        ciphertext=ciphertext, message_signature=message_signature,
     )
 
     alice = _make_connected_session(alice_payload)
@@ -949,6 +995,9 @@ def test_load_conversation_history_direct_end_to_end(running_server, monkeypatch
     try:
         _open_direct_chat(alice, bob_payload["username"])
         alice.key_manager.store_key(alice.current_conversation_id, session_key)
+        alice._observed_peer_signing_public_keys[bob_payload["username"]] = (
+            bob_signing_public_key
+        )
 
         history = alice.load_conversation_history(bob_payload["username"])
 
@@ -1007,15 +1056,22 @@ def test_load_conversation_history_group_end_to_end(running_server, monkeypatch)
     conversation_id = _create_group_conversation(
         [alice_payload["user_id"], bob_payload["user_id"]], "E2E Group",
     )
+    message_signature, bob_signing_public_key = _signed_history_row(
+        bob_payload["username"], conversation_id=conversation_id,
+        ciphertext=ciphertext,
+    )
     _insert_message(
         conversation_id, bob_payload["user_id"], bob_payload["user_id"],
-        ciphertext=ciphertext,
+        ciphertext=ciphertext, message_signature=message_signature,
     )
 
     alice = _make_connected_session(alice_payload)
 
     try:
         alice.key_manager.store_key(conversation_id, session_key)
+        alice._observed_peer_signing_public_keys[bob_payload["username"]] = (
+            bob_signing_public_key
+        )
         _open_group_chat(alice, conversation_id)
 
         history = alice.load_conversation_history(conversation_id, is_group=True)
@@ -1053,11 +1109,17 @@ def test_load_conversation_history_attachment_through_history_and_blob_request(
     conversation_id = _create_direct_conversation(
         alice_payload["user_id"], bob_payload["user_id"]
     )
+    message_signature, bob_signing_public_key = _signed_history_row(
+        bob_payload["username"], receiver_username=alice_payload["username"],
+        payload_type=PayloadType.FILE, ciphertext=envelope.ciphertext,
+        content_metadata=content_metadata,
+    )
     _message_id, blob_ref = _insert_message(
         conversation_id, bob_payload["user_id"], alice_payload["user_id"],
         blob_content=envelope.ciphertext,
         payload_type=PayloadType.FILE,
         content_metadata=content_metadata,
+        message_signature=message_signature,
     )
 
     alice = _make_connected_session(alice_payload)
@@ -1065,6 +1127,9 @@ def test_load_conversation_history_attachment_through_history_and_blob_request(
     try:
         _open_direct_chat(alice, bob_payload["username"])
         alice.key_manager.store_key(alice.current_conversation_id, session_key)
+        alice._observed_peer_signing_public_keys[bob_payload["username"]] = (
+            bob_signing_public_key
+        )
 
         history = alice.load_conversation_history(bob_payload["username"])
 
@@ -1159,13 +1224,32 @@ def test_load_conversation_history_full_round_trip_needs_no_local_access(
         original_bytes, AESCipher(session_key), content_metadata={"filename": "n.bin"}
     )
 
+    # Both messages are from the SAME sender identity -- one shared
+    # signer, matching how a real bob has exactly one ML-DSA keypair
+    # for both messages to be signed under (see _signed_history_row()'s
+    # docstring for why a signature is required at all here).
+    bob_signer = MLDSASigner()
+    bob_signer.generate_keys()
+    bob_signing_public_key = bob_signer.export_public_key()
+
+    text_ciphertext = AESCipher(session_key).encrypt(plaintext)
+    text_signature = sign_message_payload(
+        bob_signer, bob_payload["username"], alice_payload["username"], None,
+        "text", text_ciphertext, None, None,
+    )
+    file_signature = sign_message_payload(
+        bob_signer, bob_payload["username"], alice_payload["username"], None,
+        PayloadType.FILE, envelope.ciphertext, {"filename": "n.bin"}, None,
+    )
+
     conversation_id = _create_direct_conversation(
         alice_payload["user_id"], bob_payload["user_id"]
     )
     _insert_message(
         conversation_id, bob_payload["user_id"], alice_payload["user_id"],
-        ciphertext=AESCipher(session_key).encrypt(plaintext),
+        ciphertext=text_ciphertext,
         timestamp=_utc_now().replace(2026, 1, 1, 9, 0, 0),
+        message_signature=base64.b64encode(text_signature).decode("ascii"),
     )
     _message_id, blob_ref = _insert_message(
         conversation_id, bob_payload["user_id"], alice_payload["user_id"],
@@ -1173,6 +1257,7 @@ def test_load_conversation_history_full_round_trip_needs_no_local_access(
         payload_type=PayloadType.FILE,
         content_metadata={"filename": "n.bin"},
         timestamp=_utc_now().replace(2026, 1, 1, 9, 5, 0),
+        message_signature=base64.b64encode(file_signature).decode("ascii"),
     )
 
     alice = _make_connected_session(alice_payload)
@@ -1180,6 +1265,9 @@ def test_load_conversation_history_full_round_trip_needs_no_local_access(
     try:
         _open_direct_chat(alice, bob_payload["username"])
         alice.key_manager.store_key(alice.current_conversation_id, session_key)
+        alice._observed_peer_signing_public_keys[bob_payload["username"]] = (
+            bob_signing_public_key
+        )
 
         history = alice.load_conversation_history(bob_payload["username"])
 

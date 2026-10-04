@@ -48,6 +48,14 @@ def test_attach_button_exists_and_starts_enabled_state_matches_input():
 
 
 def test_attachment_selected_emits_chosen_path():
+    """Phase 19.24 -- Attachment Menu: _handle_attach_clicked() now
+    shows a real QMenu first (Photo/File, Voice Message, Video
+    Message) -- exercised directly below via _pick_file(), the
+    handler the menu's "Photo / File" action dispatches to, bypassing
+    only the modal QMenu.exec() itself (the same convention this
+    project's other QMenu-driven features -- Mute/Wallpaper/Pin --
+    already established)."""
+
     bar = InputBar()
 
     received = []
@@ -57,7 +65,7 @@ def test_attachment_selected_emits_chosen_path():
         "gui.input_bar.QFileDialog.getOpenFileName",
         return_value=("C:/fake/path/photo.png", "All Files (*)"),
     ):
-        bar._handle_attach_clicked()
+        bar._pick_file()
 
     assert received == ["C:/fake/path/photo.png"]
 
@@ -72,9 +80,48 @@ def test_attachment_selected_not_emitted_when_dialog_cancelled():
         "gui.input_bar.QFileDialog.getOpenFileName",
         return_value=("", ""),
     ):
-        bar._handle_attach_clicked()
+        bar._pick_file()
 
     assert received == []
+
+
+def test_attach_menu_offers_photo_file_voice_and_video():
+    """The real menu _handle_attach_clicked() builds (bypassing only
+    the modal QMenu.exec() call, exactly like _pick_file() above) --
+    proves the Attachment Menu genuinely exposes all three kinds, not
+    just the pre-existing file picker."""
+
+    bar = InputBar()
+
+    from PySide6.QtWidgets import QMenu
+
+    captured = {}
+
+    class _FakeMenu(QMenu):
+        def exec(self, *args, **kwargs):
+            captured["actions"] = [a.data() for a in self.actions()]
+            return None
+
+    with patch("gui.input_bar.QMenu", _FakeMenu):
+        bar._handle_attach_clicked()
+
+    assert captured["actions"] == ["file", "voice", "video"]
+
+
+def test_attach_menu_voice_choice_opens_the_real_recorder_dialog():
+    bar = InputBar()
+
+    with patch.object(bar, "_record_media") as record_media:
+        from PySide6.QtWidgets import QMenu
+
+        class _FakeMenu(QMenu):
+            def exec(self, *args, **kwargs):
+                return self.actions()[1]  # "voice"
+
+        with patch("gui.input_bar.QMenu", _FakeMenu):
+            bar._handle_attach_clicked()
+
+    record_media.assert_called_once_with("voice")
 
 
 def test_set_enabled_toggles_attach_button():

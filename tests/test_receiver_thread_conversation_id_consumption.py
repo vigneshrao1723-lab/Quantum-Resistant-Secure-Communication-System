@@ -28,6 +28,7 @@ Run with:
     pytest tests/test_receiver_thread_conversation_id_consumption.py -v
 """
 
+import base64
 import time
 import uuid
 
@@ -38,7 +39,10 @@ from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
 from client.conversation_store import ConversationStore
 from client.session import ClientSession
+from domain.security_rejection_reason import SecurityRejectionReason
 from crypto.key_manager import fingerprint_public_key
+from crypto.message_protocol import sign_message_payload
+from crypto.ml_dsa import MLDSASigner
 from database.connection import SessionLocal
 from database.repositories.session_repository import SessionRepository
 from database.repositories.user_repository import UserRepository
@@ -95,7 +99,7 @@ def _login_and_get_token(payload):
     try:
         auth_service = AuthenticationService(db)
         result = auth_service.authenticate_user(
-            LoginRequest(identifier=payload["username"], password=payload["password"])
+            LoginRequest(identifier=payload["phone_number"], password=payload["password"])
         )
         assert result.success, result.errors
         return result.token_pair.access_token
@@ -177,6 +181,17 @@ def alice_and_bob(running_server, monkeypatch, tmp_path):
     alice.key_store.verify_peer_fingerprint(
         bob.username, fingerprint_public_key(bob.key_manager.public_key)
     )
+    # Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    # bob is also the RECEIVER of the live group_key_distribution
+    # packet establish_session_key() sends, which now separately
+    # requires bob to have alice already VERIFIED too.
+    bob.key_store = SecureKeyStore(
+        bob_payload["user_id"], storage_dir=tmp_path / "keystore-bob"
+    )
+    bob.key_store.unlock(bob_payload["password"])
+    bob.key_store.verify_peer_fingerprint(
+        alice.username, fingerprint_public_key(alice.key_manager.public_key)
+    )
 
     yield {"alice": alice, "bob": bob}
 
@@ -207,15 +222,15 @@ def test_receiver_thread_uses_server_fields_and_never_touches_database(alice_and
     expected_conversation_id = alice.current_conversation_id
     assert expected_conversation_id
 
-    # Bob already has a placeholder summary for Alice (created the
-    # moment the server's user_list broadcast told him she's online --
-    # see ConversationStore.update_online_status()), but critically
-    # its conversation_id is still None: nothing has resolved it yet.
-    # This is exactly the case where the OLD ensure_direct_conversation_id()
-    # would NOT have hit its cache and would have gone to the database.
-    existing_summary = bob.conversation_store.get(alice.username)
-    assert existing_summary is not None
-    assert existing_summary.conversation_id is None
+    # Bob has no summary for Alice at all yet -- merely being online
+    # together (the server's user_list broadcast) no longer creates
+    # one (UI Finalization Decision 1: ConversationStore.
+    # update_online_status() only updates existing entries' presence,
+    # it never adds a placeholder for its own sake -- see that
+    # method's docstring). This is exactly the case where the OLD
+    # ensure_direct_conversation_id() would NOT have hit its cache and
+    # would have gone to the database.
+    assert bob.conversation_store.get(alice.username) is None
 
     # ensure_direct_conversation_id() (the DB fallback this test used
     # to also prove the receiver thread never calls) was deleted
@@ -248,7 +263,36 @@ def test_receiver_thread_uses_server_fields_and_never_touches_database(alice_and
 
 def test_handle_session_key_alone_uses_server_field_without_database(alice_and_bob):
     """Narrower companion to the combined test above, isolating
-    handle_session_key() specifically (independent of handle_chat())."""
+    key-establishment specifically (independent of handle_chat()).
+
+    BUG -- Offline First Contact (client/session.py::
+    establish_session_key()) moved KYBER's first-establishment wire
+    packet from session_key to group_key_distribution (reusing
+    KeyManager.wrap_key_for_member(), the same construction direct key
+    redelivery already used, since Kyber's KEM encapsulation cannot
+    target the now-independently-generated AES key -- see that
+    method's docstring). Bob's receiver thread therefore now runs
+    handle_group_key_distribution(), not handle_session_key(), for
+    this exchange. handle_group_key_distribution() is also used for
+    real group key distribution, where conversation_id belongs to a
+    conversation with no single "other username" -- so, unlike
+    handle_chat()/handle_session_key(), it deliberately does not call
+    ConversationStore.record_direct_conversation_id(); doing so
+    unconditionally would mislabel an actual group's conversation_id
+    as a direct conversation with whoever happened to relay this
+    member's wrapped key.
+
+    This does not regress the sidebar in practice: a direct
+    conversation's server-side membership/message state already
+    exists by the time any key is ever redelivered (this exact
+    scenario is end-to-end covered by
+    tests/test_offline_first_contact.py), and ClientSession.
+    load_conversations() -- the full server-driven snapshot every
+    login/reconnect already performs -- picks it up independent of
+    this packet entirely. What's still proven here, unchanged: the
+    server-supplied conversation_id field on the packet is what gets
+    consumed to store the key, never a database lookup.
+    """
     alice = alice_and_bob["alice"]
     bob = alice_and_bob["bob"]
 
@@ -257,20 +301,11 @@ def test_handle_session_key_alone_uses_server_field_without_database(alice_and_b
 
     assert bob.key_manager.get_key(expected_conversation_id) is None
 
-    # See test_receiver_thread_uses_server_fields_and_never_touches_
-    # database()'s comment: ensure_direct_conversation_id() no longer
-    # exists (deleted in D4.3), so there is nothing left to fall back
-    # to -- the assertion below already fully proves the server-
-    # supplied field was consumed.
     alice.establish_session_key()
 
     assert _wait_for(
         lambda: bob.key_manager.get_key(expected_conversation_id) is not None
     )
-
-    bob_summary = bob.conversation_store.get(alice.username)
-    assert bob_summary is not None
-    assert bob_summary.conversation_id == expected_conversation_id
 
 
 # ----------------------------------------------------------------------
@@ -329,16 +364,39 @@ def test_record_direct_conversation_id_updates_existing_summary_in_place():
 
 
 def test_handle_chat_missing_direct_conversation_id_does_not_crash_or_query_db(caplog):
+    """Message-Level ML-DSA Origin Authentication: handle_chat() now
+    verifies a message's signature BEFORE anything else runs (see
+    client/session.py::_verify_chat_message_signature()), so this
+    packet must carry a genuinely valid one -- from a signing key this
+    session already "observes" for alice, exactly as a real
+    _handle_signed_public_key() call would have populated -- to reach
+    the missing-direct_conversation_id code path this test actually
+    exists to prove. The signature itself is not what is under test
+    here; it is simply satisfied so the ORIGINAL scenario (a broken/
+    non-conforming server response missing direct_conversation_id) is
+    reached unchanged."""
+
     session = ClientSession()
     session.user_id = str(uuid.uuid4())
     session.username = "bob"
     session.online_users = []
 
+    alice_signer = MLDSASigner()
+    alice_signer.generate_keys()
+    alice_signing_public_key = alice_signer.export_public_key()
+    session._observed_peer_signing_public_keys["alice"] = alice_signing_public_key
+
+    ciphertext = "ciphertext-irrelevant-to-this-test"
+    signature = sign_message_payload(
+        alice_signer, "alice", None, None, "text", ciphertext, None, None
+    )
+
     packet = {
         "type": "chat",
         "sender": "alice",
-        "message": "ciphertext-irrelevant-to-this-test",
+        "message": ciphertext,
         "payload_type": "text",
+        "message_signature": base64.b64encode(signature).decode("ascii"),
         # Deliberately no "direct_conversation_id" and no
         # "conversation_id" -- simulates a broken/non-conforming
         # server response.
@@ -367,9 +425,18 @@ def test_handle_session_key_missing_conversation_id_does_not_crash_or_query_db(c
 
     # ensure_direct_conversation_id() was deleted outright in D4.3 --
     # nothing left to fall back to.
-    session.handle_session_key(packet)  # must not raise
+    #
+    # Phase 13.7 (Key-Establishment Rejection Observability & State
+    # Integrity): a missing conversation_id is now folded into the
+    # same unified MALFORMED_PACKET rejection reporting every other
+    # security-relevant rejection uses (see client/session.py::
+    # _report_security_rejection()) rather than its own bespoke
+    # ERROR-level message -- the underlying behavior this test cares
+    # about (no crash, no DB round trip, nothing stored) is unchanged.
+    result = session.handle_session_key(packet)  # must not raise
 
-    assert "No conversation_id supplied by the server" in caplog.text
+    assert result == SecurityRejectionReason.MALFORMED_PACKET
+    assert "malformed_packet" in caplog.text
     # Returned before ever touching KeyManager -- nothing stored under
     # a useless key.
     assert session.key_manager.get_key(None) is None
@@ -397,6 +464,11 @@ def test_handle_session_key_empty_string_conversation_id_is_treated_as_missing(c
 
     # ensure_direct_conversation_id() was deleted outright in D4.3 --
     # nothing left to fall back to.
-    session.handle_session_key(packet)  # must not raise
+    #
+    # Phase 13.7: see the identical comment in the missing-field test
+    # above -- same unified MALFORMED_PACKET reporting, same
+    # underlying no-crash/no-DB-query/nothing-stored guarantee.
+    result = session.handle_session_key(packet)  # must not raise
 
-    assert "No conversation_id supplied by the server" in caplog.text
+    assert result == SecurityRejectionReason.MALFORMED_PACKET
+    assert "malformed_packet" in caplog.text

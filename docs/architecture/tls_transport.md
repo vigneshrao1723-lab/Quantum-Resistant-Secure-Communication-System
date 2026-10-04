@@ -240,7 +240,8 @@ everywhere:
   `test_group_messaging_integration.py`,
   `test_message_persistence_integration.py`,
   `test_chat_encryption_integration.py`,
-  `test_message_routing_security.py` — 38 tests total) reuse the same
+  `test_message_routing_security.py` — 40 tests total, reconfirmed
+  during Phase 14.4) reuse the same
   `tests/tls_test_support.py` helpers so their sockets simply speak
   TLS; their assertions about application behavior (routing,
   persistence, AES confidentiality/tamper-detection, sender-spoofing

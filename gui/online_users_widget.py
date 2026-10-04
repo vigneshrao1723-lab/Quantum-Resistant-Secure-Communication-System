@@ -41,7 +41,7 @@ class UserRow(QWidget):
         avatar.setFixedSize(34, 34)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(
-            f"background-color: {COLOR_ACCENT}; color: #0B0D16; "
+            f"background-color: {COLOR_ACCENT}; color: #FFFFFF; "
             "border-radius: 17px; font-weight: 700;"
         )
 

@@ -10,6 +10,7 @@ Run with:
     pytest tests/test_authentication_service.py -v
 """
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt as pyjwt
@@ -40,7 +41,11 @@ def _register(auth_service, payload):
 
 
 def _login(auth_service, payload, **overrides):
-    kwargs = {"identifier": payload["username"], "password": payload["password"]}
+    # UI Finalization -- Login Identifier: phone number, not username,
+    # is what authenticate_user() now accepts -- see the dedicated
+    # "Login Identifier" section below for tests proving username/email
+    # are specifically rejected.
+    kwargs = {"identifier": payload["phone_number"], "password": payload["password"]}
     kwargs.update(overrides)
     return auth_service.authenticate_user(LoginRequest(**kwargs))
 
@@ -144,7 +149,13 @@ def test_authenticate_user_invalid_password(auth_service, registration_payload):
     assert "password" in result.errors
 
 
-def test_authenticate_user_unknown_identifier(auth_service):
+def test_authenticate_user_rejects_malformed_identifier(auth_service):
+    """"no-such-user" is not a plausible phone number at all (letters,
+    no digits) -- rejected by normalize_phone_number() before any
+    database lookup happens. See
+    test_authenticate_user_rejects_unregistered_phone_number below for
+    the "well-formed but no account has it" case."""
+
     result = auth_service.authenticate_user(
         LoginRequest(identifier="no-such-user", password="whatever")
     )
@@ -214,6 +225,155 @@ def test_authenticate_user_locks_after_max_failed_attempts(
     correct_attempt = _login(auth_service, registration_payload)
     assert correct_attempt.success is False
     assert correct_attempt.errors["status"] == "Account is locked."
+
+
+# ----------------------------------------------------------------------
+# Login Identifier (UI Finalization) -- phone number + password is the
+# only valid login combination; username and email, though still valid
+# UNIQUE columns on the user, are display/registration identifiers
+# only and must never authenticate a login.
+# ----------------------------------------------------------------------
+
+
+def test_authenticate_user_accepts_phone_number(auth_service, registration_payload):
+    _register(auth_service, registration_payload)
+
+    result = _login(auth_service, registration_payload)
+
+    assert result.success is True
+    assert result.token_pair is not None
+
+
+def test_authenticate_user_accepts_an_equivalent_written_form_of_the_phone_number(
+    auth_service, registration_payload
+):
+    """"+91 98765 43210" and "+919876543210" identify the same account
+    (security/phone_number.py normalises both to the same canonical
+    form) -- login must accept the written form exactly as
+    registration does, not only the already-canonical one stored in
+    the database."""
+
+    _register(auth_service, registration_payload)
+
+    raw_digits = registration_payload["phone_number"].lstrip("+")
+    spaced_identifier = f"+{raw_digits[:2]} {raw_digits[2:7]} {raw_digits[7:]}"
+    assert spaced_identifier != registration_payload["phone_number"]
+
+    result = _login(auth_service, registration_payload, identifier=spaced_identifier)
+
+    assert result.success is True
+
+
+def test_authenticate_user_rejects_username_as_identifier(
+    auth_service, registration_payload
+):
+    """Requirement: username cannot be used as a login identifier, even
+    though it is a real, valid, UNIQUE value on the account -- the
+    lookup only ever queries the phone_number column now (see
+    AuthenticationService.authenticate_user()), so a real username
+    simply never matches. This is also what stops another user's
+    username from being substituted through the client login form: no
+    username -- the account's own or anyone else's -- is ever an
+    accepted identifier."""
+
+    _register(auth_service, registration_payload)
+
+    result = _login(
+        auth_service, registration_payload, identifier=registration_payload["username"]
+    )
+
+    assert result.success is False
+    assert "identifier" in result.errors
+
+
+def test_authenticate_user_rejects_email_as_identifier(
+    auth_service, registration_payload
+):
+    """Requirement: email cannot be used as a login identifier."""
+
+    _register(auth_service, registration_payload)
+
+    result = _login(
+        auth_service, registration_payload, identifier=registration_payload["email"]
+    )
+
+    assert result.success is False
+    assert "identifier" in result.errors
+
+
+def test_authenticate_user_rejects_unregistered_phone_number(auth_service):
+    """A well-formed phone number that simply has no account -- the
+    "invalid phone/password combination" case distinct from a
+    malformed identifier (test_authenticate_user_rejects_malformed_
+    identifier above)."""
+
+    result = auth_service.authenticate_user(
+        LoginRequest(identifier="+919999999999", password="whatever")
+    )
+
+    assert result.success is False
+    assert "identifier" in result.errors
+
+
+def test_authenticate_user_rejects_correct_phone_wrong_password(
+    auth_service, registration_payload
+):
+    _register(auth_service, registration_payload)
+
+    result = _login(auth_service, registration_payload, password="WrongPassword!123")
+
+    assert result.success is False
+    assert "password" in result.errors
+
+
+def test_authenticate_user_returns_the_authenticated_users_own_username(
+    auth_service, registration_payload
+):
+    """Requirement: the authenticated user's username is obtained from
+    the server/database profile -- not echoed back from anything the
+    client submitted (the login form no longer even collects a
+    username -- see gui/login_window.py)."""
+
+    _register(auth_service, registration_payload)
+
+    result = _login(auth_service, registration_payload)
+
+    assert result.success is True
+    assert result.username == registration_payload["username"]
+
+
+def test_authenticate_user_cannot_be_tricked_into_returning_a_different_users_username(
+    auth_service, unique_suffix, strong_password
+):
+    """Two real accounts; logging in with account A's own phone number
+    must return exactly account A's username, never account B's --
+    guards against a mixed-up lookup returning the wrong profile."""
+
+    payload_a = {
+        "full_name": "User A",
+        "username": f"user_a_{unique_suffix}",
+        "email": f"user_a_{unique_suffix}@example.com",
+        "password": strong_password,
+        "confirm_password": strong_password,
+        "phone_number": f"+91{uuid.uuid4().int % 10**12:012d}",
+    }
+    payload_b = {
+        "full_name": "User B",
+        "username": f"user_b_{unique_suffix}",
+        "email": f"user_b_{unique_suffix}@example.com",
+        "password": strong_password,
+        "confirm_password": strong_password,
+        "phone_number": f"+91{uuid.uuid4().int % 10**12:012d}",
+    }
+
+    _register(auth_service, payload_a)
+    _register(auth_service, payload_b)
+
+    result = _login(auth_service, payload_a)
+
+    assert result.success is True
+    assert result.username == payload_a["username"]
+    assert result.username != payload_b["username"]
 
 
 # ----------------------------------------------------------------------

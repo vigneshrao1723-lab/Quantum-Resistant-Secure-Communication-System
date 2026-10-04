@@ -34,14 +34,16 @@ import hashlib
 from collections import namedtuple
 from datetime import datetime, timezone
 
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import aliased
 
 from database.models.conversation import Conversation
 from database.models.conversation_member import ConversationMember
 from database.models.message import Message
+from database.models.message_recipient import MessageRecipient
 from database.models.user import User
 from database.repositories.base_repository import BaseRepository
+from domain.message_delivery_status import MessageDeliveryStatus
 
 
 def _utc_now() -> datetime:
@@ -84,12 +86,14 @@ def _direct_conversation_lock_key(user_a_id, user_b_id):
     return int.from_bytes(digest[:8], "big", signed=True)
 
 # One row per conversation this user belongs to: the Conversation
-# itself, its latest Message (None if it has none yet), and the
-# User rows of every other member (a list, not a scalar, so a future
-# group conversation's multiple other participants need no redesign
-# of this shape).
+# itself, its latest Message (None if it has none yet), the User rows
+# of every other member (a list, not a scalar, so a future group
+# conversation's multiple other participants need no redesign of this
+# shape), and how many of this user's own MessageRecipient rows in it
+# are not yet READ (BUG -- Offline Unread/Notification).
 ConversationPreview = namedtuple(
-    "ConversationPreview", ["conversation", "latest_message", "participants"]
+    "ConversationPreview",
+    ["conversation", "latest_message", "participants", "unread_count"],
 )
 
 
@@ -164,7 +168,7 @@ class ConversationRepository(BaseRepository):
 
         return self.db.scalar(statement)
 
-    def _create_conversation(self, conversation_type, member_user_ids, name=None):
+    def _create_conversation(self, conversation_type, member_user_ids, name=None, admin_user_id=None):
         """
         Create a conversation of the given type with one
         ConversationMember row per user id.
@@ -172,31 +176,75 @@ class ConversationRepository(BaseRepository):
         Generic over member count, type, and (Phase 4) name -- this is
         the exact extension point named since Phase 1;
         create_group_conversation() below is its first real caller.
+
+        ``admin_user_id`` (Phase 19.13 -- Group Admin): when given,
+        that one member's row gets ROLE_ADMIN instead of the default
+        ROLE_MEMBER -- every other member is unaffected. None for a
+        direct conversation (get_or_create_direct_conversation() never
+        passes it): admin/member has no meaning for a two-party direct
+        chat.
         """
 
         conversation = Conversation(type=conversation_type, name=name)
         self.add(conversation)
 
         for user_id in member_user_ids:
+            role = (
+                ConversationMember.ROLE_ADMIN
+                if admin_user_id is not None and user_id == admin_user_id
+                else ConversationMember.ROLE_MEMBER
+            )
             self.add(
                 ConversationMember(
                     conversation_id=conversation.id,
                     user_id=user_id,
+                    role=role,
                 )
             )
 
         return conversation
 
-    def create_group_conversation(self, member_ids, name):
+    def create_group_conversation(self, member_ids, name, creator_id=None):
         """
         Create a new "group" conversation with the given members
         (the creator's own id is expected to already be included in
         member_ids by the caller). Reuses _create_conversation() --
         the same generic helper get_or_create_direct_conversation()
         already uses -- unchanged.
+
+        ``creator_id`` (Phase 19.13 -- Group Admin): the member
+        recorded as this group's ROLE_ADMIN. The group always has
+        exactly one admin from creation onward -- nothing in this
+        phase adds a second one or transfers the role. Optional
+        (defaults to None, i.e. no admin recorded -- every member gets
+        the plain ROLE_MEMBER default, matching this method's
+        behavior before this phase) purely so every pre-existing
+        direct caller of this repository method in the test suite
+        keeps working unchanged; the real production path (server/
+        client_handler.py::handle_group_create()) always passes it.
         """
 
-        return self._create_conversation(Conversation.TYPE_GROUP, member_ids, name=name)
+        return self._create_conversation(
+            Conversation.TYPE_GROUP, member_ids, name=name, admin_user_id=creator_id,
+        )
+
+    def get_admin_user_id(self, conversation_id):
+        """
+        Return the active admin's user id for a group conversation, or
+        None if it has none (a direct conversation, or -- should never
+        happen by construction -- a group whose admin has left without
+        the role ever transferring). Server-side authorization checks
+        (remove-member, approve member-add request) call this rather
+        than trusting anything client-supplied.
+        """
+
+        statement = select(ConversationMember.user_id).where(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.role == ConversationMember.ROLE_ADMIN,
+            ConversationMember.left_at.is_(None),
+        )
+
+        return self.db.scalar(statement)
 
     def get_member_user_ids(self, conversation_id):
         """
@@ -407,20 +455,32 @@ class ConversationRepository(BaseRepository):
 
     def get_conversation_previews_for_user(self, user_id):
         """
-        Return every active conversation this user belongs to, each
-        paired with its latest message (if any) and its other
+        Return every INITIALIZED conversation this user belongs to,
+        each paired with its latest message and its other
         participant(s), ordered by latest activity (most recent
-        message first; a conversation with no messages yet sorts by
-        its own creation time).
+        message first).
+
+        "Initialized" is deliberately narrower than "exists in the
+        database": a direct conversation row is created the moment
+        either side opens a chat with someone never messaged before
+        (ConversationRepository.get_or_create_direct_conversation()),
+        purely so a conversation_id is available for key-manager/epoch
+        setup before anything is actually sent -- see
+        ClientSession.set_current_chat(). That row must not appear in
+        the sidebar merely because it exists; a direct conversation is
+        excluded here unless it has at least one real message. A group
+        conversation has no such lazy-creation window (it is always
+        created eagerly, already populated with members, via an
+        explicit create-group action) and is therefore always
+        included regardless of message count.
 
         Two queries total, regardless of how many conversations the
         user has: the latest-message-per-conversation lookup uses a
         window function, so no message history is loaded into Python
         to be sorted here, and participants are resolved in a single
         batched query. Both are designed to be reused, not rewritten,
-        once group conversations, unread counts, pinning, and
-        archiving are added -- those only add a WHERE/ORDER BY term to
-        this same shape.
+        once unread counts, pinning, and archiving are added -- those
+        only add a WHERE/ORDER BY term to this same shape.
         """
 
         member_conversation_ids = select(ConversationMember.conversation_id).where(
@@ -432,7 +492,12 @@ class ConversationRepository(BaseRepository):
             func.row_number()
             .over(
                 partition_by=Message.conversation_id,
-                order_by=Message.timestamp.desc(),
+                # Phase 19.18: same client-suppliable-timestamp tie as
+                # MessageRepository.get_conversation() -- created_at
+                # (server-assigned, never client input) breaks ties in
+                # true receipt order so the sidebar preview always
+                # shows the actually-most-recent message.
+                order_by=(Message.timestamp.desc(), Message.created_at.desc()),
             )
             .label("rank")
         )
@@ -454,7 +519,13 @@ class ConversationRepository(BaseRepository):
                     ranked_messages.c.rank == 1,
                 ),
             )
-            .where(Conversation.id.in_(member_conversation_ids))
+            .where(
+                Conversation.id.in_(member_conversation_ids),
+                or_(
+                    Conversation.type == Conversation.TYPE_GROUP,
+                    ranked_messages.c.id.isnot(None),
+                ),
+            )
             .order_by(
                 func.coalesce(
                     ranked_messages.c.timestamp, Conversation.created_at
@@ -468,15 +539,56 @@ class ConversationRepository(BaseRepository):
         participants_by_conversation = self._get_other_participants(
             conversation_ids, user_id
         )
+        unread_counts_by_conversation = self._get_unread_counts(
+            conversation_ids, user_id
+        )
 
         return [
             ConversationPreview(
                 conversation=conversation,
                 latest_message=message,
                 participants=participants_by_conversation.get(conversation.id, []),
+                unread_count=unread_counts_by_conversation.get(conversation.id, 0),
             )
             for conversation, message in rows
         ]
+
+    def _get_unread_counts(self, conversation_ids, user_id):
+        """
+        Return {conversation_id: count} of not-yet-READ MessageRecipient
+        rows belonging to ``user_id``, across the given conversations
+        (BUG -- Offline Unread/Notification).
+
+        Reuses MessageRecipient/MessageDeliveryStatus exactly as
+        MessageRepository.mark_conversation_read() (C2 -- Read
+        Receipts) already does -- same join through Message (
+        MessageRecipient has no conversation_id column of its own),
+        same status field, no new table, no new write path. This is
+        the read side of state that read-receipt handling already
+        writes; a message a recipient has already read (on this
+        session or a previous one) is therefore never counted here,
+        regardless of when the login happens.
+
+        One batched query for every conversation in the list, not one
+        per conversation -- GROUP BY conversation_id, same shape as
+        _get_other_participants() alongside it.
+        """
+
+        if not conversation_ids:
+            return {}
+
+        statement = (
+            select(Message.conversation_id, func.count(MessageRecipient.id))
+            .join(MessageRecipient, MessageRecipient.message_id == Message.id)
+            .where(
+                Message.conversation_id.in_(conversation_ids),
+                MessageRecipient.recipient_id == user_id,
+                MessageRecipient.status != MessageDeliveryStatus.READ,
+            )
+            .group_by(Message.conversation_id)
+        )
+
+        return dict(self.db.execute(statement).all())
 
     def _get_other_participants(self, conversation_ids, excluding_user_id):
         """

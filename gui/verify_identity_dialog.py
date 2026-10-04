@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from client.session import PEER_KEY_STATE_CHANGED
+from gui.styles import COLOR_DANGER
 from storage.secure_key_store import KeyStoreError, PEER_STATE_VERIFIED
 
 
@@ -80,7 +81,7 @@ class VerifyIdentityDialog(QDialog):
             )
             warning.setWordWrap(True)
             warning.setStyleSheet(
-                "font-weight: 700; color: #E5637E;"
+                f"font-weight: 700; color: {COLOR_DANGER};"
             )
             layout.addWidget(warning)
 

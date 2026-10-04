@@ -5,7 +5,7 @@ Displays the current connection status,
 active encryption algorithm, and logged-in user.
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QWidget,
     QLabel,
@@ -15,11 +15,19 @@ from PySide6.QtWidgets import (
 from gui.styles import (
     COLOR_ONLINE,
     COLOR_OFFLINE,
+    COLOR_DANGER,
     COLOR_QUANTUM,
     COLOR_CLASSICAL,
     COLOR_PANEL_ALT,
     COLOR_TEXT_MUTED,
 )
+
+# Phase 14.1 -- Security Rejection GUI: how long a security notice stays
+# visible before clearing itself. Self-clearing (rather than requiring
+# a dismiss click) is deliberate -- see StatusBarWidget.set_security_
+# notice()'s own docstring for why a malicious packet must not be able
+# to pile up interruptions.
+SECURITY_NOTICE_DURATION_MS = 6000
 
 
 class StatusBarWidget(QWidget):
@@ -32,6 +40,15 @@ class StatusBarWidget(QWidget):
         super().__init__()
 
         self.build_ui()
+
+        # Phase 14.1 -- Security Rejection GUI: a single-shot timer that
+        # clears the security notice on its own, so a rapid sequence of
+        # rejected packets (e.g. a malicious server retrying) replaces
+        # the same label and resets the same timer rather than queuing
+        # up separate, stacking interruptions.
+        self._security_notice_timer = QTimer(self)
+        self._security_notice_timer.setSingleShot(True)
+        self._security_notice_timer.timeout.connect(self._clear_security_notice)
 
     # ==========================================================
     # UI
@@ -76,7 +93,19 @@ class StatusBarWidget(QWidget):
             f"color: {COLOR_TEXT_MUTED}; font-size: 9.5pt;"
         )
 
+        # Phase 14.1 -- Security Rejection GUI: empty/hidden until a
+        # rejection actually happens (set_security_notice()) -- takes
+        # no permanent space in the bar otherwise.
+        self.security_label = QLabel("")
+        self.security_label.setTextFormat(Qt.PlainText)
+        self.security_label.setStyleSheet(
+            f"color: {COLOR_DANGER}; font-weight: 600; font-size: 9pt;"
+        )
+        self.security_label.setVisible(False)
+
         layout.addWidget(self.connection_label)
+
+        layout.addWidget(self.security_label)
 
         layout.addStretch()
 
@@ -165,3 +194,36 @@ class StatusBarWidget(QWidget):
         self.user_label.setText(
             f"User: {username}"
         )
+
+    def set_security_notice(self, text):
+        """
+        Phase 14.1 -- Security Rejection GUI: show a brief, non-blocking
+        security notice (e.g. "a security-sensitive packet was
+        rejected") and auto-clear it after SECURITY_NOTICE_DURATION_MS.
+
+        Deliberately NOT a QMessageBox: a forged/rejected packet is,
+        by construction, something ClientSession has already handled
+        safely (see ClientSession.security_rejection's own docstring --
+        no trusted key or identity state is ever altered by the
+        rejection itself). A modal dialog would let a malicious server
+        repeatedly interrupt the user just by resending forged
+        packets; a self-clearing status-bar line is noticeable without
+        being a repeatable denial-of-service against the UI. Calling
+        this again before the previous notice expired simply replaces
+        the text and restarts the timer -- notices never queue or
+        stack.
+
+        ``text`` is caller-supplied and must already be a safe,
+        human-readable string -- this method has no way to know
+        whether it came from cryptographic material, so composing that
+        text safely is entirely the caller's responsibility (see
+        ChatWindow.handle_security_rejection()).
+        """
+
+        self.security_label.setText(text)
+        self.security_label.setVisible(bool(text))
+        self._security_notice_timer.start(SECURITY_NOTICE_DURATION_MS)
+
+    def _clear_security_notice(self):
+        self.security_label.setText("")
+        self.security_label.setVisible(False)

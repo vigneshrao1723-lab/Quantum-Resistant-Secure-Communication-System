@@ -548,7 +548,10 @@ def app(running_server, monkeypatch, tmp_path):
         session = ClientSession()
         opened.append(session)
 
-        result = session.authenticate_credentials(payload["username"], password)
+        # UI Finalization -- Login Identifier: phone number, not
+        # username, is what authenticate_credentials() now authenticates
+        # with.
+        result = session.authenticate_credentials(payload["phone_number"], password)
         assert result.success, result.message
 
         session.user_id = result.user_id
@@ -693,6 +696,14 @@ def test_older_epochs_remain_decryptable_after_restart(app):
     alice.key_store.verify_peer_fingerprint(
         bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
     )
+    # Phase 13 (Group-Key-Distribution ML-DSA Origin Authentication):
+    # bob is the RECEIVER of every session key alice (re-)establishes
+    # below, including after her own restart -- her identity is loaded
+    # from her persisted key store across each relaunch, so verifying
+    # it once here, up front, covers every later delivery too.
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"], fingerprint_public_key(alice.key_manager.public_key)
+    )
 
     _open_direct(alice, bob_payload["username"])
     _open_direct(bob, alice_payload["username"])
@@ -758,6 +769,12 @@ def test_attachment_from_a_previous_session_still_decrypts(app, tmp_path):
     alice.key_store.verify_peer_fingerprint(
         bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
     )
+    # Phase 13: bob is the RECEIVER of alice's live group_key_
+    # distribution packet below, which now also requires bob to have
+    # alice already VERIFIED.
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"], fingerprint_public_key(alice.key_manager.public_key)
+    )
 
     image_path = tmp_path / "shared.png"
     image = QImage(40, 30, QImage.Format_RGB32)
@@ -808,6 +825,12 @@ def test_logout_then_login_preserves_history(app):
 
     alice.key_store.verify_peer_fingerprint(
         bob_payload["username"], fingerprint_public_key(bob.key_manager.public_key)
+    )
+    # Phase 13: bob is the RECEIVER of alice's live group_key_
+    # distribution packet below, which now also requires bob to have
+    # alice already VERIFIED.
+    bob.key_store.verify_peer_fingerprint(
+        alice_payload["username"], fingerprint_public_key(alice.key_manager.public_key)
     )
 
     _open_direct(alice, bob_payload["username"])
