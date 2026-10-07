@@ -458,6 +458,8 @@ function registerBubbleMessageId(bubble, messageId) {
   if (!bubble || !messageId) return;
   bubble.dataset.messageId = messageId;
   bubblesByMessageId.set(messageId, bubble);
+  const actions = bubble.closest(".msg-row")?.querySelector(".msg-actions");
+  if (actions) actions.hidden = false;
 }
 
 function resolveOldestPendingSentBubble(key, messageId) {
@@ -690,8 +692,16 @@ function closeAnyOpenPopup() {
 document.addEventListener("click", closeAnyOpenPopup);
 
 function positionPopup(el, event) {
-  el.style.left = `${Math.min(event.clientX, window.innerWidth - 200)}px`;
-  el.style.top = `${Math.min(event.clientY, window.innerHeight - 200)}px`;
+  const width = el.offsetWidth || 180;
+  const height = el.offsetHeight || 200;
+  const left = typeof event?.clientX === "number"
+    ? Math.min(Math.max(event.clientX, 8), Math.max(8, window.innerWidth - width - 8))
+    : 8;
+  const top = typeof event?.clientY === "number"
+    ? Math.min(Math.max(event.clientY, 8), Math.max(8, window.innerHeight - height - 8))
+    : 8;
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
 }
 
 function showBubbleContextMenu(bubble, event) {
@@ -1520,6 +1530,27 @@ function bubbleShell(container, sender, options, extraClass) {
     bubble.appendChild(senderLabel);
   }
   row.appendChild(bubble);
+
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+  actions.hidden = !options.messageId;
+  const actionButton = document.createElement("button");
+  actionButton.type = "button";
+  actionButton.className = "msg-action-btn";
+  actionButton.setAttribute("aria-label", "Message actions");
+  actionButton.title = "Message actions";
+  actionButton.textContent = "⋯";
+  actionButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    bubble.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: actionButton.getBoundingClientRect().right,
+      clientY: actionButton.getBoundingClientRect().bottom,
+    }));
+  });
+  actions.appendChild(actionButton);
+  row.appendChild(actions);
   container.appendChild(row);
   container.scrollTop = container.scrollHeight;
 
@@ -1775,11 +1806,43 @@ function renderAttachment(container, sender, payloadType, bytes, contentMetadata
 function openLightbox(objectUrl) {
   const box = document.createElement("div");
   box.className = "lightbox";
+  box.setAttribute("role", "dialog");
+  box.setAttribute("aria-modal", "true");
+  box.setAttribute("aria-label", "Image preview");
+  box.tabIndex = -1;
+  const returnFocus = document.activeElement;
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.className = "lightbox-close";
+  closeButton.setAttribute("aria-label", "Close image preview");
+  closeButton.textContent = "×";
   const img = document.createElement("img");
   img.src = objectUrl;
-  box.appendChild(img);
-  box.addEventListener("click", () => box.remove());
+  img.alt = "";
+  const close = () => {
+    document.removeEventListener("keydown", onKeyDown);
+    box.remove();
+    if (returnFocus instanceof HTMLElement && returnFocus.isConnected) {
+      returnFocus.focus({ preventScroll: true });
+    }
+  };
+  const onKeyDown = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+    }
+  };
+  closeButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    close();
+  });
+  box.append(closeButton, img);
+  box.addEventListener("click", (event) => {
+    if (event.target === box) close();
+  });
+  document.addEventListener("keydown", onKeyDown);
   document.body.appendChild(box);
+  closeButton.focus({ preventScroll: true });
 }
 
 // Phase 19.17C -- profile pictures. Fills an .avatar element with a

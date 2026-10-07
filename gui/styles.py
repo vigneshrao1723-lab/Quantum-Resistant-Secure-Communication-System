@@ -67,6 +67,11 @@ COLOR_SEND_FAILED = COLOR_DANGER
 # (0.85, 0.85, 0.90, 1) for kind == "received"), matched exactly.
 COLOR_BUBBLE_RECEIVED = "#D9D9E6"
 COLOR_BUBBLE_SYSTEM = COLOR_PANEL_ALT
+COLOR_BUBBLE_SENT_TEXT = "#FFFFFF"
+COLOR_BUBBLE_SENT_META = "#E7E2FF"
+COLOR_BUBBLE_FAILED_TEXT = "#702A35"
+COLOR_BUBBLE_RECEIVED_TEXT = COLOR_TEXT
+COLOR_BUBBLE_RECEIVED_META = "#55556A"
 
 # ==============================================================
 # Chat Wallpaper (Phase 19.24)
@@ -247,6 +252,60 @@ QPushButton#IconButton {{
 
 QPushButton#IconButton:hover {{
     background-color: {COLOR_PANEL_ALT};
+}}
+
+QPushButton#SidebarToolButton {{
+    background-color: {COLOR_PANEL_ALT};
+    color: {COLOR_TEXT};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 10px;
+    padding: 7px 8px;
+    min-height: 18px;
+}}
+
+QPushButton#SidebarToolButton:hover {{
+    background-color: {COLOR_PANEL};
+    border-color: {COLOR_ACCENT};
+}}
+
+QPushButton#SidebarToolButton:checked {{
+    background-color: {COLOR_ACCENT};
+    color: #FFFFFF;
+}}
+
+QPushButton#AuthPrimaryAction {{
+    min-height: 24px;
+    border-radius: 12px;
+    font-size: 12pt;
+    font-weight: 700;
+}}
+
+QPushButton#AuthModeToggle {{
+    background-color: transparent;
+    color: {COLOR_ACCENT};
+    padding: 7px 12px;
+    min-height: 16px;
+}}
+
+QPushButton#AuthModeToggle:hover {{
+    background-color: {COLOR_PANEL_ALT};
+}}
+
+QPushButton#MessageActionsButton {{
+    background-color: transparent;
+    color: {COLOR_TEXT_MUTED};
+    border: none;
+    border-radius: 8px;
+    padding: 0;
+    min-width: 28px;
+    min-height: 22px;
+    font-size: 15pt;
+    font-weight: 700;
+}}
+
+QPushButton#MessageActionsButton:hover {{
+    background-color: {COLOR_PANEL_ALT};
+    color: {COLOR_ACCENT};
 }}
 
 

@@ -901,6 +901,7 @@ input { font-family: inherit; }
   position: fixed;
   z-index: 500;
   min-width: 160px;
+  max-width: min(92vw, 220px);
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -958,3 +959,108 @@ input { font-family: inherit; }
   color: var(--text);
 }
 .bubble-popup-list button:hover { background: var(--accent-soft); color: var(--accent); }
+
+/* Keep the action menu attached to its message instead of clipping it
+   outside the conversation's scrolling area. */
+.msg-row { position: relative; }
+.msg-actions {
+  position: absolute;
+  top: -12px;
+  right: 4px;
+  z-index: 4;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(3px);
+  transition: opacity .12s ease, transform .12s ease;
+}
+.msg-actions[hidden] { display: none; }
+.msg-row:hover .msg-actions,
+.msg-row:focus-within .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+.msg-action-btn {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.msg-action-btn:hover,
+.msg-action-btn:focus-visible {
+  background: var(--surface-alt);
+  color: var(--accent);
+}
+
+.message-scroll:not(:empty)::before {
+  content: "";
+  flex: 1 0 auto;
+  min-height: 0;
+}
+
+#fingerprintDisplay,
+.device-panel .row-sub {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.chat-header-info { min-width: 0; }
+.chat-header-title { overflow-wrap: anywhere; }
+.verified-badge { flex: none; white-space: nowrap; }
+.device-panel .row-card { align-items: flex-start; }
+.device-panel .row-main { min-width: 0; }
+.empty-hint { overflow-wrap: anywhere; }
+
+.lightbox { cursor: default; padding: 56px 16px 16px; }
+.lightbox img { max-width: 96vw; max-height: 92vh; object-fit: contain; }
+.lightbox-close {
+  position: absolute;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(255, 255, 255, .45);
+  border-radius: 50%;
+  background: rgba(25, 22, 38, .8);
+  color: #fff;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+}
+.lightbox-close:hover,
+.lightbox-close:focus-visible { background: var(--accent); }
+
+@media (max-width: 800px) {
+  .app-body { grid-template-columns: minmax(0, 1fr); }
+  .sidebar.is-chat-open { display: none; }
+  .main-pane.is-empty { display: none; }
+  .chat-header { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
+  .chat-header-back { display: inline-flex; }
+  .chat-header-info { flex: 1 1 200px; }
+  .chat-header button.btn-icon { min-width: 34px; }
+  .msg-row { max-width: 88%; }
+}
+
+@media (max-width: 480px) {
+  .topbar { padding-left: 10px; padding-right: 10px; }
+  .msg-row { max-width: 92%; }
+  .lightbox { padding: max(64px, env(safe-area-inset-top)) 10px 16px; }
+  .lightbox img { max-height: calc(100dvh - 96px); }
+  .lightbox-close { right: 10px; }
+}
+
+@media (hover: none) {
+  .msg-actions { opacity: 1; pointer-events: auto; transform: none; }
+}

@@ -210,6 +210,7 @@ class LoginWindow(QWidget):
         # ----------------------------------
 
         self.submit_button = QPushButton("Login")
+        self.submit_button.setObjectName("AuthPrimaryAction")
         self.submit_button.setFixedHeight(46)
         self.submit_button.setCursor(Qt.PointingHandCursor)
         self.submit_button.clicked.connect(self.handle_submit)
@@ -219,6 +220,7 @@ class LoginWindow(QWidget):
         # ----------------------------------
 
         self.toggle_mode_button = QPushButton("Create an account")
+        self.toggle_mode_button.setObjectName("AuthModeToggle")
         self.toggle_mode_button.setFlat(True)
         self.toggle_mode_button.clicked.connect(self.toggle_mode)
 

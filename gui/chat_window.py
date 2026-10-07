@@ -205,21 +205,27 @@ class ChatWindow(QWidget):
 
         conversations_header.addStretch()
 
-        conversations_header.addWidget(self.archived_toggle_button)
-
-        conversations_header.addWidget(self.find_user_button)
-
-        conversations_header.addWidget(self.new_group_button)
-
-        conversations_header.addWidget(self.inbox_button)
-
-        conversations_header.addWidget(self.account_settings_button)
-
-        conversations_header.addWidget(self.device_management_button)
+        conversations_actions = QGridLayout()
+        conversations_actions.setContentsMargins(0, 4, 0, 4)
+        conversations_actions.setHorizontalSpacing(6)
+        conversations_actions.setVerticalSpacing(6)
+        sidebar_actions = (
+            self.find_user_button,
+            self.new_group_button,
+            self.inbox_button,
+            self.account_settings_button,
+            self.device_management_button,
+            self.archived_toggle_button,
+        )
+        for index, button in enumerate(sidebar_actions):
+            button.setObjectName("SidebarToolButton")
+            button.setMinimumWidth(0)
+            conversations_actions.addWidget(button, index // 3, index % 3)
 
         self.conversation_list = ConversationListWidget()
 
         left_layout.addLayout(conversations_header)
+        left_layout.addLayout(conversations_actions)
 
         left_layout.addWidget(self.conversation_list)
 
@@ -321,6 +327,8 @@ class ChatWindow(QWidget):
         self.chat_partner_label.setStyleSheet(
             "font-size: 15px; font-weight: 700;"
         )
+        self.chat_partner_label.setMinimumWidth(0)
+        self.chat_partner_label.setWordWrap(True)
 
         # Phase 19.24 -- Presence/Last Seen: a direct conversation's
         # own online/offline subtitle -- Desktop previously showed NO
@@ -471,37 +479,27 @@ class ChatWindow(QWidget):
 
         self._current_direct_peer_username = None
 
-        header_top_row = QHBoxLayout()
+        header_identity_row = QHBoxLayout()
+        header_identity_row.setSpacing(8)
+        header_identity_row.addWidget(self.header_avatar_label)
+        header_identity_row.addWidget(self.chat_partner_label, 1)
+        header_identity_row.addWidget(self.view_profile_button)
+        header_identity_row.addWidget(self.verification_status_label)
+        header_layout.addLayout(header_identity_row)
 
-        header_top_row.addWidget(self.header_avatar_label)
-
-        header_top_row.addWidget(self.chat_partner_label)
-
-        header_top_row.addWidget(self.view_profile_button)
-
-        header_top_row.addWidget(self.verification_status_label)
-
-        header_top_row.addWidget(self.verify_identity_button)
-
-        header_top_row.addWidget(self.request_verification_button)
-
-        header_top_row.addStretch()
-
-        header_top_row.addWidget(self.search_button)
-
-        header_top_row.addWidget(self.pinned_messages_button)
-
-        header_top_row.addWidget(self.gallery_button)
-
-        header_top_row.addWidget(self.wallpaper_button)
-
-        header_top_row.addWidget(self.add_members_button)
-
-        header_top_row.addWidget(self.group_info_button)
-
-        header_top_row.addWidget(self.leave_group_button)
-
-        header_layout.addLayout(header_top_row)
+        header_actions_row = QHBoxLayout()
+        header_actions_row.setSpacing(4)
+        header_actions_row.addWidget(self.verify_identity_button)
+        header_actions_row.addWidget(self.request_verification_button)
+        header_actions_row.addStretch()
+        header_actions_row.addWidget(self.search_button)
+        header_actions_row.addWidget(self.pinned_messages_button)
+        header_actions_row.addWidget(self.gallery_button)
+        header_actions_row.addWidget(self.wallpaper_button)
+        header_actions_row.addWidget(self.add_members_button)
+        header_actions_row.addWidget(self.group_info_button)
+        header_actions_row.addWidget(self.leave_group_button)
+        header_layout.addLayout(header_actions_row)
 
         header_layout.addWidget(self.presence_label)
 
@@ -1959,7 +1957,8 @@ class ChatWindow(QWidget):
             self.verification_status_label.setText("✓ Verified")
 
             self.verification_status_label.setStyleSheet(
-                f"font-size: 11px; font-weight: 700; color: {COLOR_ONLINE};"
+                f"font-size: 11px; font-weight: 700; color: {COLOR_ONLINE}; "
+                "background: #2DC8A422; padding: 4px 9px; border-radius: 10px;"
             )
 
             self.verification_status_label.setVisible(True)
@@ -1975,7 +1974,8 @@ class ChatWindow(QWidget):
             )
 
             self.verification_status_label.setStyleSheet(
-                f"font-size: 11px; font-weight: 700; color: {COLOR_DANGER};"
+                f"font-size: 11px; font-weight: 700; color: {COLOR_DANGER}; "
+                "background: #D9525222; padding: 4px 9px; border-radius: 10px;"
             )
 
             self.verification_status_label.setVisible(True)
@@ -1991,7 +1991,8 @@ class ChatWindow(QWidget):
             )
 
             self.verification_status_label.setStyleSheet(
-                f"font-size: 11px; font-weight: 700; color: {COLOR_CLASSICAL};"
+                f"font-size: 11px; font-weight: 700; color: {COLOR_CLASSICAL}; "
+                "background: #C97A0A22; padding: 4px 9px; border-radius: 10px;"
             )
 
             self.verification_status_label.setVisible(True)

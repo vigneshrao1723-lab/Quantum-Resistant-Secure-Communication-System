@@ -36,8 +36,13 @@ from domain.payload_type import PayloadType
 from gui.styles import (
     COLOR_ACCENT,
     COLOR_BUBBLE_FAILED,
+    COLOR_BUBBLE_FAILED_TEXT,
     COLOR_BUBBLE_SENT,
+    COLOR_BUBBLE_SENT_META,
+    COLOR_BUBBLE_SENT_TEXT,
     COLOR_BUBBLE_RECEIVED,
+    COLOR_BUBBLE_RECEIVED_META,
+    COLOR_BUBBLE_RECEIVED_TEXT,
     COLOR_BUBBLE_SYSTEM,
     COLOR_READ_RECEIPT,
     COLOR_SEND_FAILED,
@@ -125,6 +130,64 @@ def _handle_message_context_menu_event(bubble, event, parent):
         return
 
     bubble.on_context_action(chosen.data(), bubble)
+
+
+def _bubble_content_colors(kind, read_status):
+    if kind == "received":
+        return COLOR_BUBBLE_RECEIVED_TEXT, COLOR_BUBBLE_RECEIVED_META
+    if read_status == "failed":
+        return COLOR_BUBBLE_FAILED_TEXT, COLOR_BUBBLE_FAILED_TEXT
+    return COLOR_BUBBLE_SENT_TEXT, COLOR_BUBBLE_SENT_META
+
+
+def _show_message_action_menu(bubble, button):
+    menu = _build_message_context_menu(bubble, bubble)
+    if menu is None:
+        return
+    action = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+    if action is not None and bubble.on_context_action is not None:
+        bubble.on_context_action(action.data(), bubble)
+
+
+def _create_message_actions_button(bubble):
+    button = QPushButton("⋯")
+    button.setObjectName("MessageActionsButton")
+    button.setAccessibleName("Message actions")
+    button.setToolTip("Message actions")
+    button.setFixedSize(28, 24)
+    button.setCursor(Qt.PointingHandCursor)
+    button.setVisible(False)
+    button.clicked.connect(lambda: _show_message_action_menu(bubble, button))
+    return button
+
+
+def _message_footer(bubble, time_label):
+    footer = QWidget()
+    layout = QHBoxLayout(footer)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    layout.addWidget(time_label)
+    layout.addStretch()
+    bubble.actions_button = _create_message_actions_button(bubble)
+    _text_color, meta_color = _bubble_content_colors(
+        bubble.kind, getattr(bubble, "_read_status", None)
+    )
+    bubble.actions_button.setStyleSheet(
+        f"color: {meta_color}; background: transparent; border: none; "
+        "border-radius: 8px; padding: 0; font-size: 15pt; font-weight: 700;"
+    )
+    layout.addWidget(bubble.actions_button)
+    return footer
+
+
+def _refresh_message_actions_button(bubble):
+    button = getattr(bubble, "actions_button", None)
+    if button is None or bubble.kind == "system":
+        return
+    message_id = bubble.message_id
+    button.setVisible(
+        bool(message_id and not str(message_id).startswith("live-"))
+    )
 
 
 def _row_size_hint(widget):
@@ -658,11 +721,12 @@ class MessageBubble(QWidget):
                 Qt.AlignRight if kind == "sent" else Qt.AlignLeft
             )
 
-            bubble_layout.addWidget(self.time_label)
+            bubble_layout.addWidget(_message_footer(self, self.time_label))
 
             self._bubble = bubble
             self._read_status = read_status
             self._on_retry = on_retry
+            self._refresh_content_colors()
 
             # Task 2 -- a failed message must be RECOVERABLE, not just
             # labelled. Without this the only options were retyping the
@@ -732,6 +796,34 @@ class MessageBubble(QWidget):
         )
 
         _apply_bubble_style(self._bubble, self.kind, read_status)
+        self._refresh_content_colors()
+
+    def _refresh_content_colors(self):
+        text_color, meta_color = _bubble_content_colors(
+            self.kind, self._read_status
+        )
+        self._text_label.setStyleSheet(
+            f"color: {text_color}; font-size: 10.5pt; background: transparent;"
+        )
+        self._pinned_label.setStyleSheet(
+            f"color: {meta_color}; font-size: 8.5pt; "
+            "font-weight: 600; background: transparent;"
+        )
+        self._reply_preview_label.setStyleSheet(
+            f"color: {meta_color}; font-size: 9pt; "
+            "font-style: italic; background: transparent; "
+            f"border-left: 2px solid {meta_color}; padding-left: 6px;"
+        )
+        self._reactions_label.setStyleSheet(
+            f"color: {text_color}; font-size: 10pt; background: transparent;"
+        )
+        self.time_label.setStyleSheet(
+            f"color: {meta_color}; font-size: 8pt; background: transparent;"
+        )
+        self.actions_button.setStyleSheet(
+            f"color: {meta_color}; background: transparent; border: none; "
+            "border-radius: 8px; padding: 0; font-size: 15pt; font-weight: 700;"
+        )
 
     # ------------------------------------------------------------------
     # Task 2 -- retry
@@ -785,6 +877,7 @@ class MessageBubble(QWidget):
         self.time_label.setText(_time_label_html(self._timestamp_text, False))
 
         _apply_bubble_style(self._bubble, self.kind, False)
+        self._refresh_content_colors()
 
         if self.retry_button is not None:
             self.retry_button.hide()
@@ -1142,7 +1235,9 @@ class ImageMessageBubble(QWidget):
         else:
 
             self.image_label.setText("[Unable to display image]")
-            self.image_label.setStyleSheet("color: white;")
+            self.image_label.setStyleSheet(
+                f"color: {_bubble_content_colors(kind, read_status)[0]};"
+            )
 
         bubble_layout.addWidget(self.image_label)
 
@@ -1189,13 +1284,13 @@ class ImageMessageBubble(QWidget):
         # label by identity rather than by position.
         self.time_label.setObjectName("TimestampLabel")
         self.time_label.setStyleSheet(
-            "color: rgba(255, 255, 255, 0.55); "
+            f"color: {_bubble_content_colors(kind, read_status)[1]}; "
             "font-size: 8pt; background: transparent;"
         )
         self.time_label.setAlignment(
             Qt.AlignRight if kind == "sent" else Qt.AlignLeft
         )
-        bubble_layout.addWidget(self.time_label)
+        bubble_layout.addWidget(_message_footer(self, self.time_label))
 
         self._bubble = bubble
         self._read_status = read_status
@@ -1499,7 +1594,8 @@ class FileMessageBubble(QWidget):
         name_label.setTextFormat(Qt.PlainText)
         name_label.setWordWrap(True)
         name_label.setStyleSheet(
-            "color: white; font-size: 10.5pt; background: transparent;"
+            f"color: {_bubble_content_colors(kind, read_status)[0]}; "
+            "font-size: 10.5pt; background: transparent;"
         )
         bubble_layout.addWidget(name_label)
 
@@ -1507,7 +1603,7 @@ class FileMessageBubble(QWidget):
         size_label = QLabel(_format_file_size(size_bytes))
         size_label.setTextFormat(Qt.PlainText)
         size_label.setStyleSheet(
-            "color: rgba(255, 255, 255, 0.6); "
+            f"color: {_bubble_content_colors(kind, read_status)[1]}; "
             "font-size: 8.5pt; background: transparent;"
         )
         bubble_layout.addWidget(size_label)
@@ -1547,13 +1643,13 @@ class FileMessageBubble(QWidget):
         # label by identity rather than by position.
         self.time_label.setObjectName("TimestampLabel")
         self.time_label.setStyleSheet(
-            "color: rgba(255, 255, 255, 0.55); "
+            f"color: {_bubble_content_colors(kind, read_status)[1]}; "
             "font-size: 8pt; background: transparent;"
         )
         self.time_label.setAlignment(
             Qt.AlignRight if kind == "sent" else Qt.AlignLeft
         )
-        bubble_layout.addWidget(self.time_label)
+        bubble_layout.addWidget(_message_footer(self, self.time_label))
 
         self._bubble = bubble
         self._read_status = read_status
@@ -1985,6 +2081,7 @@ class MessageWidget(QListWidget):
         # notifications must be able to find and update a RECEIVED
         # bubble too, unlike the sent-only receipt registry above.
         bubble.message_id = assigned_id
+        _refresh_message_actions_button(bubble)
 
         if bubble.kind != "system" and assigned_id is not None and not str(assigned_id).startswith("live-"):
             self._bubbles_by_message_id[assigned_id] = bubble
@@ -2289,6 +2386,7 @@ class MessageWidget(QListWidget):
             self._sent_bubbles_by_message_id[real_message_id] = bubble
             bubble.message_id = real_message_id
             self._bubbles_by_message_id[real_message_id] = bubble
+            _refresh_message_actions_button(bubble)
 
             return
 
@@ -2326,6 +2424,7 @@ class MessageWidget(QListWidget):
 
         if bubble.kind != "system":
             self._bubbles_by_message_id[message_id] = bubble
+        _refresh_message_actions_button(bubble)
 
     def get_bubble(self, message_id):
         """Read-only lookup -- used by gui/chat_window.py to resolve a
