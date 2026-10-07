@@ -1,6 +1,6 @@
 # Quantum-Resistant Secure Communication System
 
-A multi user, server-mediated secure communication system developed as a Final Year Project in Python. The system combines classical cryptography with Post-Quantum Cryptography (PQC) for client-side session key exchange, and uses a PostgreSQL-backed server as the authority for authentication, conversation state, message persistence, and file/image blob storage.
+A multi-user, server-mediated secure communication system developed as a Final Year Project in Python. The system combines classical cryptography with Post-Quantum Cryptography (PQC) for client-side session key exchange, and uses a PostgreSQL-backed server as the authority for authentication, conversation state, message persistence, and file/image blob storage.
 
 ---
 
