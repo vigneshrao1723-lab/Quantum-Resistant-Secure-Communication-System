@@ -54,6 +54,9 @@ COLOR_DANGER = "#D95252"
 # purple (mobile/app.py Bubble: `bg, radius = PURPLE, [16,16,4,16]`
 # for kind == "sent") -- matched exactly, not approximated.
 COLOR_BUBBLE_SENT = COLOR_ACCENT
+COLOR_BUBBLE_SENT_TEXT = "#FFFFFF"
+COLOR_BUBBLE_RECEIVED_TEXT = "#242333"
+COLOR_BUBBLE_RECEIVED_META = "#5D5C70"
 
 # Android's own read-tick color (mobile/app.py Bubble._READ_TICK_COLOR
 # = (0.35, 0.68, 0.97, 1)), matched exactly rather than re-derived --
@@ -67,11 +70,6 @@ COLOR_SEND_FAILED = COLOR_DANGER
 # (0.85, 0.85, 0.90, 1) for kind == "received"), matched exactly.
 COLOR_BUBBLE_RECEIVED = "#D9D9E6"
 COLOR_BUBBLE_SYSTEM = COLOR_PANEL_ALT
-COLOR_BUBBLE_SENT_TEXT = "#FFFFFF"
-COLOR_BUBBLE_SENT_META = "#E7E2FF"
-COLOR_BUBBLE_FAILED_TEXT = "#702A35"
-COLOR_BUBBLE_RECEIVED_TEXT = COLOR_TEXT
-COLOR_BUBBLE_RECEIVED_META = "#55556A"
 
 # ==============================================================
 # Chat Wallpaper (Phase 19.24)
@@ -259,7 +257,7 @@ QPushButton#SidebarToolButton {{
     color: {COLOR_TEXT};
     border: 1px solid {COLOR_BORDER};
     border-radius: 10px;
-    padding: 7px 8px;
+    padding: 8px 10px;
     min-height: 18px;
 }}
 
@@ -289,23 +287,6 @@ QPushButton#AuthModeToggle {{
 
 QPushButton#AuthModeToggle:hover {{
     background-color: {COLOR_PANEL_ALT};
-}}
-
-QPushButton#MessageActionsButton {{
-    background-color: transparent;
-    color: {COLOR_TEXT_MUTED};
-    border: none;
-    border-radius: 8px;
-    padding: 0;
-    min-width: 28px;
-    min-height: 22px;
-    font-size: 15pt;
-    font-weight: 700;
-}}
-
-QPushButton#MessageActionsButton:hover {{
-    background-color: {COLOR_PANEL_ALT};
-    color: {COLOR_ACCENT};
 }}
 
 

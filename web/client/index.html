@@ -2,10 +2,28 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#FFFFFF" />
+<meta name="color-scheme" content="light dark" />
 <title>QRSCS Web Client</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&display=swap">
-<link rel="stylesheet" href="./style.css?v=ui-20261007">
+<!-- Appearance: apply the saved theme (Light / Dark / System) before
+     first paint so a dark-mode user never sees a white flash. A
+     per-browser display preference only (localStorage) -- never sent
+     anywhere. main.js owns switching it afterwards. -->
+<script>
+  (function () {
+    var root = document.documentElement, pref = "system";
+    try { pref = localStorage.getItem("qrscs.theme") || "system"; } catch (e) {}
+    var dark = pref === "dark" || (pref === "system" && window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches);
+    root.dataset.theme = pref;
+    root.dataset.colorScheme = dark ? "dark" : "light";
+  })();
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23765CF2'/%3E%3Crect x='9' y='14.5' width='14' height='10' rx='2' fill='none' stroke='white' stroke-width='2'/%3E%3Cpath d='M12 14.5V11a4 4 0 0 1 8 0v3.5' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=Roboto+Mono:wght@500&display=swap">
+<!-- ?v= busts the browser cache whenever the UI build changes, so a
+     reviewer never sees a stale stylesheet/script from an older pass. -->
+<link rel="stylesheet" href="./style.css?v=1.6.1">
 <!--
   Import map (a native browser feature, no bundler needed): resolves
   both the bare specifiers crypto.js itself imports AND the absolute
@@ -31,7 +49,64 @@
 </head>
 <body>
 
-<div id="securityWarning"></div>
+<!-- Phase 1 UI polish -- one inline icon set (24px grid, 2px stroke)
+     replacing the mixed emoji/Unicode glyphs the header, composer and
+     menus used before, so every icon renders at the same size and
+     weight on every platform. Referenced as <svg><use href="#i-..."/>
+     from this file and from main.js::icon(). Presentation only. -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-check-check" viewBox="0 0 24 24"><path d="M18 6 7 17l-5-5"/><path d="m22 10-7.5 7.5L13 16"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21"/></symbol>
+  <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 22a10 10 0 1 1 10-10c0 2.5-2 3.5-4 3.5h-1.5a2 2 0 0 0-1.5 3.3A1.9 1.9 0 0 1 12 22z"/><circle cx="7.5" cy="10.5" r="1"/><circle cx="10.5" cy="6.8" r="1"/><circle cx="15" cy="7.5" r="1"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 16v-4.5"/><path d="M12 8h.01"/></symbol>
+  <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+  <symbol id="i-chevron-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></symbol>
+  <symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6"/><path d="M22 11h-6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+  <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M21.5 2.5 10.6 13.4"/><path d="m21.5 2.5-6.8 19-4.1-8.1-8.1-4.1z"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+  <symbol id="i-bell-off" viewBox="0 0 24 24"><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="M18.63 13A17.9 17.9 0 0 1 18 8"/><path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14"/><path d="M18 8a6 6 0 0 0-9.33-5"/><path d="m2 2 20 20"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol>
+  <symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-shield-alert" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><path d="m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4"/><path d="m21 2-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/></symbol>
+  <symbol id="i-user-check" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="m16 11 2 2 4-4"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/></symbol>
+  <symbol id="i-reply" viewBox="0 0 24 24"><path d="m9 17-5-5 5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></symbol>
+  <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01"/><path d="M15 9h.01"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="14" height="14" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+  <symbol id="i-forward" viewBox="0 0 24 24"><path d="m15 17 5-5-5-5"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v5"/><path d="M12 16.5h.01"/></symbol>
+  <symbol id="i-retry" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><path d="m16 13 5.22 3.13a.5.5 0 0 0 .78-.43V8.3a.5.5 0 0 0-.78-.43L16 11"/><rect x="2" y="6" width="14" height="12" rx="2"/></symbol>
+  <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></symbol>
+</svg>
+
+<div id="securityWarning" role="alert"></div>
 
 <!-- ==================================================================
      LOGIN / REGISTER SCREEN -- mirrors gui/login_window.py and
@@ -45,18 +120,25 @@
      own label, same as both other clients.
      ================================================================== -->
 <div id="screen-login">
-  <div class="auth-card">
-    <div class="brand-mark">QRSCS</div>
-    <p class="brand-full">Quantum-Resistant Secure Communication System</p>
+  <div class="ambient" aria-hidden="true"></div>
+  <button id="loginThemeBtn" class="btn-icon login-theme-btn" type="button" aria-label="Switch between light and dark appearance" data-tooltip="Appearance" data-tooltip-align="end"><svg class="icon"><use href="#i-moon"/></svg></button>
+  <main class="auth-card">
+    <div class="auth-brand">
+      <span class="brand-logo" aria-hidden="true"><svg class="icon"><use href="#i-lock"/></svg></span>
+      <div>
+        <div class="brand-mark">QRSCS</div>
+        <p class="brand-full">Quantum-Resistant Secure Communication System</p>
+      </div>
+    </div>
     <p class="brand-subtitle">End-to-end chat secured with post-quantum cryptography</p>
 
     <div id="regUsernameField" hidden>
       <label class="field-label" for="regUsername">Username</label>
-      <input id="regUsername" class="input" placeholder="Choose a username">
+      <input id="regUsername" class="input" placeholder="Choose a username" autocomplete="username">
     </div>
 
     <label class="field-label" for="phoneNumber">Phone number</label>
-    <input id="phoneNumber" class="input" placeholder="+91 98765 43210" autocomplete="username">
+    <input id="phoneNumber" class="input" placeholder="+91 98765 43210" autocomplete="username" inputmode="tel">
 
     <label class="field-label" for="password">Password</label>
     <input id="password" type="password" class="input" placeholder="Enter your password" autocomplete="current-password">
@@ -66,15 +148,21 @@
       <input id="regConfirmPassword" type="password" class="input" placeholder="Confirm your password" autocomplete="new-password">
     </div>
 
-    <button id="connectBtn" class="btn btn-primary btn-block">Login</button>
-    <button id="toggleModeBtn" class="btn btn-ghost btn-block" type="button">Create an account</button>
-    <div id="authStatus" class="auth-status"></div>
+    <button id="connectBtn" class="btn btn-primary btn-block btn-lg">Login</button>
+    <button id="toggleModeBtn" class="btn btn-ghost btn-block btn-lg" type="button">Create an account</button>
+    <div id="authStatus" class="auth-status" role="status" aria-live="polite"></div>
+
+    <ul class="auth-trust" aria-label="Security">
+      <li><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>ML-KEM</li>
+      <li><svg class="icon" aria-hidden="true"><use href="#i-shield-check"/></svg>ML-DSA</li>
+      <li><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>End-to-end encrypted</li>
+    </ul>
 
     <div class="gateway-field">
       <label class="field-label" for="gatewayUrl">Gateway URL</label>
-      <input id="gatewayUrl" class="input" value="ws://127.0.0.1:8765">
+      <input id="gatewayUrl" class="input" value="ws://127.0.0.1:8765" spellcheck="false">
     </div>
-  </div>
+  </main>
 </div>
 
 <!-- ==================================================================
@@ -84,17 +172,21 @@
      a wide viewport (see docs/architecture/web_interoperability.md).
      ================================================================== -->
 <div id="screen-app" hidden>
-  <div class="topbar">
+  <header class="topbar">
+    <span class="brand-logo sm" aria-hidden="true"><svg class="icon"><use href="#i-lock"/></svg></span>
     <div class="brand-mark">QRSCS</div>
     <div class="topbar-spacer"></div>
-    <div id="connectionStatus" class="connection-pill" data-state="disconnected">disconnected</div>
-    <button id="logoutBtn" class="btn-icon" title="Disconnect / Logout">&#9211;</button>
-  </div>
+    <div id="connectionStatus" class="connection-pill" data-state="disconnected" role="status" aria-live="polite">disconnected</div>
+    <button id="logoutBtn" class="btn-icon" type="button" aria-label="Disconnect / Logout" data-tooltip="Log out" data-tooltip-align="end"><svg class="icon"><use href="#i-logout"/></svg></button>
+  </header>
 
   <div class="app-body">
-    <div class="sidebar" id="sidebar">
+    <nav class="sidebar" id="sidebar" aria-label="Conversations">
       <div class="sidebar-search">
-        <input id="peerUsername" class="input" placeholder="Search username to start a chat...">
+        <div class="search-field">
+          <svg class="icon search-field-icon" aria-hidden="true"><use href="#i-search"/></svg>
+          <input id="peerUsername" class="input" placeholder="Search username to start a chat..." aria-label="Search username to start a chat" autocomplete="off" spellcheck="false">
+        </div>
       </div>
 
       <!-- Internal state only -- the active group's raw conversation_id
@@ -104,153 +196,272 @@
            real user actually opens a group (its row-card). -->
       <input type="hidden" id="activeGroupId">
 
-      <div class="sidebar-tabs">
-        <button class="tab-btn is-active" data-tab="chats" type="button">Chats</button>
-        <button class="tab-btn" data-tab="groups" type="button">Groups</button>
-        <button class="tab-btn" data-tab="inbox" type="button">Inbox<span id="inboxBadge" class="tab-badge" hidden>0</span></button>
+      <div class="sidebar-tabs" role="tablist" aria-label="Conversation lists">
+        <button class="tab-btn is-active" data-tab="chats" type="button" role="tab" aria-selected="true">Chats<span id="chatsBadge" class="tab-badge is-accent" hidden>0</span></button>
+        <button class="tab-btn" data-tab="groups" type="button" role="tab" aria-selected="false">Groups<span id="groupsBadge" class="tab-badge is-accent" hidden>0</span></button>
+        <button class="tab-btn" data-tab="inbox" type="button" role="tab" aria-selected="false">Inbox<span id="inboxBadge" class="tab-badge" hidden>0</span></button>
       </div>
 
-      <div class="sidebar-panel is-active" data-panel="chats">
+      <div class="sidebar-panel is-active" data-panel="chats" role="tabpanel">
         <div class="sidebar-toolbar">
-          <button id="archivedChatsToggle" type="button" class="btn btn-ghost btn-sm">Archived</button>
+          <span class="sidebar-toolbar-label">Direct messages</span>
+          <button id="archivedChatsToggle" type="button" class="btn btn-text btn-xs">Archived</button>
         </div>
         <div class="sidebar-list" id="chatList">
           <div class="empty-hint">Type a username above and press Enter to open a direct chat.</div>
         </div>
       </div>
 
-      <div class="sidebar-panel" data-panel="groups">
-        <div style="padding:10px 14px 4px;">
-          <input id="groupName" class="input" placeholder="Group name" style="margin-bottom:8px;">
-          <input id="groupMembers" class="input" placeholder="Members (comma-separated usernames)" style="margin-bottom:8px;">
-          <button id="createGroupBtn" class="btn btn-primary btn-block btn-sm">Create Group</button>
-        </div>
+      <div class="sidebar-panel" data-panel="groups" role="tabpanel">
         <div class="sidebar-toolbar">
-          <button id="archivedGroupsToggle" type="button" class="btn btn-ghost btn-sm">Archived</button>
+          <span class="sidebar-toolbar-label">My groups</span>
+          <div class="sidebar-toolbar-actions">
+            <button id="archivedGroupsToggle" type="button" class="btn btn-text btn-xs">Archived</button>
+            <button id="openCreateGroupBtn" type="button" class="btn btn-soft btn-xs"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Create group</button>
+          </div>
         </div>
         <div class="sidebar-list" id="groupList"></div>
       </div>
 
-      <div class="sidebar-panel" data-panel="inbox">
+      <div class="sidebar-panel" data-panel="inbox" role="tabpanel">
         <div class="sidebar-list" id="inboxList">
           <div class="empty-hint">No notifications.</div>
         </div>
       </div>
 
       <div class="sidebar-footer">
-        <button id="settingsToggleBtn" class="btn btn-ghost btn-sm" style="flex:1;">&#9881; Settings</button>
+        <button id="settingsToggleBtn" class="btn btn-ghost btn-sm btn-block-flex" type="button"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg>Settings</button>
       </div>
-    </div>
+    </nav>
 
-    <div class="main-pane" id="mainPane">
+    <main class="main-pane" id="mainPane">
 
       <!-- Empty state -->
       <div class="main-empty" id="mainEmpty">
-        <div style="font-size:34px;">&#128172;</div>
-        <div>Select a conversation, or search a username to begin.</div>
+        <div class="main-empty-icon" aria-hidden="true"><svg class="icon"><use href="#i-message"/></svg></div>
+        <div class="main-empty-title">Your messages</div>
+        <div class="main-empty-text">Select a conversation, or search a username to begin.</div>
+        <div class="main-empty-note"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>Secured with ML-KEM and ML-DSA</div>
       </div>
 
       <!-- Direct chat view -->
-      <div id="chatView" hidden style="display:flex; flex-direction:column; height:100%;">
+      <section id="chatView" class="chat-view" hidden aria-label="Direct conversation">
         <div class="chat-header">
-          <button class="btn-icon chat-header-back" id="chatBackBtn" type="button">&#8592;</button>
+          <button class="btn-icon chat-header-back" id="chatBackBtn" type="button" aria-label="Back to conversations"><svg class="icon"><use href="#i-chevron-left"/></svg></button>
           <div class="avatar sm" id="chatAvatar">?</div>
           <div class="chat-header-info">
-            <div class="chat-header-title" id="chatTitle">&mdash;
-              <span id="peerVerifiedBadge" class="verified-badge is-unverified">unverified</span>
+            <div class="chat-header-title" id="chatTitle"><span class="chat-header-name">&mdash;</span>
+              <span id="peerVerifiedBadge" class="verified-badge is-unverified" data-state="UNVERIFIED">Unverified</span>
             </div>
             <div class="chat-header-sub" id="peerPresence"></div>
-            <div class="chat-header-sub" id="fingerprintDisplay"></div>
           </div>
-          <button id="confirmVerifiedBtn" class="btn btn-ghost btn-sm">Confirm match</button>
-          <button id="requestVerificationBtn" class="btn btn-ghost btn-sm">Request Approval</button>
-          <button id="establishKeyBtn" class="btn btn-ghost btn-sm">Establish key</button>
-          <button id="markReadBtn" class="btn-icon" title="Mark read">&#10003;</button>
-          <button id="loadHistoryBtn" class="btn-icon" title="Load history">&#8635;</button>
-          <button id="searchBtn" class="btn-icon" title="Search in this conversation" type="button">&#128269;</button>
-          <button id="pinnedBtn" class="btn-icon" title="Pinned messages" type="button">&#128204;</button>
-          <button id="galleryBtn" class="btn-icon" title="Media gallery" type="button">&#128451;</button>
-          <button id="wallpaperBtn" class="btn-icon" title="Chat wallpaper" type="button">&#128444;</button>
+          <div class="chat-header-actions" role="toolbar" aria-label="Conversation tools">
+            <button id="markReadBtn" class="btn-icon" type="button" aria-label="Mark as read" data-tooltip="Mark as read"><svg class="icon"><use href="#i-check-check"/></svg></button>
+            <button id="loadHistoryBtn" class="btn-icon" type="button" aria-label="Load history" data-tooltip="Load history"><svg class="icon"><use href="#i-history"/></svg></button>
+            <span class="toolbar-divider" aria-hidden="true"></span>
+            <button id="searchBtn" class="btn-icon" type="button" aria-label="Search in this conversation" data-tooltip="Search"><svg class="icon"><use href="#i-search"/></svg></button>
+            <button id="pinnedBtn" class="btn-icon" type="button" aria-label="Pinned messages" data-tooltip="Pinned messages"><svg class="icon"><use href="#i-pin"/></svg></button>
+            <button id="galleryBtn" class="btn-icon" type="button" aria-label="Media gallery" data-tooltip="Media gallery"><svg class="icon"><use href="#i-image"/></svg></button>
+            <button id="wallpaperBtn" class="btn-icon" type="button" aria-label="Chat wallpaper" data-tooltip="Wallpaper" data-tooltip-align="end"><svg class="icon"><use href="#i-palette"/></svg></button>
+          </div>
+        </div>
+        <!-- Safety number + the three key-trust actions, moved out of the
+             header row into their own strip so the number always has a
+             full line to wrap across instead of collapsing into a
+             one-character-wide column next to the action buttons. -->
+        <div class="security-bar" id="securityBar" data-state="UNVERIFIED">
+          <svg class="icon security-bar-icon" aria-hidden="true"><use href="#i-shield"/></svg>
+          <div class="security-bar-body">
+            <div id="fingerprintDisplay" class="fingerprint-display" aria-live="polite"></div>
+          </div>
+          <div class="security-bar-actions" role="group" aria-label="Identity and key">
+            <button id="confirmVerifiedBtn" class="btn btn-ghost btn-xs" type="button"><svg class="icon" aria-hidden="true"><use href="#i-shield-check"/></svg>Confirm match</button>
+            <button id="requestVerificationBtn" class="btn btn-ghost btn-xs" type="button"><svg class="icon" aria-hidden="true"><use href="#i-user-check"/></svg>Request Approval</button>
+            <button id="establishKeyBtn" class="btn btn-ghost btn-xs" type="button"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>Establish key</button>
+          </div>
+        </div>
+        <!-- Pinned banner: one ACTIVE pinned message at a time (main.js
+             cycles through the set on click). The wrap keeps the unpin
+             affordance outside the bar button so the bar stays a single
+             valid, keyboard-focusable control. -->
+        <div class="pinned-bar-wrap" id="pinnedBarWrap" hidden>
+          <button id="pinnedBar" class="pinned-bar" type="button">
+            <span class="pinned-bar-icon" aria-hidden="true"><svg class="icon"><use href="#i-pin"/></svg></span>
+            <span class="pinned-bar-body">
+              <span class="pinned-bar-label"></span>
+              <span class="pinned-bar-text"></span>
+            </span>
+            <svg class="icon pinned-bar-chevron" aria-hidden="true"><use href="#i-chevron-right"/></svg>
+          </button>
+          <button id="pinnedUnpinBtn" class="pinned-bar-unpin" type="button" aria-label="Unpin this message" data-tooltip="Unpin" data-tooltip-pos="bottom"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
         </div>
         <div id="searchBar" class="search-bar" hidden>
-          <input id="searchInput" class="input" placeholder="Search in this conversation">
-          <span id="searchResultLabel" class="search-result-label"></span>
-          <button id="searchPrevBtn" class="btn-icon" type="button" title="Previous match">&#9650;</button>
-          <button id="searchNextBtn" class="btn-icon" type="button" title="Next match">&#9660;</button>
-          <button id="searchCloseBtn" class="btn-icon" type="button" title="Close search">&#10005;</button>
+          <input id="searchInput" class="input input-sm" placeholder="Search in this conversation" aria-label="Search in this conversation">
+          <span id="searchResultLabel" class="search-result-label" aria-live="polite"></span>
+          <button id="searchPrevBtn" class="btn-icon btn-icon-sm" type="button" aria-label="Previous match"><svg class="icon"><use href="#i-chevron-up"/></svg></button>
+          <button id="searchNextBtn" class="btn-icon btn-icon-sm" type="button" aria-label="Next match"><svg class="icon"><use href="#i-chevron-down"/></svg></button>
+          <button id="searchCloseBtn" class="btn-icon btn-icon-sm" type="button" aria-label="Close search"><svg class="icon"><use href="#i-x"/></svg></button>
         </div>
-        <div class="message-scroll" id="messages"></div>
-        <div id="readStatus" style="padding:0 20px 6px;font-size:11px;color:var(--text-muted);"></div>
+        <div class="message-scroll" id="messages" role="log" aria-label="Messages"></div>
+        <div id="readStatus" class="read-status"></div>
         <div id="composerContext" class="composer-context" hidden>
-          <span id="composerContextText"></span>
-          <button id="composerContextCancel" class="btn-icon" type="button" title="Cancel">&#10005;</button>
+          <span class="composer-context-icon" aria-hidden="true"><svg class="icon"><use href="#i-reply"/></svg></span>
+          <span class="composer-context-body">
+            <span class="composer-context-title" id="composerContextTitle"></span>
+            <span class="composer-context-text" id="composerContextText"></span>
+          </span>
+          <button id="composerContextCancel" class="btn btn-text btn-xs composer-context-cancel" type="button" aria-label="Cancel"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg><span class="composer-context-cancel-label">Cancel</span></button>
         </div>
-        <div id="typingStatus" class="typing-status" hidden></div>
+        <div id="typingStatus" class="typing-status" hidden aria-live="polite"></div>
         <div class="composer">
           <input id="attachmentInput" type="file" hidden>
-          <button id="attachBtn" class="btn-icon" title="Attach a photo, file, voice, or video message" type="button">&#128206;</button>
-          <input id="messageText" class="input" placeholder="Type a message...">
-          <button id="sendAttachmentBtn" class="btn btn-ghost btn-sm" hidden>Send file</button>
-          <button id="sendBtn" class="btn btn-primary btn-sm">Send</button>
+          <button id="attachBtn" class="btn-icon composer-icon-btn" type="button" aria-label="Attach a photo, file, voice, or video message" data-tooltip="Attach" data-tooltip-pos="top"><svg class="icon"><use href="#i-paperclip"/></svg></button>
+          <input id="messageText" class="input composer-input" placeholder="Type a message..." aria-label="Message" autocomplete="off">
+          <button id="sendAttachmentBtn" class="btn btn-ghost btn-sm composer-file-btn" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#i-file"/></svg><span class="composer-file-label">Send file</span></button>
+          <button id="sendBtn" class="btn btn-primary composer-send" type="button"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span class="composer-send-label">Send</span></button>
         </div>
-      </div>
+      </section>
 
       <!-- Group chat view -->
-      <div id="groupChatView" hidden style="display:flex; flex-direction:column; height:100%;">
+      <section id="groupChatView" class="chat-view" hidden aria-label="Group conversation">
         <div class="chat-header">
-          <button class="btn-icon chat-header-back" id="groupBackBtn" type="button">&#8592;</button>
-          <div class="avatar sm" id="groupAvatar">G</div>
+          <button class="btn-icon chat-header-back" id="groupBackBtn" type="button" aria-label="Back to conversations"><svg class="icon"><use href="#i-chevron-left"/></svg></button>
+          <div class="avatar sm is-group" id="groupAvatar">G</div>
           <div class="chat-header-info">
             <div class="chat-header-title" id="groupTitle">&mdash;</div>
             <div class="chat-header-sub" id="groupSub"></div>
           </div>
-          <button id="groupInfoBtn" class="btn-icon" title="Group info">&#8505;</button>
-          <button id="loadGroupHistoryBtn" class="btn-icon" title="Load history">&#8635;</button>
-          <button id="groupSearchBtn" class="btn-icon" title="Search in this conversation" type="button">&#128269;</button>
-          <button id="groupPinnedBtn" class="btn-icon" title="Pinned messages" type="button">&#128204;</button>
-          <button id="groupGalleryBtn" class="btn-icon" title="Media gallery" type="button">&#128451;</button>
-          <button id="groupWallpaperBtn" class="btn-icon" title="Chat wallpaper" type="button">&#128444;</button>
+          <div class="chat-header-actions" role="toolbar" aria-label="Conversation tools">
+            <button id="groupInfoBtn" class="btn-icon" type="button" aria-label="Group info" data-tooltip="Group info"><svg class="icon"><use href="#i-info"/></svg></button>
+            <button id="loadGroupHistoryBtn" class="btn-icon" type="button" aria-label="Load history" data-tooltip="Load history"><svg class="icon"><use href="#i-history"/></svg></button>
+            <span class="toolbar-divider" aria-hidden="true"></span>
+            <button id="groupSearchBtn" class="btn-icon" type="button" aria-label="Search in this conversation" data-tooltip="Search"><svg class="icon"><use href="#i-search"/></svg></button>
+            <button id="groupPinnedBtn" class="btn-icon" type="button" aria-label="Pinned messages" data-tooltip="Pinned messages"><svg class="icon"><use href="#i-pin"/></svg></button>
+            <button id="groupGalleryBtn" class="btn-icon" type="button" aria-label="Media gallery" data-tooltip="Media gallery"><svg class="icon"><use href="#i-image"/></svg></button>
+            <button id="groupWallpaperBtn" class="btn-icon" type="button" aria-label="Chat wallpaper" data-tooltip="Wallpaper" data-tooltip-align="end"><svg class="icon"><use href="#i-palette"/></svg></button>
+          </div>
+        </div>
+        <div class="pinned-bar-wrap" id="groupPinnedBarWrap" hidden>
+          <button id="groupPinnedBar" class="pinned-bar" type="button">
+            <span class="pinned-bar-icon" aria-hidden="true"><svg class="icon"><use href="#i-pin"/></svg></span>
+            <span class="pinned-bar-body">
+              <span class="pinned-bar-label"></span>
+              <span class="pinned-bar-text"></span>
+            </span>
+            <svg class="icon pinned-bar-chevron" aria-hidden="true"><use href="#i-chevron-right"/></svg>
+          </button>
+          <button id="groupPinnedUnpinBtn" class="pinned-bar-unpin" type="button" aria-label="Unpin this message" data-tooltip="Unpin" data-tooltip-pos="bottom"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
         </div>
         <div id="groupSearchBar" class="search-bar" hidden>
-          <input id="groupSearchInput" class="input" placeholder="Search in this conversation">
-          <span id="groupSearchResultLabel" class="search-result-label"></span>
-          <button id="groupSearchPrevBtn" class="btn-icon" type="button" title="Previous match">&#9650;</button>
-          <button id="groupSearchNextBtn" class="btn-icon" type="button" title="Next match">&#9660;</button>
-          <button id="groupSearchCloseBtn" class="btn-icon" type="button" title="Close search">&#10005;</button>
+          <input id="groupSearchInput" class="input input-sm" placeholder="Search in this conversation" aria-label="Search in this conversation">
+          <span id="groupSearchResultLabel" class="search-result-label" aria-live="polite"></span>
+          <button id="groupSearchPrevBtn" class="btn-icon btn-icon-sm" type="button" aria-label="Previous match"><svg class="icon"><use href="#i-chevron-up"/></svg></button>
+          <button id="groupSearchNextBtn" class="btn-icon btn-icon-sm" type="button" aria-label="Next match"><svg class="icon"><use href="#i-chevron-down"/></svg></button>
+          <button id="groupSearchCloseBtn" class="btn-icon btn-icon-sm" type="button" aria-label="Close search"><svg class="icon"><use href="#i-x"/></svg></button>
         </div>
-        <div class="message-scroll" id="groupMessages"></div>
+        <div class="message-scroll" id="groupMessages" role="log" aria-label="Messages"></div>
         <div id="groupComposerContext" class="composer-context" hidden>
-          <span id="groupComposerContextText"></span>
-          <button id="groupComposerContextCancel" class="btn-icon" type="button" title="Cancel">&#10005;</button>
+          <span class="composer-context-icon" aria-hidden="true"><svg class="icon"><use href="#i-reply"/></svg></span>
+          <span class="composer-context-body">
+            <span class="composer-context-title" id="groupComposerContextTitle"></span>
+            <span class="composer-context-text" id="groupComposerContextText"></span>
+          </span>
+          <button id="groupComposerContextCancel" class="btn btn-text btn-xs composer-context-cancel" type="button" aria-label="Cancel"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg><span class="composer-context-cancel-label">Cancel</span></button>
         </div>
-        <div id="groupTypingStatus" class="typing-status" hidden></div>
+        <div id="groupTypingStatus" class="typing-status" hidden aria-live="polite"></div>
         <div class="composer">
-          <input id="groupMessageText" class="input" placeholder="Message the group...">
-          <button id="sendGroupMessageBtn" class="btn btn-primary btn-sm">Send</button>
+          <input id="groupMessageText" class="input composer-input" placeholder="Message the group..." aria-label="Message" autocomplete="off">
+          <button id="sendGroupMessageBtn" class="btn btn-primary composer-send" type="button"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span class="composer-send-label">Send</span></button>
         </div>
-      </div>
+      </section>
 
       <!-- Group info view -->
-      <div id="groupInfoView" hidden style="overflow-y:auto;">
+      <section id="groupInfoView" class="scroll-view" hidden aria-label="Group info">
         <div class="chat-header">
-          <button class="btn-icon chat-header-back" id="groupInfoBackBtn" type="button">&#8592;</button>
+          <button class="btn-icon chat-header-back is-always" id="groupInfoBackBtn" type="button" aria-label="Back to group chat"><svg class="icon"><use href="#i-chevron-left"/></svg></button>
           <div class="chat-header-info">
             <div class="chat-header-title">Group Info</div>
           </div>
         </div>
-        <div class="card" style="margin:14px;">
-          <div class="group-info-name" id="groupInfoName">&mdash;</div>
-          <div class="group-info-sub" id="groupInfoSub"></div>
+        <div class="scroll-view-body">
+          <div class="card group-info-card">
+            <div class="avatar lg is-group" aria-hidden="true"><svg class="icon"><use href="#i-users"/></svg></div>
+            <div>
+              <div class="group-info-name" id="groupInfoName">&mdash;</div>
+              <div class="group-info-sub" id="groupInfoSub"></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-heading">Members</div>
+            <div id="groupInfoMembers"></div>
+          </div>
         </div>
-        <div class="card" style="margin:14px;">
-          <div class="panel-header" style="padding:0 0 8px;">Members</div>
-          <div id="groupInfoMembers"></div>
-        </div>
-      </div>
+      </section>
 
       <!-- Settings view -->
-      <div id="settingsView" hidden style="overflow-y:auto;">
-        <div class="panel-header">Settings</div>
+      <section id="settingsView" class="scroll-view" hidden aria-label="Settings">
+        <div class="chat-header">
+          <button class="btn-icon chat-header-back" id="settingsBackBtn" type="button" aria-label="Back to conversations"><svg class="icon"><use href="#i-chevron-left"/></svg></button>
+          <div class="chat-header-info">
+            <div class="chat-header-title">Settings</div>
+          </div>
+        </div>
+        <div class="scroll-view-body">
+        <div class="panel-header">Appearance</div>
+        <div class="card">
+          <div class="settings-item settings-item-stack">
+            <div>
+              <div class="settings-item-label" id="themeLabel">Theme</div>
+              <div class="settings-item-hint">Choose how QRSCS looks on this device.</div>
+            </div>
+            <div class="theme-options" role="radiogroup" aria-labelledby="themeLabel">
+              <label class="theme-option">
+                <input type="radio" name="themePref" value="light">
+                <span class="theme-preview is-light" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span class="theme-option-label"><svg class="icon" aria-hidden="true"><use href="#i-sun"/></svg>Light</span>
+              </label>
+              <label class="theme-option">
+                <input type="radio" name="themePref" value="dark">
+                <span class="theme-preview is-dark" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span class="theme-option-label"><svg class="icon" aria-hidden="true"><use href="#i-moon"/></svg>Dark</span>
+              </label>
+              <label class="theme-option">
+                <input type="radio" name="themePref" value="system">
+                <span class="theme-preview is-system" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span class="theme-option-label"><svg class="icon" aria-hidden="true"><use href="#i-monitor"/></svg>System</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Chat -- only controls that already exist in the product:
+             Enter-to-send is main.js's own composer keydown behaviour,
+             now surfaced as a per-browser preference; wallpaper stays a
+             per-conversation control (chat toolbar) and is only described
+             here, never faked as a global setting. -->
+        <div class="panel-header">Chat</div>
+        <div class="card">
+          <div class="settings-item">
+            <div>
+              <div class="settings-item-label">Press Enter to send</div>
+              <div class="settings-item-hint">Turn off to send only with the Send button.</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="enterToSendToggle" checked>
+              <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+              <span class="sr-only">Press Enter to send</span>
+            </label>
+          </div>
+          <div class="settings-item">
+            <div>
+              <div class="settings-item-label">Chat wallpaper</div>
+              <div class="settings-item-hint">Choose a wallpaper from any conversation's toolbar. It stays on this device.</div>
+            </div>
+            <span class="settings-chip"><svg class="icon" aria-hidden="true"><use href="#i-palette"/></svg>Per chat</span>
+          </div>
+        </div>
+
+        <div class="panel-header">Account</div>
         <div class="card">
           <div class="settings-item">
             <div>
@@ -259,8 +470,8 @@
             </div>
             <button id="changeUsernameToggleBtn" class="btn btn-ghost btn-sm">Edit</button>
           </div>
-          <div id="changeUsernameForm" hidden style="padding:0 0 14px;">
-            <input id="newUsernameInput" class="input" placeholder="New username" style="margin-bottom:8px;">
+          <div id="changeUsernameForm" class="settings-form" hidden>
+            <input id="newUsernameInput" class="input input-sm" placeholder="New username" aria-label="New username">
             <button id="changeUsernameSubmitBtn" class="btn btn-primary btn-sm">Save Username</button>
           </div>
           <div class="settings-item">
@@ -270,14 +481,14 @@
             </div>
             <button id="changePasswordToggleBtn" class="btn btn-ghost btn-sm">Edit</button>
           </div>
-          <div id="changePasswordForm" hidden style="padding:0 0 14px;">
-            <input id="currentPasswordInput" type="password" class="input" placeholder="Current password" style="margin-bottom:8px;">
-            <input id="newPasswordInput" type="password" class="input" placeholder="New password" style="margin-bottom:8px;">
-            <input id="confirmNewPasswordInput" type="password" class="input" placeholder="Confirm new password" style="margin-bottom:8px;">
+          <div id="changePasswordForm" class="settings-form" hidden>
+            <input id="currentPasswordInput" type="password" class="input input-sm" placeholder="Current password" aria-label="Current password">
+            <input id="newPasswordInput" type="password" class="input input-sm" placeholder="New password" aria-label="New password">
+            <input id="confirmNewPasswordInput" type="password" class="input input-sm" placeholder="Confirm new password" aria-label="Confirm new password">
             <button id="changePasswordSubmitBtn" class="btn btn-primary btn-sm">Save Password</button>
           </div>
           <div class="settings-item">
-            <div style="display:flex; align-items:center; gap:12px;">
+            <div class="settings-item-lead">
               <div class="avatar" id="myProfilePicAvatar" style="cursor:pointer;">?</div>
               <div>
                 <div class="settings-item-label">Profile Picture</div>
@@ -296,6 +507,33 @@
           </div>
         </div>
 
+        <!-- Security -- an honest summary of what the running client
+             actually uses, plus where the per-conversation trust controls
+             live. No invented switches: safety numbers and verification
+             are per-contact, so they are described here and performed in
+             the conversation's own security bar. -->
+        <div class="panel-header">Security</div>
+        <div class="card">
+          <div class="settings-item settings-item-stack">
+            <div>
+              <div class="settings-item-label">Post-quantum cryptography</div>
+              <div class="settings-item-hint">The algorithms this session is protected with.</div>
+            </div>
+            <ul class="crypto-chips" aria-label="Cryptography in use">
+              <li class="crypto-chip"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>ML-KEM-768</li>
+              <li class="crypto-chip"><svg class="icon" aria-hidden="true"><use href="#i-shield-check"/></svg>ML-DSA-65</li>
+              <li class="crypto-chip"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>AES-256-GCM</li>
+            </ul>
+          </div>
+          <div class="settings-item">
+            <div>
+              <div class="settings-item-label">Safety numbers</div>
+              <div class="settings-item-hint">Open a conversation to compare its safety number, then use Confirm match to verify the contact.</div>
+            </div>
+            <span class="settings-chip"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>Per contact</span>
+          </div>
+        </div>
+
         <!-- Linked Devices -- moved here from the main sidebar/chat
              screen: this is real, working Phase 18 device-identity
              functionality (enroll/bind/authorize/revoke/key-sync), not
@@ -303,30 +541,68 @@
              something that belongs beside the message composer. -->
         <div class="panel-header">Linked Devices</div>
         <div class="card">
-          <div class="row-sub" style="margin-bottom:10px;">This device: <span id="myDeviceId" class="mono">(not yet enrolled)</span></div>
-          <input id="deviceName" class="input" value="Web Browser" style="margin-bottom:8px;">
-          <input id="devicePlatform" class="input" value="web" style="margin-bottom:8px;" hidden>
-          <div style="display:flex; gap:8px; margin-bottom:10px;">
-            <button id="enrollDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Enroll</button>
-            <button id="bindDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Bind session</button>
+          <div class="row-sub device-self">This device: <span id="myDeviceId" class="mono">(not yet enrolled)</span></div>
+          <label class="field-label" for="deviceName">Device name</label>
+          <input id="deviceName" class="input input-sm" value="Web Browser">
+          <input id="devicePlatform" class="input" value="web" hidden>
+          <div class="btn-row">
+            <button id="enrollDeviceBtn" class="btn btn-ghost btn-sm">Enroll</button>
+            <button id="bindDeviceBtn" class="btn btn-ghost btn-sm">Bind session</button>
           </div>
           <button id="listDevicesBtn" class="btn btn-ghost btn-block btn-sm">Refresh device list</button>
-          <div id="deviceList" style="margin-top:10px;"></div>
-          <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">
-            <div class="row-sub" style="margin-bottom:8px; text-transform:uppercase; font-size:10px; letter-spacing:0.04em;">Authorize / revoke a device</div>
-            <input id="targetDeviceId" class="input" placeholder="Target device_id" style="margin:8px 0;">
-            <div style="display:flex; gap:8px; margin-bottom:8px;">
-              <button id="observeDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Show fingerprint</button>
-              <button id="authorizeDeviceBtn" class="btn btn-ghost btn-sm" style="flex:1;">Authorize</button>
+          <div id="deviceList" class="device-list"></div>
+          <div class="card-subsection">
+            <div class="card-subheading">Authorize / revoke a device</div>
+            <input id="targetDeviceId" class="input input-sm mono-input" placeholder="Target device_id" aria-label="Target device id" spellcheck="false">
+            <div class="btn-row">
+              <button id="observeDeviceBtn" class="btn btn-ghost btn-sm">Show fingerprint</button>
+              <button id="authorizeDeviceBtn" class="btn btn-ghost btn-sm">Authorize</button>
             </div>
-            <div id="deviceFingerprintDisplay" class="row-sub" style="margin-bottom:8px;"></div>
+            <div id="deviceFingerprintDisplay" class="row-sub device-fingerprint"></div>
             <button id="revokeDeviceBtn" class="btn btn-danger btn-block btn-sm">Revoke device</button>
-            <input id="syncConversationId" class="input" placeholder="Conversation id to sync" style="margin:8px 0;">
+            <input id="syncConversationId" class="input input-sm mono-input" placeholder="Conversation id to sync" aria-label="Conversation id to sync" spellcheck="false">
             <button id="syncKeyBtn" class="btn btn-ghost btn-block btn-sm">Sync key to target device</button>
           </div>
         </div>
-      </div>
+        </div>
+      </section>
 
+    </main>
+  </div>
+</div>
+
+<!-- Create group -- opened from the Groups panel's "Create group"
+     button. Same fields and the same session.createGroup(name, members)
+     call as before; only where the form lives changed (it used to sit
+     permanently above the group list). #groupMembers still accepts a
+     plain comma-separated list; Enter/comma turns entries into chips. -->
+<div id="groupCreateModal" class="modal-overlay" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="groupCreateTitle">
+    <div class="modal-header">
+      <span class="modal-header-icon" aria-hidden="true"><svg class="icon"><use href="#i-users"/></svg></span>
+      <div>
+        <div class="modal-title" id="groupCreateTitle">Create group</div>
+        <div class="modal-subtitle">Group messages are end-to-end encrypted for every member.</div>
+      </div>
+      <button id="groupCreateCloseBtn" class="btn-icon btn-icon-sm modal-close" type="button" aria-label="Close"><svg class="icon"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <label class="field-label" for="groupName">Group name</label>
+      <input id="groupName" class="input" placeholder="e.g. Design Review" autocomplete="off">
+      <label class="field-label" for="groupMembers">Members</label>
+      <div class="member-picker" id="groupMemberPicker">
+        <span class="member-chips" id="groupMemberChips" role="list" aria-label="Selected members"></span>
+        <input id="groupMembers" class="member-picker-input" placeholder="Add a username…" aria-describedby="groupMembersHint" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field-hint" id="groupMembersHint">Press Enter or comma to add each person. You're included automatically.</div>
+      <div class="member-suggestions" id="groupMemberSuggestions" hidden>
+        <div class="member-suggestions-label">Suggested</div>
+        <div class="member-suggestions-list" id="groupMemberSuggestionsList"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button id="groupCreateCancelBtn" class="btn btn-ghost" type="button">Cancel</button>
+      <button id="createGroupBtn" class="btn btn-primary" type="button"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Create group</button>
     </div>
   </div>
 </div>
@@ -340,6 +616,6 @@
   <div id="log"></div>
 </div>
 
-<script type="module" src="./main.js?v=ui-20261007"></script>
+<script type="module" src="./main.js?v=1.6.1"></script>
 </body>
 </html>

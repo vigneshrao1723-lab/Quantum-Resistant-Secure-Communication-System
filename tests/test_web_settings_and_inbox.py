@@ -122,6 +122,9 @@ def test_web_group_info_remove_member_real_ui(running_server, gateway_url, brows
         page = browser_page["page"]
 
         page.click('.tab-btn[data-tab="groups"]')
+        # Phase 1.5 UI: the create-group form lives in a modal opened
+        # from the Groups panel (it is no longer permanently on screen).
+        page.click("#openCreateGroupBtn")
         page.fill("#groupName", "remove-member-group")
         page.fill("#groupMembers", member.username)
         page.click("#createGroupBtn")

@@ -90,6 +90,266 @@ function initialOf(name) {
 }
 
 // ------------------------------------------------------------------
+// Phase 1 UI polish -- small presentation helpers. None of these read
+// or write session state; they only build DOM / format values that
+// the existing callbacks already hand to this file.
+// ------------------------------------------------------------------
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// One icon from index.html's inline <symbol> set.
+function icon(name, className = "icon") {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", className);
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS(SVG_NS, "use");
+  use.setAttribute("href", `#i-${name}`);
+  svg.appendChild(use);
+  return svg;
+}
+
+// Several row templates below are built with innerHTML; usernames and
+// group names are user-chosen, so they're escaped on the way in.
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+  ));
+}
+
+// History timestamps are naive-UTC ISO strings -- the same convention
+// WebClientSession.fetchLastSeen() already handles by appending "Z".
+function parseServerTimestamp(value) {
+  if (!value) return null;
+  const text = String(value);
+  const hasZone = /[zZ]$|[+-]\d\d:?\d\d$/.test(text);
+  const date = new Date(hasZone ? text : `${text}Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function messageDate(options) {
+  if (options && options.historical) return parseServerTimestamp(options.timestamp);
+  return new Date();
+}
+
+function formatMessageTime(date) {
+  return date ? date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+function formatDayLabel(date) {
+  const now = new Date();
+  const sameDay = (a, b) => a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  if (sameDay(date, now)) return "Today";
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (sameDay(date, yesterday)) return "Yesterday";
+  return date.toLocaleDateString([], {
+    weekday: "short", day: "numeric", month: "short",
+    year: date.getFullYear() === now.getFullYear() ? undefined : "numeric",
+  });
+}
+
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Brief, non-blocking feedback for user-initiated actions (Copy,
+// Establish key, Request Approval, ...). Their outcome previously
+// reached only the hidden developer log, so a click looked like it did
+// nothing. Announced politely to screen readers; at most three stack.
+function toast(message, kind = "info") {
+  let region = document.getElementById("toastRegion");
+  if (!region) {
+    region = document.createElement("div");
+    region.id = "toastRegion";
+    region.className = "toast-region";
+    region.setAttribute("role", "status");
+    region.setAttribute("aria-live", "polite");
+    document.body.appendChild(region);
+  }
+  const el = document.createElement("div");
+  el.className = `toast is-${kind}`;
+  el.appendChild(icon(kind === "error" ? "alert" : kind === "success" ? "check" : "info"));
+  const text = document.createElement("span");
+  text.textContent = message;
+  el.appendChild(text);
+  region.appendChild(el);
+  while (region.children.length > 3) region.firstElementChild.remove();
+  const dismiss = () => {
+    el.classList.add("is-leaving");
+    setTimeout(() => el.remove(), 200);
+  };
+  setTimeout(dismiss, kind === "error" ? 5000 : 2800);
+  el.addEventListener("click", dismiss);
+}
+
+// ------------------------------------------------------------------
+// Phase 1.5 -- Appearance (Light / Dark / System). A per-browser
+// display preference only (localStorage, like the wallpaper choice's
+// local-only spirit) -- never sent to the server. index.html's inline
+// head script applies it before first paint; this keeps it in sync.
+// ------------------------------------------------------------------
+
+const THEME_STORAGE_KEY = "qrscs.theme";
+const darkSchemeQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+const reducedMotionQuery = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+let themeTransitionTimer = null;
+
+function readThemePreference() {
+  try { return localStorage.getItem(THEME_STORAGE_KEY) || "system"; } catch { return "system"; }
+}
+
+function applyTheme(preference, { animate = false } = {}) {
+  const root = document.documentElement;
+  const dark = preference === "dark" || (preference === "system" && !!darkSchemeQuery?.matches);
+  if (animate && !reducedMotionQuery?.matches) {
+    // A short, shared colour cross-fade -- removed again right after.
+    root.classList.add("theme-switching");
+    clearTimeout(themeTransitionTimer);
+    themeTransitionTimer = setTimeout(() => root.classList.remove("theme-switching"), 320);
+  }
+  root.dataset.theme = preference;
+  root.dataset.colorScheme = dark ? "dark" : "light";
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#16171F" : "#FFFFFF");
+  document.querySelectorAll('input[name="themePref"]').forEach((radio) => {
+    radio.checked = radio.value === preference;
+  });
+  const loginThemeUse = document.querySelector("#loginThemeBtn use");
+  if (loginThemeUse) loginThemeUse.setAttribute("href", dark ? "#i-sun" : "#i-moon");
+}
+
+function setThemePreference(preference) {
+  try { localStorage.setItem(THEME_STORAGE_KEY, preference); } catch { /* display-only preference */ }
+  applyTheme(preference, { animate: true });
+}
+
+darkSchemeQuery?.addEventListener?.("change", () => {
+  if (readThemePreference() === "system") applyTheme("system", { animate: true });
+});
+document.querySelectorAll('input[name="themePref"]').forEach((radio) => {
+  radio.addEventListener("change", () => { if (radio.checked) setThemePreference(radio.value); });
+});
+document.getElementById("loginThemeBtn")?.addEventListener("click", () => {
+  setThemePreference(document.documentElement.dataset.colorScheme === "dark" ? "light" : "dark");
+});
+applyTheme(readThemePreference());
+
+// Initials avatars get one of a few muted tones, chosen from the name
+// (stable for the same person everywhere), instead of one flat colour.
+const AVATAR_TONES = 6;
+function avatarTone(name) {
+  let hash = 0;
+  for (const ch of String(name || "")) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
+  return String(hash % AVATAR_TONES);
+}
+
+// ------------------------------------------------------------------
+// Phase 1.5 -- sidebar row metadata (last message, time, unread).
+// Purely a view over messages THIS tab has rendered or received --
+// nothing is fetched or persisted for it: a conversation not opened
+// yet this session simply shows its default subtitle.
+// ------------------------------------------------------------------
+
+const conversationActivity = new Map(); // "d:<peer>" | "g:<conversationId>" -> { preview, date, unread }
+
+function activityKey(isGroup, key) { return `${isGroup ? "g" : "d"}:${key}`; }
+
+function attachmentPreview(payloadType, contentMetadata) {
+  if (payloadType === "image") return "Photo";
+  if (payloadType === "voice") return "Voice message";
+  if (payloadType === "video") return "Video message";
+  return contentMetadata?.filename ? `File: ${contentMetadata.filename}` : "File";
+}
+
+function isConversationOnScreen(isGroup, key) {
+  return isGroup
+    ? key === activeGroupIdEl.value && !groupChatViewEl.hidden
+    : key === activeDirectPeer && !chatViewEl.hidden;
+}
+
+function noteConversationActivity(isGroup, key, sender, previewText, options = {}) {
+  if (!key) return;
+  const id = activityKey(isGroup, key);
+  const entry = conversationActivity.get(id) || { preview: "", date: null, unread: 0 };
+  const mine = sender === "me" || sender === session?.username;
+  const who = mine ? "You: " : (isGroup ? `${sender}: ` : "");
+  entry.preview = options.isDeleted ? "Message deleted" : `${who}${previewText || ""}`;
+  entry.date = messageDate(options) || entry.date;
+  if (!mine && !options.historical && !isConversationOnScreen(isGroup, key)) entry.unread += 1;
+  conversationActivity.set(id, entry);
+  if (isGroup) renderGroupList(); else renderChatList();
+}
+
+function clearConversationUnread(isGroup, key) {
+  const entry = conversationActivity.get(activityKey(isGroup, key));
+  if (entry) entry.unread = 0;
+}
+
+function formatRowTime(date) {
+  if (!date) return "";
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) return formatMessageTime(date);
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return date.toLocaleDateString([], { day: "numeric", month: "short" });
+}
+
+function updateTabBadges() {
+  let chats = 0;
+  let groups = 0;
+  for (const [id, entry] of conversationActivity) {
+    if (id.startsWith("g:")) groups += entry.unread; else chats += entry.unread;
+  }
+  for (const [badgeId, count] of [["chatsBadge", chats], ["groupsBadge", groups]]) {
+    const badge = document.getElementById(badgeId);
+    if (!badge) continue;
+    badge.textContent = count > 99 ? "99+" : String(count);
+    badge.hidden = count === 0;
+  }
+}
+
+// Shared right-hand metadata column for a conversation row: time on
+// top; muted marker, unread count and the options button underneath.
+function rowMetaHtml(entry, muted, label) {
+  const time = entry?.date ? `<span class="row-time">${escapeHtml(formatRowTime(entry.date))}</span>` : '<span class="row-time"></span>';
+  const unread = entry?.unread ? `<span class="row-unread" aria-label="${entry.unread} unread">${entry.unread > 99 ? "99+" : entry.unread}</span>` : "";
+  const mutedIcon = muted ? '<svg class="icon row-muted-icon" aria-label="Muted" role="img"><use href="#i-bell-off"/></svg>' : "";
+  return `
+      <div class="row-meta">
+        ${time}
+        <div class="row-meta-bottom">
+          ${mutedIcon}${unread}
+          <button type="button" class="row-mute-btn${muted ? " is-muted" : ""}" aria-label="Options for ${escapeHtml(label)}${muted ? " (muted)" : ""}" title="Conversation options"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+        </div>
+      </div>`;
+}
+
+// Error path for a user-initiated action: still logged exactly as
+// before, and now also shown.
+function reportActionError(error) {
+  appendLog(`ERROR: ${error.message}`);
+  toast(error.message, "error");
+}
+
+// The timestamp element every bubble footer starts with -- the visible
+// short time, with the full date/time as its hover title.
+function buildFooter(options) {
+  const footer = document.createElement("div");
+  footer.className = "bubble-footer";
+  const date = messageDate(options);
+  const time = document.createElement("span");
+  time.className = "bubble-time";
+  time.textContent = formatMessageTime(date);
+  if (date) time.title = date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  footer.appendChild(time);
+  return footer;
+}
+
+// ------------------------------------------------------------------
 // Screen / panel navigation (pure presentation state)
 // ------------------------------------------------------------------
 
@@ -111,9 +371,13 @@ function setMainView(view) {
 
 document.querySelectorAll(".tab-btn").forEach((btn) => {
   btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("is-active"));
+    document.querySelectorAll(".tab-btn").forEach((b) => {
+      b.classList.remove("is-active");
+      b.setAttribute("aria-selected", "false");
+    });
     document.querySelectorAll(".sidebar-panel").forEach((p) => p.classList.remove("is-active"));
     btn.classList.add("is-active");
+    btn.setAttribute("aria-selected", "true");
     document.querySelector(`.sidebar-panel[data-panel="${btn.dataset.tab}"]`).classList.add("is-active");
     if (btn.dataset.tab === "inbox") renderInboxList();
   });
@@ -126,6 +390,10 @@ function isInboxTabActive() {
 
 document.getElementById("chatBackBtn").addEventListener("click", () => setMainView("empty"));
 document.getElementById("groupBackBtn").addEventListener("click", () => setMainView("empty"));
+// Settings had no way back on a phone-width screen (the sidebar is
+// hidden while any main view is open there) -- same "back to list"
+// as the chat views above.
+document.getElementById("settingsBackBtn").addEventListener("click", () => setMainView("empty"));
 
 document.getElementById("settingsToggleBtn").addEventListener("click", () => {
   setMainView("settings");
@@ -211,17 +479,14 @@ document.getElementById("attachBtn").addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
   closeAnyOpenPopup();
-  const menu = document.createElement("div");
-  menu.className = "bubble-context-menu";
+  const menu = createMenu("Attach");
   const options = [
-    ["file", "\u{1F5BC}️ Photo / File"],
-    ["voice", "\u{1F3A4} Voice Message"],
-    ["video", "\u{1F3AC} Video Message"],
+    ["file", "Photo / File", "image"],
+    ["voice", "Voice Message", "mic"],
+    ["video", "Video Message", "video"],
   ];
-  for (const [choice, label] of options) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.textContent = label;
+  for (const [choice, label, iconName] of options) {
+    const btn = createMenuItem(label, iconName);
     btn.addEventListener("click", (clickEvent) => {
       clickEvent.stopPropagation();
       closeAnyOpenPopup();
@@ -233,12 +498,18 @@ document.getElementById("attachBtn").addEventListener("click", (event) => {
     });
     menu.appendChild(btn);
   }
-  document.body.appendChild(menu);
-  positionPopup(menu, event);
+  openPopup(menu, event, event.currentTarget);
 });
 document.getElementById("attachmentInput").addEventListener("change", () => {
-  const hasFile = document.getElementById("attachmentInput").files.length > 0;
-  document.getElementById("sendAttachmentBtn").hidden = !hasFile;
+  const input = document.getElementById("attachmentInput");
+  const hasFile = input.files.length > 0;
+  const btn = document.getElementById("sendAttachmentBtn");
+  btn.hidden = !hasFile;
+  // Name the picked file on the button itself, so it's clear what
+  // "Send" will send.
+  const file = hasFile ? input.files[0] : null;
+  btn.querySelector(".composer-file-label").textContent = file ? `Send ${file.name}` : "Send file";
+  btn.title = file ? `Send ${file.name} (${formatBytes(file.size)})` : "";
 });
 
 // ------------------------------------------------------------------
@@ -263,6 +534,7 @@ function openMediaRecorderModal(mode) {
     appendLog(
       `ERROR: could not access the ${mode === "video" ? "camera/microphone" : "microphone"}: ${error.message}`
     );
+    toast(`Couldn't access the ${mode === "video" ? "camera or microphone" : "microphone"}.`, "error");
   });
 }
 
@@ -271,7 +543,15 @@ function _buildMediaRecorderModal(mode, stream) {
   overlay.className = "media-recorder-modal";
   const card = document.createElement("div");
   card.className = "media-recorder-card";
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-modal", "true");
+  card.setAttribute("aria-label", mode === "video" ? "Record a video message" : "Record a voice message");
   overlay.appendChild(card);
+
+  const titleEl = document.createElement("div");
+  titleEl.className = "confirm-modal-title";
+  titleEl.textContent = mode === "video" ? "Video message" : "Voice message";
+  card.appendChild(titleEl);
 
   let previewEl = null;
   if (mode === "video") {
@@ -296,7 +576,12 @@ function _buildMediaRecorderModal(mode, stream) {
   const recordBtn = document.createElement("button");
   recordBtn.type = "button";
   recordBtn.className = "btn btn-primary btn-sm";
-  recordBtn.textContent = "⏺ Record";
+  // Icon + word instead of the old ⏺/⏹ glyphs (which render at a
+  // different size and colour on every platform).
+  const setRecordLabel = (label, iconName) => {
+    recordBtn.replaceChildren(icon(iconName), document.createTextNode(label));
+  };
+  setRecordLabel("Record", "mic");
   card.appendChild(recordBtn);
 
   const actionsRow = document.createElement("div");
@@ -347,7 +632,8 @@ function _buildMediaRecorderModal(mode, stream) {
       );
       statusEl.textContent = "Recording ready to send.";
       sendBtn.disabled = false;
-      recordBtn.textContent = "⏺ Record Again";
+      setRecordLabel("Record again", "mic");
+      card.classList.remove("is-recording");
       if (mode === "video" && previewEl) {
         previewEl.srcObject = null;
         previewEl.muted = false;
@@ -365,7 +651,8 @@ function _buildMediaRecorderModal(mode, stream) {
     };
     recorder.start();
     statusEl.textContent = "Recording…";
-    recordBtn.textContent = "⏹ Stop";
+    setRecordLabel("Stop", "stop");
+    card.classList.add("is-recording");
     sendBtn.disabled = true;
     tickInterval = setInterval(() => {
       elapsedSeconds += 1;
@@ -403,7 +690,7 @@ function _buildMediaRecorderModal(mode, stream) {
       });
       cleanupAndClose();
     } catch (error) {
-      appendLog(`ERROR: ${error.message}`);
+      reportActionError(error);
       sendBtn.disabled = false;
     }
   });
@@ -426,7 +713,14 @@ function _buildMediaRecorderModal(mode, stream) {
 // message_queued relay branch.
 const pendingSentTicksByPeer = {};
 
-const TICK_TEXT = { sent: " ✓", queued: " ✓", delivered: " ✓✓", read: " ✓✓" };
+// Phase 1 UI polish: ticks are drawn as SVG (see setTickStatus()) --
+// one check for sent/queued, two for delivered/read, read additionally
+// coloured (.tick-read). The checks are separate paths 8 units apart
+// on an 11-unit-high grid, which leaves a constant ~1.5px gap between
+// them instead of two text glyphs colliding or drifting apart.
+const TICK_SHAPE = { sent: 1, queued: 1, delivered: 2, read: 2 };
+const TICK_LABEL = { sent: "Sent", queued: "Sent", delivered: "Delivered", read: "Read" };
+const TICK_PATH = "M1 5.8 L3.6 8.4 L8 2.2";
 
 // ------------------------------------------------------------------
 // Phase 19.24 (continued) -- Message Lifecycle Events UI (Reply/Edit/
@@ -458,8 +752,6 @@ function registerBubbleMessageId(bubble, messageId) {
   if (!bubble || !messageId) return;
   bubble.dataset.messageId = messageId;
   bubblesByMessageId.set(messageId, bubble);
-  const actions = bubble.closest(".msg-row")?.querySelector(".msg-actions");
-  if (actions) actions.hidden = false;
 }
 
 function resolveOldestPendingSentBubble(key, messageId) {
@@ -500,11 +792,32 @@ function activeComposerElements() {
   return null;
 }
 
-function setComposerContext(text) {
+// Phase 1.5 -- the bar above the composer states plainly what the next
+// Send will do: reply to a message, or save an edit (in which case the
+// Send button itself becomes "Save").
+function setComposerContext({ mode, title, text }) {
   const els = activeComposerElements();
   if (!els) return;
-  els.contextText.textContent = text;
-  els.contextBar.hidden = false;
+  const bar = els.contextBar;
+  bar.dataset.mode = mode;
+  // The leading glyph tells you which one you are in before you read the
+  // label: pencil while editing, arrow while replying. Presentation only.
+  bar.querySelector(".composer-context-icon use")
+    ?.setAttribute("href", mode === "edit" ? "#i-edit" : "#i-reply");
+  bar.querySelector(".composer-context-title").textContent = title;
+  els.contextText.textContent = text || "";
+  bar.querySelector(".composer-context-icon use").setAttribute("href", mode === "edit" ? "#i-edit" : "#i-reply");
+  bar.querySelector("button").setAttribute("aria-label", mode === "edit" ? "Cancel editing" : "Cancel reply");
+  bar.hidden = false;
+  const view = bar.closest(".chat-view");
+  const composer = view?.querySelector(".composer");
+  composer?.classList.toggle("is-editing", mode === "edit");
+  const sendBtn = composer?.querySelector(".composer-send");
+  if (sendBtn) {
+    sendBtn.querySelector(".composer-send-label").textContent = mode === "edit" ? "Save" : "Send";
+    sendBtn.querySelector("use").setAttribute("href", mode === "edit" ? "#i-check" : "#i-send");
+    sendBtn.setAttribute("aria-label", mode === "edit" ? "Save edit" : "Send");
+  }
 }
 
 function clearComposerContext() {
@@ -515,6 +828,15 @@ function clearComposerContext() {
     const bar = document.getElementById(barId);
     if (bar) bar.hidden = true;
   }
+  document.querySelectorAll(".composer.is-editing").forEach((composer) => {
+    composer.classList.remove("is-editing");
+    const sendBtn = composer.querySelector(".composer-send");
+    if (sendBtn) {
+      sendBtn.querySelector(".composer-send-label").textContent = "Send";
+      sendBtn.querySelector("use").setAttribute("href", "#i-send");
+      sendBtn.removeAttribute("aria-label");
+    }
+  });
 }
 
 document.getElementById("composerContextCancel").addEventListener("click", clearComposerContext);
@@ -685,36 +1007,168 @@ function buildBubbleContextActions(bubble) {
   return actions;
 }
 
+// Element that had focus when the current popup opened -- focus goes
+// back there when the popup is dismissed with Escape.
+let popupOpener = null;
+
 function closeAnyOpenPopup() {
   document.querySelectorAll(".bubble-context-menu, .bubble-popup").forEach((el) => el.remove());
+  document.querySelectorAll(".bubble.is-menu-open").forEach((el) => el.classList.remove("is-menu-open"));
 }
 
 document.addEventListener("click", closeAnyOpenPopup);
 
-function positionPopup(el, event) {
-  const width = el.offsetWidth || 180;
-  const height = el.offsetHeight || 200;
-  const left = typeof event?.clientX === "number"
-    ? Math.min(Math.max(event.clientX, 8), Math.max(8, window.innerWidth - width - 8))
-    : 8;
-  const top = typeof event?.clientY === "number"
-    ? Math.min(Math.max(event.clientY, 8), Math.max(8, window.innerHeight - height - 8))
-    : 8;
-  el.style.left = `${left}px`;
-  el.style.top = `${top}px`;
+function createMenu(label) {
+  const menu = document.createElement("div");
+  menu.className = "bubble-context-menu";
+  menu.setAttribute("role", "menu");
+  if (label) menu.setAttribute("aria-label", label);
+  return menu;
 }
 
-function showBubbleContextMenu(bubble, event) {
+function createMenuItem(label, iconName) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.setAttribute("role", "menuitem");
+  btn.textContent = label;
+  if (iconName) btn.prepend(icon(iconName));
+  return btn;
+}
+
+// Places a popup at the pointer, or -- for a keyboard-triggered event,
+// which carries no coordinates -- under ``anchor``. Measured after
+// insertion and clamped to the viewport (flipping above the pointer
+// when there's no room below), so a menu opened near an edge never
+// spills off-screen or causes page overflow.
+function positionPopup(el, event, anchor) {
+  const margin = 8;
+  let x = event?.clientX || 0;
+  let y = event?.clientY || 0;
+  let flipFrom = y;
+  const anchorEl = (anchor && anchor.isConnected) ? anchor
+    : (event?.target instanceof Element && event.target.isConnected ? event.target : null);
+  if (!x && !y && anchorEl) {
+    const rect = anchorEl.getBoundingClientRect();
+    x = rect.left;
+    y = rect.bottom + 4;
+    flipFrom = rect.top - 4;
+  }
+  const { width, height } = el.getBoundingClientRect();
+  let left = Math.min(x, window.innerWidth - width - margin);
+  let top = y;
+  if (top + height > window.innerHeight - margin) {
+    top = flipFrom - height;
+    el.style.transformOrigin = "bottom left";
+  }
+  left = Math.max(margin, left);
+  top = Math.max(margin, Math.min(top, window.innerHeight - height - margin));
+  el.style.left = `${Math.round(left)}px`;
+  el.style.top = `${Math.round(top)}px`;
+}
+
+function openPopup(el, event, anchor) {
+  popupOpener = document.activeElement;
+  document.body.appendChild(el);
+  positionPopup(el, event, anchor);
+  // Keyboard-opened (no pointer coordinates): move focus into the
+  // popup so arrow keys / Enter work immediately.
+  if (!event || (!event.clientX && !event.clientY)) {
+    el.querySelector("button:not(:disabled)")?.focus();
+  }
+}
+
+// Keyboard support for every popup/menu: arrows move between items,
+// Escape closes and returns focus to whatever opened it. Escape also
+// closes the lightbox / gallery / confirm modal (topmost first).
+document.addEventListener("keydown", (event) => {
+  const popup = document.querySelector(".bubble-context-menu, .bubble-popup");
+  if (popup && ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+    const items = Array.from(popup.querySelectorAll("button:not(:disabled)"));
+    if (!items.length) return;
+    const horizontal = popup.classList.contains("bubble-popup") && popup.querySelector(".bubble-popup-emoji-row");
+    const forward = horizontal ? "ArrowRight" : "ArrowDown";
+    const backward = horizontal ? "ArrowLeft" : "ArrowUp";
+    const index = items.indexOf(document.activeElement);
+    let nextIndex = null;
+    if (event.key === forward) nextIndex = index < 0 ? 0 : (index + 1) % items.length;
+    else if (event.key === backward) nextIndex = index < 0 ? items.length - 1 : (index - 1 + items.length) % items.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = items.length - 1;
+    if (nextIndex !== null) {
+      event.preventDefault();
+      items[nextIndex].focus();
+    }
+    return;
+  }
+  if (event.key !== "Escape") return;
+  if (popup) {
+    event.preventDefault();
+    closeAnyOpenPopup();
+    if (popupOpener && popupOpener.isConnected) popupOpener.focus();
+    popupOpener = null;
+    return;
+  }
+  const overlays = document.querySelectorAll(".lightbox, .confirm-modal");
+  const top = overlays[overlays.length - 1];
+  if (top) {
+    event.preventDefault();
+    dismissOverlay(top);
+    return;
+  }
+  if (!groupCreateModalEl.hidden) {
+    event.preventDefault();
+    closeGroupCreateModal();
+    return;
+  }
+  // Escape inside the composer cancels a pending reply/edit.
+  const els = activeComposerElements();
+  if (els && !els.contextBar.hidden && document.activeElement === els.input) {
+    event.preventDefault();
+    const wasEditing = editingMessageId !== null;
+    clearComposerContext();
+    if (wasEditing) els.input.value = "";
+  }
+});
+
+// Removes a lightbox/modal overlay and restores focus to the control
+// that opened it.
+function dismissOverlay(overlay) {
+  const returnFocus = overlay._returnFocus;
+  overlay.remove();
+  if (returnFocus && returnFocus.isConnected) returnFocus.focus({ preventScroll: true });
+}
+
+function mountOverlay(overlay, initialFocus) {
+  overlay._returnFocus = document.activeElement;
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) dismissOverlay(overlay);
+  });
+  document.body.appendChild(overlay);
+  if (initialFocus) initialFocus.focus({ preventScroll: true });
+}
+
+const BUBBLE_ACTION_ICONS = {
+  reply: "reply", copy: "copy", forward: "forward", react: "smile",
+  pin: "pin", unpin: "pin", edit: "edit", delete_me: "trash", delete_everyone: "trash",
+};
+
+function showBubbleContextMenu(bubble, event, anchor) {
   event.preventDefault();
+  event.stopPropagation();
   closeAnyOpenPopup();
   const actions = buildBubbleContextActions(bubble);
   if (!actions.length) return;
-  const menu = document.createElement("div");
-  menu.className = "bubble-context-menu";
+  const menu = createMenu("Message actions");
+  let separated = false;
   for (const [action, label, danger] of actions) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.textContent = label;
+    if (!separated && action.startsWith("delete")) {
+      const separator = document.createElement("div");
+      separator.className = "menu-separator";
+      separator.setAttribute("role", "separator");
+      menu.appendChild(separator);
+      separated = true;
+    }
+    const btn = createMenuItem(label, BUBBLE_ACTION_ICONS[action]);
     if (danger) btn.classList.add("is-danger");
     btn.addEventListener("click", (clickEvent) => {
       clickEvent.stopPropagation();
@@ -723,22 +1177,40 @@ function showBubbleContextMenu(bubble, event) {
     });
     menu.appendChild(btn);
   }
-  document.body.appendChild(menu);
-  positionPopup(menu, event);
+  openPopup(menu, event, anchor || bubble);
+  // Marks which message the open menu belongs to (cleared by
+  // closeAnyOpenPopup()).
+  bubble.classList.add("is-menu-open");
 }
 
 const REACTION_CHOICES = ["\u{1F44D}", "❤️", "\u{1F602}", "\u{1F62E}", "\u{1F622}", "\u{1F64F}"];
+const REACTION_NAMES = {
+  "\u{1F44D}": "Thumbs up", "❤️": "Heart", "\u{1F602}": "Laughing",
+  "\u{1F62E}": "Surprised", "\u{1F622}": "Sad", "\u{1F64F}": "Thank you",
+};
 
-function showReactionPicker(bubble, event) {
+function myReactionOn(bubble) {
+  const mine = (bubble._reactions || []).find((entry) => entry.user === session?.username);
+  return mine ? mine.reaction : null;
+}
+
+function showReactionPicker(bubble, event, anchor) {
   closeAnyOpenPopup();
   const popup = document.createElement("div");
   popup.className = "bubble-popup";
+  popup.setAttribute("role", "menu");
+  popup.setAttribute("aria-label", "Choose a reaction");
   const row = document.createElement("div");
   row.className = "bubble-popup-emoji-row";
+  const current = myReactionOn(bubble);
   for (const emoji of REACTION_CHOICES) {
     const btn = document.createElement("button");
     btn.type = "button";
+    btn.setAttribute("role", "menuitem");
     btn.textContent = emoji;
+    btn.setAttribute("aria-label", REACTION_NAMES[emoji] || emoji);
+    btn.title = REACTION_NAMES[emoji] || "";
+    if (emoji === current) btn.classList.add("is-current");
     btn.addEventListener("click", (clickEvent) => {
       clickEvent.stopPropagation();
       closeAnyOpenPopup();
@@ -747,8 +1219,7 @@ function showReactionPicker(bubble, event) {
     row.appendChild(btn);
   }
   popup.appendChild(row);
-  document.body.appendChild(popup);
-  positionPopup(popup, event);
+  openPopup(popup, event, anchor || bubble);
 }
 
 // ------------------------------------------------------------------
@@ -818,11 +1289,15 @@ function showConfirmModal(title, message, confirmLabel, doAction) {
   overlay.className = "confirm-modal";
   const card = document.createElement("div");
   card.className = "confirm-modal-card";
+  card.setAttribute("role", "alertdialog");
+  card.setAttribute("aria-modal", "true");
   overlay.appendChild(card);
 
   const titleEl = document.createElement("div");
   titleEl.className = "confirm-modal-title";
+  titleEl.id = `confirm-title-${Date.now()}`;
   titleEl.textContent = title;
+  card.setAttribute("aria-labelledby", titleEl.id);
   card.appendChild(titleEl);
 
   const messageEl = document.createElement("div");
@@ -838,19 +1313,22 @@ function showConfirmModal(title, message, confirmLabel, doAction) {
   cancelBtn.textContent = "Cancel";
   const confirmBtn = document.createElement("button");
   confirmBtn.type = "button";
-  confirmBtn.className = "btn btn-primary btn-sm";
+  // Every caller of this modal confirms an irreversible action
+  // (Delete for Everyone, Block) -- styled as such.
+  confirmBtn.className = "btn btn-danger-solid btn-sm";
   confirmBtn.textContent = confirmLabel;
   actionsRow.appendChild(cancelBtn);
   actionsRow.appendChild(confirmBtn);
   card.appendChild(actionsRow);
 
-  cancelBtn.addEventListener("click", () => overlay.remove());
+  // Escape / backdrop click behave exactly like Cancel (mountOverlay()).
+  cancelBtn.addEventListener("click", () => dismissOverlay(overlay));
   confirmBtn.addEventListener("click", () => {
-    overlay.remove();
+    dismissOverlay(overlay);
     doAction();
   });
 
-  document.body.appendChild(overlay);
+  mountOverlay(overlay, cancelBtn);
 }
 
 function doBlockUser(key) {
@@ -880,12 +1358,10 @@ function showMuteMenu(key, event, refresh, isGroup = false) {
   event.preventDefault();
   event.stopPropagation();
   closeAnyOpenPopup();
-  const menu = document.createElement("div");
-  menu.className = "bubble-context-menu";
+  const menu = createMenu("Conversation options");
+  const muteIcons = { unmute: "bell", archive: "archive", unarchive: "archive", block: "x", unblock: "user-check" };
   for (const [action, label, danger] of buildMuteActions(key, isGroup)) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.textContent = label;
+    const btn = createMenuItem(label, muteIcons[action] || "bell-off");
     if (danger) btn.classList.add("is-danger");
     btn.addEventListener("click", (clickEvent) => {
       clickEvent.stopPropagation();
@@ -895,8 +1371,7 @@ function showMuteMenu(key, event, refresh, isGroup = false) {
     });
     menu.appendChild(btn);
   }
-  document.body.appendChild(menu);
-  positionPopup(menu, event);
+  openPopup(menu, event, event.currentTarget);
 }
 
 // ------------------------------------------------------------------
@@ -928,13 +1403,16 @@ function showWallpaperPicker(container, conversationId, event) {
   event.stopPropagation();
   closeAnyOpenPopup();
   const current = session?.getConversationWallpaper(conversationId);
-  const menu = document.createElement("div");
-  menu.className = "bubble-context-menu";
+  const menu = createMenu("Chat wallpaper");
   const options = [[null, "Default"], ...Object.entries(WALLPAPER_PRESETS)];
   for (const [wallpaperId, label] of options) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.textContent = wallpaperId === current ? `✓ ${label}` : label;
+    const isCurrent = (wallpaperId || null) === (current || null);
+    const btn = createMenuItem(label);
+    btn.prepend(isCurrent ? icon("check") : swatch(wallpaperId));
+    if (isCurrent) {
+      btn.classList.add("is-current");
+      btn.setAttribute("aria-current", "true");
+    }
     btn.addEventListener("click", (clickEvent) => {
       clickEvent.stopPropagation();
       closeAnyOpenPopup();
@@ -944,8 +1422,15 @@ function showWallpaperPicker(container, conversationId, event) {
     });
     menu.appendChild(btn);
   }
-  document.body.appendChild(menu);
-  positionPopup(menu, event);
+  openPopup(menu, event, event.currentTarget);
+}
+
+// A small colour sample for each wallpaper menu entry.
+function swatch(wallpaperId) {
+  const el = document.createElement("span");
+  el.className = `menu-swatch${wallpaperId ? ` wallpaper-${wallpaperId}` : ""}`;
+  el.setAttribute("aria-hidden", "true");
+  return el;
 }
 
 // ------------------------------------------------------------------
@@ -1066,8 +1551,12 @@ function showPinnedMessagesPanel(container, event) {
   event.stopPropagation();
   closeAnyOpenPopup();
   const pinned = getPinnedBubbles(container);
-  const menu = document.createElement("div");
-  menu.className = "bubble-context-menu";
+  const menu = createMenu("Pinned messages");
+  menu.classList.add("is-pinned-panel");
+  const heading = document.createElement("div");
+  heading.className = "menu-heading";
+  heading.textContent = "Pinned messages";
+  menu.appendChild(heading);
   if (!pinned.length) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -1080,20 +1569,34 @@ function showPinnedMessagesPanel(container, event) {
       const shown = preview.length > 60 ? preview.slice(0, 57) + "…" : preview;
       const pinnedEl = bubble.querySelector(".bubble-pinned");
       const by = pinnedEl && pinnedEl.textContent.includes(" by ")
-        ? ` — ${pinnedEl.textContent.replace("\u{1F4CC} ", "")}` : "";
+        ? pinnedEl.textContent.replace("\u{1F4CC} ", "") : "";
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.textContent = `${shown}${by}`;
+      btn.setAttribute("role", "menuitem");
+      // Message first (its text is what the item is read/matched by),
+      // "Pinned by" underneath as a quieter second line.
+      const body = document.createElement("span");
+      body.className = "menu-item-body";
+      const main = document.createElement("span");
+      main.className = "menu-item-text";
+      main.textContent = shown;
+      body.appendChild(main);
+      if (by) {
+        const sub = document.createElement("span");
+        sub.className = "menu-item-sub";
+        sub.textContent = by;
+        body.appendChild(sub);
+      }
+      btn.appendChild(body);
       btn.addEventListener("click", (clickEvent) => {
         clickEvent.stopPropagation();
         closeAnyOpenPopup();
-        highlightSearchMatch(container, bubble);
+        flashBubble(container, bubble);
       });
       menu.appendChild(btn);
     }
   }
-  document.body.appendChild(menu);
-  positionPopup(menu, event);
+  openPopup(menu, event, event.currentTarget);
 }
 
 // ------------------------------------------------------------------
@@ -1119,15 +1622,22 @@ function getMediaBubbles(container) {
 }
 
 function _buildGalleryTile(bubble, overlay) {
-  const tile = document.createElement("div");
+  // A real <button>, so every tile is reachable and activatable from
+  // the keyboard, not just by mouse.
+  const tile = document.createElement("button");
+  tile.type = "button";
   tile.className = "gallery-tile";
   if (bubble.dataset.payloadType === "image") {
     const img = bubble.querySelector("img");
     if (img && img.src) {
       const thumb = document.createElement("img");
       thumb.src = img.src;
+      thumb.alt = "";
       thumb.className = "gallery-thumb";
-      thumb.addEventListener("click", () => window.open(img.src, "_blank"));
+      tile.setAttribute("aria-label", `View image${img.alt ? `: ${img.alt}` : ""}`);
+      // Opens the same in-app lightbox the bubble itself uses (was a
+      // new browser tab showing a bare blob: URL).
+      tile.addEventListener("click", () => openLightbox(img.src));
       tile.appendChild(thumb);
       return tile;
     }
@@ -1137,7 +1647,7 @@ function _buildGalleryTile(bubble, overlay) {
   label.textContent = bubble.dataset.payloadType === "video" ? "\u{1F3AC} Video" : "[Media]";
   tile.appendChild(label);
   tile.addEventListener("click", () => {
-    overlay.remove();
+    dismissOverlay(overlay);
     bubble.scrollIntoView({ behavior: "smooth", block: "center" });
   });
   return tile;
@@ -1149,8 +1659,9 @@ function _buildGalleryFileRow(bubble, overlay) {
   row.className = "gallery-file-row";
   const metaEl = bubble.querySelector(".msg-meta");
   row.textContent = metaEl ? metaEl.textContent : (bubble.dataset.payloadType || "file");
+  row.prepend(icon(bubble.dataset.payloadType === "voice" ? "mic" : "file"));
   row.addEventListener("click", () => {
-    overlay.remove();
+    dismissOverlay(overlay);
     bubble.scrollIntoView({ behavior: "smooth", block: "center" });
   });
   return row;
@@ -1164,6 +1675,9 @@ function showMediaGallery(container, event) {
   overlay.className = "confirm-modal";
   const card = document.createElement("div");
   card.className = "confirm-modal-card gallery-card";
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-modal", "true");
+  card.setAttribute("aria-label", "Media gallery");
   overlay.appendChild(card);
 
   const header = document.createElement("div");
@@ -1175,8 +1689,9 @@ function showMediaGallery(container, event) {
   const closeBtn = document.createElement("button");
   closeBtn.type = "button";
   closeBtn.className = "btn-icon";
-  closeBtn.textContent = "✕";
-  closeBtn.addEventListener("click", () => overlay.remove());
+  closeBtn.setAttribute("aria-label", "Close media gallery");
+  closeBtn.appendChild(icon("x"));
+  closeBtn.addEventListener("click", () => dismissOverlay(overlay));
   header.appendChild(closeBtn);
   card.appendChild(header);
 
@@ -1184,10 +1699,10 @@ function showMediaGallery(container, event) {
 
   if (!media.length) {
     const empty = document.createElement("div");
-    empty.className = "confirm-modal-message";
+    empty.className = "confirm-modal-message gallery-empty";
     empty.textContent = "No media in this conversation yet.";
     card.appendChild(empty);
-    document.body.appendChild(overlay);
+    mountOverlay(overlay, closeBtn);
     return;
   }
 
@@ -1218,7 +1733,7 @@ function showMediaGallery(container, event) {
     card.appendChild(list);
   }
 
-  document.body.appendChild(overlay);
+  mountOverlay(overlay, closeBtn);
 }
 
 function showForwardPicker(bubble, event) {
@@ -1233,11 +1748,18 @@ function showForwardPicker(bubble, event) {
   if (!targets.length) return;
   const popup = document.createElement("div");
   popup.className = "bubble-popup";
+  popup.setAttribute("role", "menu");
+  popup.setAttribute("aria-label", "Forward to");
+  const heading = document.createElement("div");
+  heading.className = "bubble-popup-heading";
+  heading.textContent = "Forward to";
+  popup.appendChild(heading);
   const list = document.createElement("div");
   list.className = "bubble-popup-list";
   for (const target of targets) {
     const btn = document.createElement("button");
     btn.type = "button";
+    btn.setAttribute("role", "menuitem");
     btn.textContent = target.label;
     btn.addEventListener("click", (clickEvent) => {
       clickEvent.stopPropagation();
@@ -1247,8 +1769,7 @@ function showForwardPicker(bubble, event) {
     list.appendChild(btn);
   }
   popup.appendChild(list);
-  document.body.appendChild(popup);
-  positionPopup(popup, event);
+  openPopup(popup, event, bubble);
 }
 
 async function handleBubbleContextAction(action, bubble, event) {
@@ -1258,14 +1779,24 @@ async function handleBubbleContextAction(action, bubble, event) {
     pendingReplyMessageId = messageId;
     editingMessageId = null;
     const preview = bubble.dataset.text || "[Attachment]";
-    setComposerContext(`Replying to: ${preview.length > 80 ? preview.slice(0, 77) + "…" : preview}`);
+    setComposerContext({
+      mode: "reply",
+      title: `Replying to ${bubbleAuthor(bubble)}`,
+      text: preview.length > 120 ? preview.slice(0, 117) + "…" : preview,
+    });
+    activeComposerElements()?.input.focus();
     return;
   }
 
   if (action === "copy") {
     if (bubble.dataset.text) {
-      try { await navigator.clipboard.writeText(bubble.dataset.text); }
-      catch (error) { appendLog(`ERROR: could not copy to clipboard: ${error.message}`); }
+      try {
+        await navigator.clipboard.writeText(bubble.dataset.text);
+        toast("Copied to clipboard", "success");
+      } catch (error) {
+        appendLog(`ERROR: could not copy to clipboard: ${error.message}`);
+        toast("Couldn't copy to the clipboard.", "error");
+      }
     }
     return;
   }
@@ -1276,7 +1807,7 @@ async function handleBubbleContextAction(action, bubble, event) {
   }
 
   if (action === "react") {
-    if (event) showReactionPicker(bubble, event);
+    if (event) showReactionPicker(bubble, event, bubble);
     return;
   }
 
@@ -1285,9 +1816,17 @@ async function handleBubbleContextAction(action, bubble, event) {
     pendingReplyMessageId = null;
     editingMessageId = messageId;
     editingExpectedVersion = Number(bubble.dataset.editVersion || 0);
-    setComposerContext("Editing message");
+    const original = bubble.dataset.text || "";
+    setComposerContext({
+      mode: "edit",
+      title: "Editing message",
+      text: original.length > 120 ? original.slice(0, 117) + "…" : original,
+    });
     const els = activeComposerElements();
-    if (els) els.input.value = bubble.dataset.text || "";
+    if (els) {
+      els.input.value = bubble.dataset.text || "";
+      els.input.focus();
+    }
     return;
   }
 
@@ -1295,7 +1834,7 @@ async function handleBubbleContextAction(action, bubble, event) {
     try {
       session.pinMessage(messageId);
     } catch (error) {
-      appendLog(`ERROR: ${error.message}`);
+      reportActionError(error);
       return;
     }
     // Optimistic local update, mirrors gui/chat_window.py's identical
@@ -1303,6 +1842,7 @@ async function handleBubbleContextAction(action, bubble, event) {
     // notification simply re-applies the same state, a harmless no-op
     // repeat.
     setBubblePinned(bubble, true, null);
+    toast("Message pinned", "success");
     return;
   }
 
@@ -1310,10 +1850,11 @@ async function handleBubbleContextAction(action, bubble, event) {
     try {
       session.unpinMessage(messageId);
     } catch (error) {
-      appendLog(`ERROR: ${error.message}`);
+      reportActionError(error);
       return;
     }
     setBubblePinned(bubble, false);
+    toast("Message unpinned");
     return;
   }
 
@@ -1321,7 +1862,7 @@ async function handleBubbleContextAction(action, bubble, event) {
     try {
       session.deleteMessageForMe(messageId);
     } catch (error) {
-      appendLog(`ERROR: ${error.message}`);
+      reportActionError(error);
       return;
     }
     // No server broadcast for delete-for-me (server/client_handler.py::
@@ -1348,7 +1889,7 @@ function doDeleteForEveryone(messageId) {
   try {
     session.deleteMessageForEveryone(messageId);
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 }
 
@@ -1358,7 +1899,7 @@ function sendReaction(bubble, emoji) {
   try {
     session.addReaction(conversationId, bubble.dataset.messageId, emoji);
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 }
 
@@ -1378,8 +1919,9 @@ async function forwardBubbleTo(bubble, target) {
     } else if (bubble.dataset.text) {
       await session.forwardTextMessage(target, bubble.dataset.text);
     }
+    toast(`Forwarded to ${target.label}`, "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 }
 
@@ -1390,11 +1932,17 @@ function markBubbleDeleted(bubble) {
   // Remove any content already rendered for this bubble (attachment
   // preview/link, or a pre-existing text node) -- exactly one tombstone
   // node replaces it, regardless of the original payload type.
-  bubble.querySelectorAll(".bubble-text, .msg-meta, .bubble-image, .msg-image-actions, .bubble-file, .bubble-reply-preview").forEach((el) => el.remove());
+  // An attachment's timestamp lives inside its action row -- lift it
+  // back onto the bubble before that row goes, so the tombstone keeps
+  // its time.
+  const footer = bubble.querySelector(".bubble-footer");
+  if (footer && footer.parentElement !== bubble) bubble.appendChild(footer);
+  bubble.querySelectorAll(".bubble-text, .msg-meta, .bubble-image, .msg-image-actions, .bubble-file, .bubble-media, .bubble-reply-preview").forEach((el) => el.remove());
+  bubble.classList.remove("is-attachment");
   const textEl = document.createElement("div");
   textEl.className = "bubble-text";
   textEl.textContent = "Message deleted";
-  bubble.insertBefore(textEl, bubble.firstChild);
+  bubble.insertBefore(textEl, bubble.querySelector(".bubble-footer"));
   updateBubbleReactions(bubble, []);
   setBubblePinned(bubble, false);
 }
@@ -1404,29 +1952,102 @@ function applyBubbleEdit(bubble, newText, editVersion) {
   bubble.dataset.text = newText;
   bubble.dataset.editVersion = String(editVersion);
   const textEl = bubble.querySelector(".bubble-text");
-  if (textEl) textEl.textContent = `${newText} (edited)`;
+  if (textEl) textEl.textContent = newText;
+  // Phase 1.5: the edited state lives in the footer, ahead of the time
+  // ("edited · 6:53 PM ✓ ✓") -- visible, but quieter than the text.
+  const footer = bubble.querySelector(".bubble-footer");
+  if (footer && !footer.querySelector(".bubble-edited")) {
+    const edited = document.createElement("span");
+    edited.className = "bubble-edited";
+    edited.textContent = "edited";
+    const dot = document.createElement("span");
+    dot.className = "bubble-footer-dot";
+    dot.setAttribute("aria-hidden", "true");
+    dot.textContent = "·";
+    footer.prepend(edited, dot);
+  }
 }
 
+// Reaction chips -- one equal-height chip per distinct emoji, rendered
+// as a sibling directly under the bubble (inside its .msg-row) so a
+// reaction arriving never reflows the bubble's own text/footer.
+// Chips are diffed by emoji rather than rebuilt, so only a genuinely
+// new chip plays the entry animation. Tapping a chip reuses the exact
+// sendReaction() path the picker uses: someone else's emoji -> react
+// with it too; your own -> reopen the picker to change it.
 function updateBubbleReactions(bubble, reactions) {
   bubble._reactions = reactions || [];
-  let reactionsEl = bubble.querySelector(".bubble-reactions");
+  let reactionsEl = bubble._reactionsEl;
   if (!reactionsEl) {
     reactionsEl = document.createElement("div");
     reactionsEl.className = "bubble-reactions";
-    bubble.appendChild(reactionsEl);
+    reactionsEl.setAttribute("role", "group");
+    reactionsEl.setAttribute("aria-label", "Reactions");
+    bubble._reactionsEl = reactionsEl;
+    const row = bubble.parentElement;
+    if (row) bubble.after(reactionsEl);
   }
-  if (!bubble._reactions.length) {
-    reactionsEl.textContent = "";
+  if (!reactionsEl.isConnected && bubble.parentElement) bubble.after(reactionsEl);
+
+  const groups = new Map(); // emoji -> [usernames], first-reaction order
+  for (const entry of bubble._reactions) {
+    if (!entry.reaction) continue;
+    if (!groups.has(entry.reaction)) groups.set(entry.reaction, []);
+    groups.get(entry.reaction).push(entry.user);
+  }
+  if (!groups.size) {
+    reactionsEl.replaceChildren();
     reactionsEl.hidden = true;
     return;
   }
-  const counts = new Map();
-  for (const entry of bubble._reactions) {
-    if (!entry.reaction) continue;
-    counts.set(entry.reaction, (counts.get(entry.reaction) || 0) + 1);
-  }
-  reactionsEl.textContent = [...counts.entries()].map(([emoji, count]) => `${emoji}×${count}`).join("  ");
   reactionsEl.hidden = false;
+
+  const existing = new Map(
+    Array.from(reactionsEl.children).map((chip) => [chip.dataset.emoji, chip])
+  );
+  for (const [emoji, chip] of existing) {
+    if (!groups.has(emoji)) chip.remove();
+  }
+  let previous = null;
+  for (const [emoji, users] of groups) {
+    let chip = existing.get(emoji);
+    if (!chip) {
+      chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "reaction-chip is-new";
+      chip.dataset.emoji = emoji;
+      const emojiEl = document.createElement("span");
+      emojiEl.className = "reaction-emoji";
+      emojiEl.setAttribute("aria-hidden", "true");
+      emojiEl.textContent = emoji;
+      const countEl = document.createElement("span");
+      countEl.className = "reaction-count";
+      chip.append(emojiEl, countEl);
+      chip.addEventListener("animationend", () => chip.classList.remove("is-new"), { once: true });
+      chip.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (chip.classList.contains("is-mine")) {
+          showReactionPicker(bubble, event, chip);
+        } else {
+          sendReaction(bubble, emoji);
+        }
+      });
+    }
+    const mine = users.includes(session?.username);
+    const count = users.length;
+    chip.querySelector(".reaction-count").textContent = String(count);
+    chip.classList.toggle("is-mine", mine);
+    chip.setAttribute("aria-pressed", mine ? "true" : "false");
+    const name = REACTION_NAMES[emoji] || emoji;
+    chip.setAttribute(
+      "aria-label",
+      `${name}: ${count} ${count === 1 ? "reaction" : "reactions"}${mine ? ", including yours" : ""}`
+    );
+    chip.title = users.map((user) => (user === session?.username ? "You" : user)).join(", ");
+    if (previous) previous.after(chip);
+    else reactionsEl.prepend(chip);
+    previous = chip;
+  }
 }
 
 function setBubblePinned(bubble, pinned, pinnedBy) {
@@ -1437,7 +2058,10 @@ function setBubblePinned(bubble, pinned, pinnedBy) {
   // a future "pinned messages" query both read bubble.dataset.text
   // unaffected by this.
   bubble.dataset.pinned = pinned ? "1" : "0";
+  if (pinned && bubble.dataset.pinSeq === undefined) bubble.dataset.pinSeq = String(++pinSequence);
+  if (!pinned) delete bubble.dataset.pinSeq;
   let pinnedEl = bubble.querySelector(".bubble-pinned");
+  queueMicrotask(() => refreshPinnedBar(bubble.closest(".message-scroll")));
   if (!pinned) {
     if (pinnedEl) pinnedEl.remove();
     return;
@@ -1450,7 +2074,18 @@ function setBubblePinned(bubble, pinned, pinnedBy) {
   pinnedEl.textContent = pinnedBy ? `\u{1F4CC} Pinned by ${pinnedBy}` : "\u{1F4CC} Pinned";
 }
 
-function setBubbleReplyPreview(bubble, previewText) {
+// Display name for a rendered bubble's author ("You" for your own).
+function bubbleAuthor(bubble) {
+  if (!bubble) return "";
+  if (bubble.dataset.mine === "1") return "You";
+  const label = bubble.querySelector(".bubble-sender");
+  if (label && label.textContent) return label.textContent;
+  return activeDirectPeer || "";
+}
+
+// Phase 1.5: the quoted block names who is being replied to, and
+// clicking it jumps to (and briefly highlights) that original message.
+function setBubbleReplyPreview(bubble, previewText, referenced = null) {
   if (!previewText) return;
   let replyEl = bubble.querySelector(".bubble-reply-preview");
   if (!replyEl) {
@@ -1458,15 +2093,147 @@ function setBubbleReplyPreview(bubble, previewText) {
     replyEl.className = "bubble-reply-preview";
     bubble.insertBefore(replyEl, bubble.firstChild);
   }
-  replyEl.textContent = previewText.length > 80 ? previewText.slice(0, 77) + "…" : previewText;
+  const author = document.createElement("span");
+  author.className = "reply-author";
+  author.textContent = bubbleAuthor(referenced) || "Reply";
+  const text = document.createElement("span");
+  text.className = "reply-text";
+  text.textContent = previewText.length > 120 ? previewText.slice(0, 117) + "…" : previewText;
+  replyEl.replaceChildren(author, text);
+  if (referenced) {
+    replyEl.classList.add("is-link");
+    replyEl.title = "Show the original message";
+    replyEl.onclick = (event) => {
+      event.stopPropagation();
+      if (!referenced.isConnected) return;
+      const container = referenced.closest(".message-scroll");
+      if (container) flashBubble(container, referenced);
+    };
+  }
+}
+
+// Navigate to a message and highlight it TEMPORARILY: a soft glow that
+// fades back to normal (search results keep their highlight; a pinned/
+// reply jump does not).
+function flashBubble(container, bubble) {
+  highlightSearchMatch(container, bubble);
+  bubble.classList.remove("is-flash");
+  void bubble.offsetWidth; // restart the animation on repeat jumps
+  bubble.classList.add("is-flash");
+  clearTimeout(bubble._flashTimer);
+  bubble._flashTimer = setTimeout(() => {
+    bubble.classList.remove("is-flash");
+    if (container._searchHighlighted === bubble) clearSearchHighlight(container);
+  }, 2200);
+}
+
+// ------------------------------------------------------------------
+// Phase 1.5 -- Pinned-message bar (WhatsApp-style): one compact bar
+// under the header presenting a single pinned message -- the most
+// recently pinned one. The protocol still allows several pins per
+// conversation (one-pin enforcement is a Phase 2 backend/state
+// change); when there are several, the bar shows "1 of N" and each
+// click jumps to the shown one, then advances to the next.
+// ------------------------------------------------------------------
+
+let pinSequence = 0;
+
+function pinnedBarFor(container) {
+  return document.getElementById(container === groupMessagesEl ? "groupPinnedBar" : "pinnedBar");
+}
+
+function orderedPinnedBubbles(container) {
+  return getPinnedBubbles(container).sort(
+    (a, b) => Number(b.dataset.pinSeq || 0) - Number(a.dataset.pinSeq || 0)
+  );
+}
+
+function refreshPinnedBar(container) {
+  const bar = container && pinnedBarFor(container);
+  if (!bar) return;
+  const pinned = orderedPinnedBubbles(container);
+  // The unpin affordance lives in the same wrapper as the bar button, so
+  // both show/hide together -- the bar button keeps its own hidden flag
+  // for anything that still reads it directly.
+  const wrap = bar.closest(".pinned-bar-wrap") || bar;
+  if (!pinned.length) {
+    bar.hidden = true;
+    wrap.hidden = true;
+    bar._activeBubble = null;
+    container._pinCursor = 0;
+    return;
+  }
+  const index = (container._pinCursor || 0) % pinned.length;
+  container._pinCursor = index;
+  const bubble = pinned[index];
+  const text = bubble.dataset.text || attachmentPreview(bubble.dataset.payloadType, { filename: bubble._attachmentFilename });
+  bar.querySelector(".pinned-bar-label").textContent =
+    pinned.length > 1 ? `Pinned message · ${index + 1} of ${pinned.length}` : "Pinned message";
+  // Sender + timestamp on the banner, exactly like a WhatsApp/Signal
+  // pin: "You: text · 8:30 PM" (the time only when the bubble has one).
+  const when = bubble.querySelector(".bubble-time")?.textContent || "";
+  bar.querySelector(".pinned-bar-text").textContent =
+    `${bubbleAuthor(bubble)}: ${text}${when ? ` · ${when}` : ""}`;
+  bar.setAttribute("aria-label", `Pinned message from ${bubbleAuthor(bubble)}: ${text}. Show in conversation.`);
+  bar._activeBubble = bubble;
+  bar.hidden = false;
+  wrap.hidden = false;
+}
+
+for (const [barId, getContainer] of [["pinnedBar", () => messagesEl], ["groupPinnedBar", () => groupMessagesEl]]) {
+  document.getElementById(barId)?.addEventListener("click", () => {
+    const container = getContainer();
+    const pinned = orderedPinnedBubbles(container);
+    if (!pinned.length) return;
+    const index = (container._pinCursor || 0) % pinned.length;
+    flashBubble(container, pinned[index]);
+    container._pinCursor = (index + 1) % pinned.length;
+    refreshPinnedBar(container);
+  });
+}
+
+// Unpin from the banner itself -- the SAME real message_unpin round trip
+// the context menu's Unpin runs (handleBubbleContextAction), never a
+// local-only clear, so every member's banner clears with it. Sits in the
+// wrapper, not inside the bar button, so it is a separate focusable
+// control rather than an interactive element nested in one.
+for (const [btnId, getContainer] of [["pinnedUnpinBtn", () => messagesEl], ["groupPinnedUnpinBtn", () => groupMessagesEl]]) {
+  document.getElementById(btnId)?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const bar = pinnedBarFor(getContainer());
+    const bubble = bar && bar._activeBubble;
+    if (!bubble || !bubble.isConnected || bubble.dataset.pinned !== "1") return;
+    handleBubbleContextAction("unpin", bubble, event);
+  });
 }
 
 function setTickStatus(span, status) {
   span.dataset.status = status;
-  span.textContent = TICK_TEXT[status] || "";
-  // .tick-read already existed in style.css (color: var(--read-tick),
-  // the same #59ADF7 Desktop's COLOR_READ_RECEIPT uses) but was never
-  // actually applied by any JS in this file until now.
+  span.replaceChildren();
+  // Phase 1.5: each check is its OWN element in a flex row with a fixed
+  // 2px gap (style.css .msg-tick) -- never one glyph/path pair that can
+  // read as a single merged mark.
+  const checks = TICK_SHAPE[status] || 0;
+  for (let i = 0; i < checks; i += 1) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "tick-svg");
+    svg.setAttribute("viewBox", "0 0 9 11");
+    svg.setAttribute("width", "9");
+    svg.setAttribute("height", "11");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", TICK_PATH);
+    svg.appendChild(path);
+    span.appendChild(svg);
+  }
+  // Shape carries the state; the label makes it explicit for screen
+  // readers and on hover, so it never relies on colour alone.
+  const label = TICK_LABEL[status] || "";
+  span.setAttribute("role", "img");
+  span.setAttribute("aria-label", label);
+  span.title = label;
+  // .tick-read: style.css's --read-tick, a lighter tint of Desktop's
+  // COLOR_READ_RECEIPT blue so it stays legible on the sent bubble.
   span.classList.toggle("tick-read", status === "read");
 }
 
@@ -1517,12 +2284,79 @@ function currentConversationId(container) {
   return null;
 }
 
+// Phase 1 UI polish -- a "Today"/"Yesterday"/date divider whenever the
+// calendar day changes between consecutive rows in a panel. Purely
+// derived from each row's own timestamp; never a .bubble, so search/
+// pinned/gallery (which only query .bubble) are unaffected.
+function insertDateSeparatorIfNeeded(container, date) {
+  if (!date) return;
+  const dayKey = date.toDateString();
+  const separators = container.querySelectorAll(".date-sep");
+  const last = separators[separators.length - 1];
+  if (last && last.dataset.day === dayKey) return;
+  const separator = document.createElement("div");
+  separator.className = "date-sep";
+  separator.setAttribute("role", "separator");
+  separator.dataset.day = dayKey;
+  separator.textContent = formatDayLabel(date);
+  container.appendChild(separator);
+}
+
+// Consecutive rows from the same sender visually group (tighter
+// spacing, sender name shown once, joined corners).
+function isContinuationOf(container, senderKey) {
+  const previous = container.lastElementChild;
+  return !!previous && previous.classList.contains("msg-row")
+    && !previous.classList.contains("is-failed-row")
+    && previous.dataset.sender === senderKey;
+}
+
+// Desktop hover toolbar: React / Reply / More -- shortcuts into the
+// exact same handlers the right-click menu runs. Hidden entirely on
+// touch devices (style.css), where long-press -> contextmenu remains
+// the entry point; never needed for any action to be reachable.
+function buildHoverActions(bubble) {
+  const bar = document.createElement("div");
+  bar.className = "msg-actions";
+  bar.setAttribute("role", "toolbar");
+  bar.setAttribute("aria-label", "Message actions");
+  const buttons = [
+    ["react", "smile", "React"],
+    ["reply", "reply", "Reply"],
+    ["more", "more", "More actions"],
+  ];
+  for (const [action, iconName, label] of buttons) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "msg-action-btn";
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+    btn.appendChild(icon(iconName));
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (action === "more") showBubbleContextMenu(bubble, event, btn);
+      else if (action === "react") showReactionPicker(bubble, event, btn);
+      else handleBubbleContextAction(action, bubble, event);
+    });
+    bar.appendChild(btn);
+  }
+  return bar;
+}
+
 function bubbleShell(container, sender, options, extraClass) {
   const mine = sender === "me" || sender === session?.username;
+  const senderKey = mine ? "\u0000me" : sender;
+  insertDateSeparatorIfNeeded(container, messageDate(options));
+  const continued = isContinuationOf(container, senderKey);
   const row = document.createElement("div");
-  row.className = `msg-row ${mine ? "is-mine" : "is-theirs"}${options.historical ? " is-historical" : ""}${extraClass ? " " + extraClass : ""}`;
+  row.className = `msg-row ${mine ? "is-mine" : "is-theirs"}${options.historical ? " is-historical" : ""}${continued ? " is-continued" : ""}${extraClass ? " " + extraClass : ""}`;
+  row.dataset.sender = senderKey;
   const bubble = document.createElement("div");
   bubble.className = "bubble";
+  // Focusable so the message actions are keyboard-reachable: the
+  // context-menu key, Shift+F10 or Enter opens the same menu a
+  // right-click does.
+  bubble.tabIndex = 0;
   if (!mine) {
     const senderLabel = document.createElement("div");
     senderLabel.className = "bubble-sender";
@@ -1530,27 +2364,7 @@ function bubbleShell(container, sender, options, extraClass) {
     bubble.appendChild(senderLabel);
   }
   row.appendChild(bubble);
-
-  const actions = document.createElement("div");
-  actions.className = "msg-actions";
-  actions.hidden = !options.messageId;
-  const actionButton = document.createElement("button");
-  actionButton.type = "button";
-  actionButton.className = "msg-action-btn";
-  actionButton.setAttribute("aria-label", "Message actions");
-  actionButton.title = "Message actions";
-  actionButton.textContent = "⋯";
-  actionButton.addEventListener("click", (event) => {
-    event.stopPropagation();
-    bubble.dispatchEvent(new MouseEvent("contextmenu", {
-      bubbles: true,
-      cancelable: true,
-      clientX: actionButton.getBoundingClientRect().right,
-      clientY: actionButton.getBoundingClientRect().bottom,
-    }));
-  });
-  actions.appendChild(actionButton);
-  row.appendChild(actions);
+  row.appendChild(buildHoverActions(bubble));
   container.appendChild(row);
   container.scrollTop = container.scrollHeight;
 
@@ -1558,6 +2372,12 @@ function bubbleShell(container, sender, options, extraClass) {
   bubble.dataset.mine = mine ? "1" : "0";
   bubble.dataset.conversationId = currentConversationId(container) || "";
   bubble.addEventListener("contextmenu", (event) => showBubbleContextMenu(bubble, event));
+  bubble.addEventListener("keydown", (event) => {
+    if (event.target !== bubble) return;
+    if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey) || event.key === "Enter") {
+      showBubbleContextMenu(bubble, event, bubble);
+    }
+  });
 
   const messageId = options.messageId;
   if (messageId) {
@@ -1579,11 +2399,11 @@ function renderTextMessage(container, sender, text, options = {}) {
   bubble.dataset.supportsEdit = "1";
   const textEl = document.createElement("div");
   textEl.className = "bubble-text";
-  textEl.textContent = text + (options.historical ? "" : "");
+  textEl.textContent = text;
   bubble.appendChild(textEl);
-  const footer = document.createElement("div");
-  footer.className = "bubble-footer";
-  footer.textContent = options.historical ? "history" : new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  // A historical row now shows its real send time (history entries
+  // carry it) instead of the literal word "history".
+  const footer = buildFooter(options);
   bubble.appendChild(footer);
 
   const mine = sender === "me" || sender === session?.username;
@@ -1602,7 +2422,7 @@ function renderTextMessage(container, sender, text, options = {}) {
   if (options.editVersion) applyBubbleEdit(bubble, text, options.editVersion);
   if (options.replyToMessageId) {
     const referenced = bubblesByMessageId.get(options.replyToMessageId);
-    if (referenced && referenced.dataset.text) setBubbleReplyPreview(bubble, referenced.dataset.text);
+    if (referenced && referenced.dataset.text) setBubbleReplyPreview(bubble, referenced.dataset.text, referenced);
   }
   if (options.reactions && options.reactions.length) updateBubbleReactions(bubble, options.reactions);
   if (options.isPinned) setBubblePinned(bubble, true, options.pinnedBy);
@@ -1627,8 +2447,10 @@ function renderTextMessage(container, sender, text, options = {}) {
 // ------------------------------------------------------------------
 
 function renderFailedBubble(container, text, { replyToMessageId, clientMessageId, peerUsername, conversationId, isGroup }) {
+  insertDateSeparatorIfNeeded(container, new Date());
   const row = document.createElement("div");
-  row.className = "msg-row is-mine";
+  row.className = "msg-row is-mine is-failed-row";
+  if (isContinuationOf(container, "\u0000me")) row.classList.add("is-continued");
   const bubble = document.createElement("div");
   bubble.className = "bubble is-failed";
   bubble.dataset.mine = "1";
@@ -1639,18 +2461,27 @@ function renderFailedBubble(container, text, { replyToMessageId, clientMessageId
   textEl.textContent = text;
   bubble.appendChild(textEl);
 
-  const footer = document.createElement("div");
-  footer.className = "bubble-footer";
-  footer.textContent = "Failed";
-  bubble.appendChild(footer);
+  bubble.appendChild(buildFooter({}));
+
+  // The failure + Retry sit under the bubble on the chat background
+  // (red on purple was unreadable), as an icon + words, not colour
+  // alone.
+  const status = document.createElement("div");
+  status.className = "msg-failed-status";
+  status.setAttribute("role", "status");
+  const statusText = document.createElement("span");
+  statusText.textContent = "Failed to send";
+  status.append(icon("alert"), statusText);
 
   const retryBtn = document.createElement("button");
   retryBtn.type = "button";
   retryBtn.className = "bubble-retry-btn";
-  retryBtn.textContent = "Retry";
+  const retryLabel = document.createElement("span");
+  retryLabel.textContent = "Retry";
+  retryBtn.append(icon("retry"), retryLabel);
   retryBtn.addEventListener("click", () => {
     retryBtn.disabled = true;
-    retryBtn.textContent = "Retrying…";
+    retryLabel.textContent = "Retrying…";
     const sendPromise = isGroup
       ? session.sendGroupMessage(conversationId, text, replyToMessageId, clientMessageId)
       : session.sendMessage(peerUsername, text, replyToMessageId, clientMessageId);
@@ -1660,14 +2491,15 @@ function renderFailedBubble(container, text, { replyToMessageId, clientMessageId
         renderTextMessage(container, "me", text, { replyToMessageId });
       })
       .catch((error) => {
-        appendLog(`ERROR: ${error.message}`);
+        reportActionError(error);
         retryBtn.disabled = false;
-        retryBtn.textContent = "Retry";
+        retryLabel.textContent = "Retry";
       });
   });
-  bubble.appendChild(retryBtn);
+  status.appendChild(retryBtn);
 
   row.appendChild(bubble);
+  row.appendChild(status);
   container.appendChild(row);
   container.scrollTop = container.scrollHeight;
   return bubble;
@@ -1675,14 +2507,26 @@ function renderFailedBubble(container, text, { replyToMessageId, clientMessageId
 
 function _buildMediaSaveLink(objectUrl, filename) {
   const saveLink = document.createElement("a");
-  saveLink.className = "btn btn-ghost btn-sm";
-  saveLink.textContent = "Save";
+  saveLink.className = "media-action";
   saveLink.href = objectUrl;
   saveLink.download = filename;
-  saveLink.style.display = "inline-block";
-  saveLink.style.marginTop = "4px";
+  saveLink.setAttribute("aria-label", `Save ${filename}`);
+  const label = document.createElement("span");
+  label.textContent = "Save";
+  saveLink.append(icon("download"), label);
   return saveLink;
 }
+
+// The row under an image/voice/video: its actions on the left, the
+// timestamp (+ ticks) on the right, on one line.
+function _buildMediaActionRow(...actions) {
+  const row = document.createElement("div");
+  row.className = "msg-image-actions";
+  row.append(...actions);
+  return row;
+}
+
+const FILE_EXTENSION_PATTERN = /\.([a-z0-9]{1,5})$/i;
 
 // Phase 18 -- a decrypted FILE renders as a downloadable object URL
 // link; an IMAGE renders directly as an <img> -- both built from the
@@ -1704,13 +2548,11 @@ function renderAttachment(container, sender, payloadType, bytes, contentMetadata
   bubble._attachmentFilename = contentMetadata.filename || null;
   bubble._attachmentMimeType = contentMetadata.mime_type || null;
   bubble.dataset.payloadType = payloadType;
+  bubble.classList.add("is-attachment");
 
   if (options.isDeleted) {
+    bubble.appendChild(buildFooter(options));
     markBubbleDeleted(bubble);
-    const footer = document.createElement("div");
-    footer.className = "bubble-footer";
-    footer.textContent = options.historical ? "history" : new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    bubble.appendChild(footer);
     return;
   }
   if (options.reactions && options.reactions.length) updateBubbleReactions(bubble, options.reactions);
@@ -1718,8 +2560,6 @@ function renderAttachment(container, sender, payloadType, bytes, contentMetadata
 
   const meta = document.createElement("div");
   meta.className = "msg-meta";
-  meta.style.fontSize = "11px";
-  meta.style.opacity = ".85";
   // Voice/video are labeled by payloadType, not filename, to match
   // Desktop/Mobile's fixed "Voice message"/"Video message" bubble
   // label (the recorder always sets a real filename like
@@ -1732,6 +2572,7 @@ function renderAttachment(container, sender, payloadType, bytes, contentMetadata
 
   const blob = new Blob([bytes], { type: contentMetadata.mime_type || "application/octet-stream" });
   const objectUrl = URL.createObjectURL(blob);
+  const footer = buildFooter(options);
 
   if (payloadType === "voice") {
     // Phase 19.24 -- Voice Messages: the browser's own native <audio>
@@ -1742,23 +2583,25 @@ function renderAttachment(container, sender, payloadType, bytes, contentMetadata
     audio.className = "bubble-media";
     audio.controls = true;
     audio.src = objectUrl;
-    audio.style.maxWidth = "260px";
     bubble.appendChild(audio);
-    bubble.appendChild(_buildMediaSaveLink(objectUrl, contentMetadata.filename || "voice-message"));
+    bubble.appendChild(_buildMediaActionRow(
+      _buildMediaSaveLink(objectUrl, contentMetadata.filename || "voice-message"), footer
+    ));
   } else if (payloadType === "video") {
     const video = document.createElement("video");
     video.className = "bubble-media";
     video.controls = true;
     video.src = objectUrl;
-    video.style.maxWidth = "280px";
-    video.style.borderRadius = "10px";
     bubble.appendChild(video);
-    bubble.appendChild(_buildMediaSaveLink(objectUrl, contentMetadata.filename || "video-message"));
+    bubble.appendChild(_buildMediaActionRow(
+      _buildMediaSaveLink(objectUrl, contentMetadata.filename || "video-message"), footer
+    ));
   } else if (payloadType === "image") {
     const img = document.createElement("img");
     img.className = "bubble-image msg-image";
     img.src = objectUrl;
     img.alt = contentMetadata.filename || "received image";
+    img.decoding = "async";
     img.addEventListener("click", () => openLightbox(objectUrl));
     bubble.appendChild(img);
 
@@ -1767,82 +2610,92 @@ function renderAttachment(container, sender, payloadType, bytes, contentMetadata
     // all, only a click-to-zoom on the image itself with no save
     // affordance whatsoever (a file attachment already had its own
     // always-visible download link a few lines below; an image had
-    // no equivalent). Plain, unstyled buttons render inline and
-    // static by default -- nothing here is hidden behind :hover, and
-    // none is added anywhere in this file's CSS.
-    const actions = document.createElement("div");
-    actions.className = "msg-image-actions";
+    // no equivalent). Nothing here is hidden behind :hover; they share
+    // one row with the timestamp.
     const viewBtn = document.createElement("button");
     viewBtn.type = "button";
-    viewBtn.className = "btn btn-ghost btn-sm";
-    viewBtn.textContent = "View";
+    viewBtn.className = "media-action";
+    viewBtn.setAttribute("aria-label", `View ${img.alt}`);
+    const viewLabel = document.createElement("span");
+    viewLabel.textContent = "View";
+    viewBtn.append(icon("expand"), viewLabel);
     viewBtn.addEventListener("click", () => openLightbox(objectUrl));
-    const saveLink = document.createElement("a");
-    saveLink.className = "btn btn-ghost btn-sm";
-    saveLink.textContent = "Save";
-    saveLink.href = objectUrl;
-    saveLink.download = contentMetadata.filename || "image";
-    actions.appendChild(viewBtn);
-    actions.appendChild(saveLink);
-    bubble.appendChild(actions);
+    bubble.appendChild(_buildMediaActionRow(
+      viewBtn, _buildMediaSaveLink(objectUrl, contentMetadata.filename || "image"), footer
+    ));
   } else {
+    // A file renders as an attachment card: type icon + extension,
+    // filename, human-readable size, download affordance. The whole
+    // card is the (unchanged) download link.
+    const filename = contentMetadata.filename || "download";
+    const sizeBytes = contentMetadata.size_bytes || bytes.length;
+    const extension = (filename.match(FILE_EXTENSION_PATTERN) || [])[1] || "";
     const link = document.createElement("a");
     link.className = "bubble-file msg-file";
     link.href = objectUrl;
-    link.download = contentMetadata.filename || "download";
-    link.innerHTML = `&#128206; Download (${(contentMetadata.size_bytes || bytes.length).toLocaleString()} bytes)`;
+    link.download = filename;
+    link.title = `Download ${filename}`;
+    const iconBox = document.createElement("span");
+    iconBox.className = "file-icon";
+    iconBox.appendChild(icon("file"));
+    if (extension) {
+      const ext = document.createElement("span");
+      ext.className = "file-ext";
+      ext.textContent = extension;
+      iconBox.appendChild(ext);
+    }
+    const info = document.createElement("span");
+    info.className = "file-info";
+    const nameEl = document.createElement("span");
+    nameEl.className = "file-name";
+    nameEl.textContent = filename;
+    const sizeEl = document.createElement("span");
+    sizeEl.className = "file-size";
+    sizeEl.textContent = formatBytes(sizeBytes);
+    info.append(nameEl, sizeEl);
+    const download = document.createElement("span");
+    download.className = "file-download";
+    download.appendChild(icon("download"));
+    const downloadLabel = document.createElement("span");
+    downloadLabel.className = "sr-only";
+    downloadLabel.textContent = "Download";
+    download.appendChild(downloadLabel);
+    link.append(iconBox, info, download);
     bubble.appendChild(link);
+    bubble.appendChild(footer);
   }
-
-  const footer = document.createElement("div");
-  footer.className = "bubble-footer";
-  footer.textContent = options.historical ? "history" : new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  bubble.appendChild(footer);
 
   const mine = sender === "me" || sender === session?.username;
   if (mine) appendSentTick(footer, container, options.status);
 }
 
+// Full-screen image viewer: visible close button (focused on open),
+// Escape (global keydown handler) and a click anywhere close it.
 function openLightbox(objectUrl) {
   const box = document.createElement("div");
   box.className = "lightbox";
   box.setAttribute("role", "dialog");
   box.setAttribute("aria-modal", "true");
   box.setAttribute("aria-label", "Image preview");
-  box.tabIndex = -1;
-  const returnFocus = document.activeElement;
-  const closeButton = document.createElement("button");
-  closeButton.type = "button";
-  closeButton.className = "lightbox-close";
-  closeButton.setAttribute("aria-label", "Close image preview");
-  closeButton.textContent = "×";
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "lightbox-close";
+  closeBtn.setAttribute("aria-label", "Close image preview");
+  closeBtn.appendChild(icon("x"));
+  closeBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    dismissOverlay(box);
+  });
   const img = document.createElement("img");
   img.src = objectUrl;
   img.alt = "";
-  const close = () => {
-    document.removeEventListener("keydown", onKeyDown);
-    box.remove();
-    if (returnFocus instanceof HTMLElement && returnFocus.isConnected) {
-      returnFocus.focus({ preventScroll: true });
-    }
-  };
-  const onKeyDown = (event) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      close();
-    }
-  };
-  closeButton.addEventListener("click", (event) => {
-    event.stopPropagation();
-    close();
-  });
-  box.append(closeButton, img);
+  box.append(closeBtn, img);
+  box._returnFocus = document.activeElement;
   box.addEventListener("click", (event) => {
-    if (event.target === box) close();
+    if (event.target === box) dismissOverlay(box);
   });
-  document.addEventListener("keydown", onKeyDown);
   document.body.appendChild(box);
-  closeButton.focus({ preventScroll: true });
+  closeBtn.focus({ preventScroll: true });
 }
 
 // Phase 19.17C -- profile pictures. Fills an .avatar element with a
@@ -1904,23 +2757,38 @@ function renderChatList() {
       : '<div class="empty-hint">Type a username above and press Enter to open a direct chat.</div>';
     return;
   }
+  const onlineUsers = session?.onlineUsers || new Set();
   for (const peer of peers) {
     const row = document.createElement("div");
-    row.className = `row-card${peer === activeDirectPeer ? " is-selected" : ""}`;
+    const selected = peer === activeDirectPeer;
+    row.className = `row-card${selected ? " is-selected" : ""}`;
     const muted = session?.isConversationMuted(peer);
+    const online = onlineUsers.has(peer);
+    const activity = conversationActivity.get(activityKey(false, peer));
+    const subtitle = activity?.preview || (online ? "Online" : "Direct message");
+    if (activity?.unread) row.classList.add("has-unread");
     row.innerHTML = `
-      <div class="avatar">${initialOf(peer)}</div>
+      <div class="avatar" data-tone="${avatarTone(peer)}">${escapeHtml(initialOf(peer))}<span class="presence-dot${online ? " is-online" : ""}"></span></div>
       <div class="row-main">
-        <div class="row-title">${peer}</div>
-        <div class="row-sub">Direct message</div>
-      </div>
-      <button type="button" class="row-mute-btn" title="${muted ? "Unmute" : "Mute"}">${muted ? "\u{1F515}" : "\u{1F514}"}</button>`;
+        <div class="row-title">${escapeHtml(peer)}</div>
+        <div class="row-sub${!activity?.preview && online ? " is-online" : ""}">${escapeHtml(subtitle)}</div>
+      </div>${rowMetaHtml(activity, muted, peer)}`;
+    // Keyboard-operable row: focusable, Enter/Space opens it.
+    row.tabIndex = 0;
+    if (selected) row.setAttribute("aria-current", "true");
     row.addEventListener("click", () => openDirectChat(peer));
+    row.addEventListener("keydown", (event) => {
+      if (event.target === row && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        openDirectChat(peer);
+      }
+    });
     row.querySelector(".row-mute-btn").addEventListener("click", (event) => {
       showMuteMenu(peer, event, renderChatList);
     });
     chatListEl.appendChild(row);
   }
+  updateTabBadges();
 }
 
 document.getElementById("archivedChatsToggle").addEventListener("click", () => {
@@ -1981,9 +2849,11 @@ async function refreshPeerPresence(peerUsername) {
   }
   if ((session.onlineUsers || new Set()).has(peerUsername)) {
     peerPresenceEl.textContent = "Online";
+    peerPresenceEl.dataset.online = "1";
     return;
   }
   peerPresenceEl.textContent = "";
+  peerPresenceEl.dataset.online = "0";
   try {
     const lastSeen = await session.fetchLastSeen(peerUsername);
     // The round trip is async -- the open chat may already be a
@@ -1996,6 +2866,64 @@ async function refreshPeerPresence(peerUsername) {
   }
 }
 
+// Phase 1 UI polish -- ONE renderer for everything the header shows
+// about a peer's identity (badge, safety-number strip, its state), all
+// read from the same session.peers entry. Previously the badge and the
+// fingerprint line were written independently from three call sites,
+// so after "Confirm match" the badge said "verified" while the line
+// beside it still said "[UNVERIFIED]". Reads state only -- never
+// changes it.
+const PEER_STATE_UI = {
+  VERIFIED: { label: "Verified", icon: "shield-check" },
+  UNVERIFIED: { label: "Unverified", icon: "shield" },
+  KEY_CHANGED: { label: "Key changed", icon: "shield-alert" },
+};
+
+function renderPeerIdentity(peerUsername) {
+  const known = peerUsername ? session?.peers.get(peerUsername) : null;
+  const state = known ? known.state : "UNVERIFIED";
+  const ui = PEER_STATE_UI[state]
+    || { label: state.charAt(0) + state.slice(1).toLowerCase().replace(/_/g, " "), icon: "shield-alert" };
+
+  peerVerifiedBadgeEl.replaceChildren(icon(ui.icon), document.createTextNode(ui.label));
+  peerVerifiedBadgeEl.dataset.state = state;
+  peerVerifiedBadgeEl.classList.toggle("is-unverified", state !== "VERIFIED");
+
+  const bar = document.getElementById("securityBar");
+  bar.dataset.state = state;
+  bar.querySelector(".security-bar-icon use").setAttribute("href", `#i-${ui.icon}`);
+
+  if (!known) {
+    // Left empty until the identity is actually observed -- the
+    // placeholder text comes from CSS (:empty), so nothing here can be
+    // mistaken for a real, observed fingerprint.
+    fingerprintEl.replaceChildren();
+    return;
+  }
+  const label = document.createElement("span");
+  label.className = "fp-label";
+  const peerName = document.createElement("b");
+  peerName.textContent = peerUsername;
+  const stateText = document.createElement("span");
+  stateText.className = "sr-only";
+  stateText.textContent = ` [${state}]`;
+  label.append("Safety number with ", peerName, stateText);
+  const value = document.createElement("span");
+  value.className = "fp-value";
+  value.setAttribute("aria-label", `Safety number ${known.fingerprint}`);
+  const fingerprintText = String(known.fingerprint || "");
+  const groups = fingerprintText.includes(" ")
+    ? fingerprintText.split(/\s+/).filter(Boolean)
+    : fingerprintText.match(/.{1,4}/g) || [];
+  for (const group of groups) {
+    const groupEl = document.createElement("span");
+    groupEl.className = "fp-group";
+    groupEl.textContent = group;
+    value.appendChild(groupEl);
+  }
+  fingerprintEl.replaceChildren(label, value);
+}
+
 function openDirectChat(peerUsername) {
   if (!peerUsername) return;
   saveCurrentDraftIfAny();
@@ -2004,7 +2932,9 @@ function openDirectChat(peerUsername) {
   knownDirectPeers.add(peerUsername);
   activeDirectPeer = peerUsername;
   document.getElementById("peerUsername").value = peerUsername;
-  chatTitleEl.childNodes[0].textContent = peerUsername + " ";
+  chatTitleEl.querySelector(".chat-header-name").textContent = peerUsername;
+  chatAvatarEl.dataset.tone = avatarTone(peerUsername);
+  clearConversationUnread(false, peerUsername);
   loadPeerAvatar(chatAvatarEl, peerUsername, initialOf(peerUsername));
 
   // This peer's identity may already have been observed (e.g. the
@@ -2013,17 +2943,7 @@ function openDirectChat(peerUsername) {
   // here would erase real data with nothing left to repopulate it, since
   // onPeerObserved only fires again on a NEW announcement. Reflect
   // whatever is already known instead of assuming "nothing yet".
-  const known = session?.peers.get(peerUsername);
-  if (known) {
-    fingerprintEl.textContent = `${peerUsername}: ${known.fingerprint} [${known.state}]`;
-    const verified = known.state === "VERIFIED";
-    peerVerifiedBadgeEl.textContent = verified ? "verified" : known.state.toLowerCase();
-    peerVerifiedBadgeEl.classList.toggle("is-unverified", !verified);
-  } else {
-    fingerprintEl.textContent = "";
-    peerVerifiedBadgeEl.textContent = "unverified";
-    peerVerifiedBadgeEl.classList.add("is-unverified");
-  }
+  renderPeerIdentity(peerUsername);
 
   refreshPeerPresence(peerUsername);
 
@@ -2044,6 +2964,7 @@ function openDirectChat(peerUsername) {
   // non-fatal (e.g. no session key yet for a brand-new contact) --
   // appendLog() already reports them.
   messagesEl.innerHTML = "";
+  refreshPinnedBar(messagesEl);
   // Phase 19.23 -- Issue 3: this peer's tick registry points at <span>
   // elements the innerHTML clear above just detached -- without this,
   // re-opening an already-viewed peer (forgetRenderedHistory() below
@@ -2129,28 +3050,49 @@ function renderGroupList() {
     ([conversationId]) => session.isConversationArchived(conversationId) === showArchivedGroups
   );
   if (groups.length === 0) {
-    groupListEl.innerHTML = showArchivedGroups
-      ? '<div class="empty-hint">No archived groups.</div>'
-      : '<div class="empty-hint">No groups yet -- create one above.</div>';
+    if (showArchivedGroups) {
+      groupListEl.innerHTML = '<div class="empty-hint">No archived groups.</div>';
+    } else {
+      groupListEl.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon" aria-hidden="true"><svg class="icon"><use href="#i-users"/></svg></div>
+          <div class="empty-state-title">No groups yet</div>
+          <div class="empty-state-text">Create a group to start a conversation.</div>
+          <button type="button" class="btn btn-primary btn-sm empty-state-action"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Create group</button>
+        </div>`;
+      groupListEl.querySelector(".empty-state-action").addEventListener("click", openGroupCreateModal);
+    }
+    updateTabBadges();
     return;
   }
   for (const [conversationId, group] of groups) {
     const row = document.createElement("div");
     row.className = `row-card${conversationId === activeGroupIdEl.value ? " is-selected" : ""}`;
     const muted = session.isConversationMuted(conversationId);
+    const activity = conversationActivity.get(activityKey(true, conversationId));
+    const memberCount = `${group.members.length} ${group.members.length === 1 ? "member" : "members"}`;
+    if (activity?.unread) row.classList.add("has-unread");
     row.innerHTML = `
-      <div class="avatar" style="background:var(--accent);">${initialOf(group.name)}</div>
+      <div class="avatar is-group" data-tone="${avatarTone(group.name)}">${escapeHtml(initialOf(group.name))}</div>
       <div class="row-main">
-        <div class="row-title">${group.name}</div>
-        <div class="row-sub">${group.members.length} members</div>
-      </div>
-      <button type="button" class="row-mute-btn" title="${muted ? "Unmute" : "Mute"}">${muted ? "\u{1F515}" : "\u{1F514}"}</button>`;
+        <div class="row-title">${escapeHtml(group.name)}</div>
+        <div class="row-sub">${escapeHtml(activity?.preview || memberCount)}</div>
+      </div>${rowMetaHtml(activity, muted, group.name)}`;
+    row.tabIndex = 0;
+    if (conversationId === activeGroupIdEl.value) row.setAttribute("aria-current", "true");
     row.addEventListener("click", () => openGroupChat(conversationId, group));
+    row.addEventListener("keydown", (event) => {
+      if (event.target === row && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        openGroupChat(conversationId, group);
+      }
+    });
     row.querySelector(".row-mute-btn").addEventListener("click", (event) => {
       showMuteMenu(conversationId, event, renderGroupList, true);
     });
     groupListEl.appendChild(row);
   }
+  updateTabBadges();
 }
 
 document.getElementById("archivedGroupsToggle").addEventListener("click", () => {
@@ -2167,11 +3109,14 @@ function openGroupChat(conversationId, group) {
   groupTitleEl.textContent = group.name;
   groupSubEl.textContent = `${group.members.length} members • ${group.members.join(", ")}`;
   groupAvatarEl.textContent = initialOf(group.name);
+  groupAvatarEl.dataset.tone = avatarTone(group.name);
+  clearConversationUnread(true, conversationId);
   setMainView("groupChat");
   renderGroupList();
 
   // See openDirectChat()'s own comment -- identical fix, group side.
   groupMessagesEl.innerHTML = "";
+  refreshPinnedBar(groupMessagesEl);
   clearMessageLifecycleState();
 
   // Phase 19.24 -- Drafts: restore whatever unsent text this group had,
@@ -2203,7 +3148,10 @@ function renderGroupInfo() {
   if (!group) return;
 
   const onlineUsers = session.onlineUsers || new Set();
-  const onlineCount = group.members.filter((m) => onlineUsers.has(m)).length;
+  // The server's online list never includes the viewer themself --
+  // but the viewer is, by definition, online right now.
+  const isMemberOnline = (m) => m === session.username || onlineUsers.has(m);
+  const onlineCount = group.members.filter(isMemberOnline).length;
 
   groupInfoNameEl.textContent = group.name;
   groupInfoSubEl.textContent = `${group.members.length} members • ${onlineCount} online`;
@@ -2219,20 +3167,21 @@ function renderGroupInfo() {
   groupInfoMembersEl.innerHTML = "";
   for (const username of group.members) {
     const isAdmin = group.admin && username === group.admin;
-    const isOnline = onlineUsers.has(username);
+    const isOnline = isMemberOnline(username);
     const roleText = isAdmin ? "Admin" : (isOnline ? "Online" : "Offline");
     const roleClass = isAdmin ? "" : (isOnline ? "is-online" : "is-offline");
 
     const row = document.createElement("div");
     row.className = "member-row";
     row.innerHTML = `
-      <div class="avatar sm">${initialOf(username)}</div>
-      <div class="row-title">${username}${username === session.username ? " (you)" : ""}</div>
+      <div class="avatar sm" data-tone="${avatarTone(username)}">${escapeHtml(initialOf(username))}<span class="presence-dot${isOnline ? " is-online" : ""}"></span></div>
+      <div class="row-title">${escapeHtml(username)}${username === session.username ? ' <span class="member-you">(you)</span>' : ""}</div>
       <div class="member-role ${roleClass}">${roleText}</div>`;
 
     if (isSelfAdmin && username !== session.username && !isAdmin) {
       const removeBtn = document.createElement("button");
-      removeBtn.className = "btn btn-danger btn-sm";
+      removeBtn.className = "btn btn-danger btn-xs";
+      removeBtn.setAttribute("aria-label", `Remove ${username} from the group`);
       removeBtn.textContent = "Remove";
       removeBtn.addEventListener("click", async () => {
         removeBtn.disabled = true;
@@ -2248,7 +3197,7 @@ function renderGroupInfo() {
           renderGroupInfo();
           renderGroupList();
         } catch (error) {
-          appendLog(`ERROR: ${error.message}`);
+          reportActionError(error);
           removeBtn.disabled = false;
         }
       });
@@ -2458,7 +3407,15 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
     // it names a known group, otherwise to the direct-messaging panel.
     onMessage: (identityKey, sender, text, options) => {
       if (session.groups.has(identityKey)) {
-        renderTextMessage(groupMessagesEl, sender, text, options || {});
+        // Phase 1.5: only into the group that's actually open -- the
+        // single shared #groupMessages node used to receive every
+        // group's live messages, mixing conversations (the same fix
+        // 19.17C made for direct chats). Other groups count as unread
+        // and load normally when opened.
+        noteConversationActivity(true, identityKey, sender, text, options || {});
+        if (identityKey === activeGroupIdEl.value) {
+          renderTextMessage(groupMessagesEl, sender, text, options || {});
+        }
         return;
       }
       // Phase 19.17C -- #messages is one shared DOM node for every
@@ -2467,28 +3424,30 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
       // have open (message-mixing between unrelated conversations).
       const peerKey = resolveDirectPeerKey(identityKey);
       knownDirectPeers.add(peerKey);
-      renderChatList();
+      noteConversationActivity(false, peerKey, sender, text, options || {});
       if (peerKey === activeDirectPeer) {
         renderTextMessage(messagesEl, sender, text, options || {});
       }
     },
     onAttachment: (identityKey, sender, payloadType, bytes, contentMetadata, options) => {
       if (session.groups.has(identityKey)) {
-        renderAttachment(groupMessagesEl, sender, payloadType, bytes, contentMetadata, options || {});
+        noteConversationActivity(true, identityKey, sender, attachmentPreview(payloadType, contentMetadata), options || {});
+        if (identityKey === activeGroupIdEl.value) {
+          renderAttachment(groupMessagesEl, sender, payloadType, bytes, contentMetadata, options || {});
+        }
         return;
       }
       const peerKey = resolveDirectPeerKey(identityKey);
       knownDirectPeers.add(peerKey);
-      renderChatList();
+      noteConversationActivity(false, peerKey, sender, attachmentPreview(payloadType, contentMetadata), options || {});
       if (peerKey === activeDirectPeer) {
         renderAttachment(messagesEl, sender, payloadType, bytes, contentMetadata, options || {});
       }
     },
     onPeerObserved: (peerUsername, fingerprint, state) => {
-      fingerprintEl.textContent = `${peerUsername}: ${fingerprint} [${state}]`;
-      const verified = state === "VERIFIED";
-      peerVerifiedBadgeEl.textContent = verified ? "verified" : state.toLowerCase();
-      peerVerifiedBadgeEl.classList.toggle("is-unverified", !verified);
+      // Only the open chat's header reflects an identity -- an
+      // announcement for some OTHER peer used to overwrite it.
+      if (peerUsername === activeDirectPeer) renderPeerIdentity(peerUsername);
     },
     // Phase 17: reflects connectionStatus's own "disconnected" |
     // "connecting" | "connected" | "reconnecting" states -- see
@@ -2565,6 +3524,8 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
     },
     onOnlineUsersChanged: () => {
       if (!groupInfoViewEl.hidden) renderGroupInfo();
+      // Sidebar rows show each contact's presence dot.
+      renderChatList();
       // Phase 19.24 -- Presence/Last Seen: the same server-pushed
       // event every other presence indicator in this file already
       // uses -- no polling added.
@@ -2645,6 +3606,11 @@ document.getElementById("logoutBtn").addEventListener("click", () => {
   appendLog("Disconnected (logout) -- automatic reconnect will not occur.");
   screenApp.hidden = true;
   screenLogin.hidden = false;
+  // Leave the login form clean: no stale "Connecting..." status and no
+  // password left sitting in the field after signing out.
+  authStatusEl.textContent = "";
+  authStatusEl.classList.remove("is-error");
+  document.getElementById("password").value = "";
   knownDirectPeers.clear();
   activeDirectPeer = null;
   for (const key of Object.keys(pendingSentTicksByPeer)) delete pendingSentTicksByPeer[key];
@@ -2668,14 +3634,14 @@ document.getElementById("confirmVerifiedBtn").addEventListener("click", () => {
   try {
     session.confirmPeerVerified(peerUsername, observedPeer && observedPeer.fingerprint);
     appendLog(`${peerUsername} marked VERIFIED.`);
-    peerVerifiedBadgeEl.textContent = "verified";
-    peerVerifiedBadgeEl.classList.remove("is-unverified");
+    toast(`${peerUsername} marked as verified`, "success");
+    renderPeerIdentity(peerUsername);
     // Phase 19.23 -- Issue 1: add this newly-verified peer to the
     // sidebar immediately, not just at this browser's next login.
     knownDirectPeers.add(peerUsername);
     renderChatList();
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2684,8 +3650,9 @@ document.getElementById("requestVerificationBtn").addEventListener("click", asyn
   try {
     await session.requestVerification(peerUsername);
     appendLog(`Verification requested from ${peerUsername}.`);
+    toast(`Verification request sent to ${peerUsername}`, "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2694,8 +3661,9 @@ document.getElementById("establishKeyBtn").addEventListener("click", async () =>
   try {
     await session.establishSessionKey(peerUsername);
     appendLog(`Session key established with ${peerUsername}.`);
+    toast(`Secure session established with ${peerUsername}`, "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2717,7 +3685,7 @@ document.getElementById("sendBtn").addEventListener("click", async () => {
       await session.editMessage(conversationId, messageId, text, expectedVersion);
       document.getElementById("messageText").value = "";
     } catch (error) {
-      appendLog(`ERROR: ${error.message}`);
+      reportActionError(error);
     }
     return;
   }
@@ -2735,6 +3703,7 @@ document.getElementById("sendBtn").addEventListener("click", async () => {
   try {
     await session.sendMessage(peerUsername, text, replyToMessageId, clientMessageId);
     renderTextMessage(messagesEl, "me", text, { replyToMessageId });
+    noteConversationActivity(false, peerUsername, "me", text);
   } catch (error) {
     appendLog(`ERROR: ${error.message}`);
     renderFailedBubble(messagesEl, text, {
@@ -2743,8 +3712,25 @@ document.getElementById("sendBtn").addEventListener("click", async () => {
   }
   document.getElementById("messageText").value = "";
 });
+// Settings → Chat: "Press Enter to send". A per-browser display
+// preference stored exactly like the theme (localStorage only, never
+// sent anywhere). Default ON is main.js's original behaviour, so
+// nothing changes for a user who never opens Settings.
+const ENTER_TO_SEND_KEY = "qrscs.enterToSend";
+function enterToSendEnabled() {
+  try { return localStorage.getItem(ENTER_TO_SEND_KEY) !== "0"; } catch (e) { return true; }
+}
+function syncEnterToSendControl() {
+  const el = document.getElementById("enterToSendToggle");
+  if (el) el.checked = enterToSendEnabled();
+}
+document.getElementById("enterToSendToggle")?.addEventListener("change", (event) => {
+  try { localStorage.setItem(ENTER_TO_SEND_KEY, event.target.checked ? "1" : "0"); } catch (e) {}
+});
+syncEnterToSendControl();
+
 document.getElementById("messageText").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") { event.preventDefault(); document.getElementById("sendBtn").click(); }
+  if (event.key === "Enter" && enterToSendEnabled()) { event.preventDefault(); document.getElementById("sendBtn").click(); }
 });
 
 document.getElementById("markReadBtn")?.addEventListener("click", async () => {
@@ -2753,8 +3739,9 @@ document.getElementById("markReadBtn")?.addEventListener("click", async () => {
     const conversationId = await session.openDirectConversation(peerUsername);
     session.markRead(conversationId);
     appendLog(`Marked ${conversationId} as read.`);
+    toast("Marked as read", "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2764,7 +3751,7 @@ document.getElementById("loadHistoryBtn").addEventListener("click", async () => 
     const conversationId = await session.openDirectConversation(peerUsername);
     await session.loadHistory(conversationId, false);
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2772,6 +3759,39 @@ document.getElementById("wallpaperBtn").addEventListener("click", (event) => {
   const peerUsername = document.getElementById("peerUsername").value;
   showWallpaperPicker(messagesEl, peerUsername, event);
 });
+
+// "Jump to latest" -- appears once the reader has scrolled well up from
+// the newest message; one click (or Enter) glides back down.
+function setupJumpToLatest(container) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "jump-latest";
+  btn.hidden = true;
+  btn.setAttribute("aria-label", "Jump to latest message");
+  btn.title = "Jump to latest";
+  btn.appendChild(icon("arrow-down"));
+  container.after(btn);
+  const update = () => {
+    const distance = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const show = distance > 240;
+    if (show) {
+      // Pinned just above the scroller's bottom edge, whatever sits
+      // below it (reply bar, typing line, composer).
+      const view = container.parentElement.getBoundingClientRect();
+      const box = container.getBoundingClientRect();
+      btn.style.top = `${Math.round(box.bottom - view.top - 56)}px`;
+    }
+    btn.hidden = !show;
+  };
+  container.addEventListener("scroll", update, { passive: true });
+  window.addEventListener("resize", update);
+  btn.addEventListener("click", () => {
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+  });
+}
+
+setupJumpToLatest(messagesEl);
+setupJumpToLatest(groupMessagesEl);
 
 setupSearchBar(messagesEl, {
   toggleBtn: document.getElementById("searchBtn"),
@@ -2815,6 +3835,7 @@ document.getElementById("sendAttachmentBtn").addEventListener("click", async () 
   const file = fileInput.files && fileInput.files[0];
   if (!file) {
     appendLog("ERROR: no file selected.");
+    toast("Choose a file to send first.", "error");
     return;
   }
   try {
@@ -2826,21 +3847,165 @@ document.getElementById("sendAttachmentBtn").addEventListener("click", async () 
     fileInput.value = "";
     document.getElementById("sendAttachmentBtn").hidden = true;
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
+});
+
+// ------------------------------------------------------------------
+// Phase 1.5 -- Create group modal. The request is unchanged:
+// session.createGroup(name, members) with the same name string and
+// member username list the old inline form produced. Members are
+// picked as chips (Enter/comma), from suggestions (people you already
+// have a conversation with), or typed comma-separated as before.
+// ------------------------------------------------------------------
+
+const groupCreateModalEl = document.getElementById("groupCreateModal");
+const groupMembersInputEl = document.getElementById("groupMembers");
+let selectedGroupMembers = [];
+
+function memberTokens(text) {
+  return String(text || "").split(",").map((m) => m.trim()).filter(Boolean);
+}
+
+function addGroupMembers(names) {
+  for (const name of names) {
+    if (name && name !== session?.username && !selectedGroupMembers.includes(name)) {
+      selectedGroupMembers.push(name);
+    }
+  }
+  renderGroupMemberChips();
+}
+
+function renderGroupMemberChips() {
+  const chips = document.getElementById("groupMemberChips");
+  chips.replaceChildren();
+  for (const name of selectedGroupMembers) {
+    const chip = document.createElement("span");
+    chip.className = "member-chip";
+    chip.setAttribute("role", "listitem");
+    const avatar = document.createElement("span");
+    avatar.className = "avatar xxs";
+    avatar.dataset.tone = avatarTone(name);
+    avatar.textContent = initialOf(name);
+    const label = document.createElement("span");
+    label.textContent = name;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "member-chip-remove";
+    remove.setAttribute("aria-label", `Remove ${name}`);
+    remove.appendChild(icon("x"));
+    remove.addEventListener("click", () => {
+      selectedGroupMembers = selectedGroupMembers.filter((m) => m !== name);
+      renderGroupMemberChips();
+      groupMembersInputEl.focus();
+    });
+    chip.append(avatar, label, remove);
+    chips.appendChild(chip);
+  }
+  renderGroupMemberSuggestions();
+}
+
+function renderGroupMemberSuggestions() {
+  const wrap = document.getElementById("groupMemberSuggestions");
+  const list = document.getElementById("groupMemberSuggestionsList");
+  const query = groupMembersInputEl.value.trim().toLowerCase();
+  // Your existing conversations only -- never arbitrary online users.
+  const pool = new Set(knownDirectPeers);
+  const candidates = [...pool]
+    .filter((name) => name && name !== session?.username && !selectedGroupMembers.includes(name))
+    .filter((name) => !query || name.toLowerCase().includes(query))
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, 6);
+  list.replaceChildren();
+  for (const name of candidates) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "member-suggestion";
+    const avatar = document.createElement("span");
+    avatar.className = "avatar xxs";
+    avatar.dataset.tone = avatarTone(name);
+    avatar.textContent = initialOf(name);
+    const label = document.createElement("span");
+    label.textContent = name;
+    btn.append(avatar, label, icon("plus"));
+    btn.addEventListener("click", () => {
+      addGroupMembers([name]);
+      groupMembersInputEl.value = "";
+      renderGroupMemberSuggestions();
+      groupMembersInputEl.focus();
+    });
+    list.appendChild(btn);
+  }
+  wrap.hidden = candidates.length === 0;
+}
+
+function openGroupCreateModal() {
+  closeAnyOpenPopup();
+  groupCreateModalEl._returnFocus = document.activeElement;
+  groupCreateModalEl.hidden = false;
+  renderGroupMemberChips();
+  document.getElementById("groupName").focus();
+}
+
+function closeGroupCreateModal() {
+  if (groupCreateModalEl.hidden) return;
+  groupCreateModalEl.hidden = true;
+  const returnFocus = groupCreateModalEl._returnFocus;
+  if (returnFocus && returnFocus.isConnected) returnFocus.focus({ preventScroll: true });
+}
+
+function resetGroupCreateForm() {
+  document.getElementById("groupName").value = "";
+  groupMembersInputEl.value = "";
+  selectedGroupMembers = [];
+  renderGroupMemberChips();
+}
+
+document.getElementById("openCreateGroupBtn").addEventListener("click", openGroupCreateModal);
+document.getElementById("groupCreateCloseBtn").addEventListener("click", closeGroupCreateModal);
+document.getElementById("groupCreateCancelBtn").addEventListener("click", closeGroupCreateModal);
+groupCreateModalEl.addEventListener("click", (event) => {
+  if (event.target === groupCreateModalEl) closeGroupCreateModal();
+});
+document.getElementById("groupMemberPicker").addEventListener("click", (event) => {
+  if (event.target.id === "groupMemberPicker" || event.target.id === "groupMemberChips") groupMembersInputEl.focus();
+});
+groupMembersInputEl.addEventListener("keydown", (event) => {
+  if ((event.key === "Enter" || event.key === ",") && groupMembersInputEl.value.trim()) {
+    event.preventDefault();
+    addGroupMembers(memberTokens(groupMembersInputEl.value));
+    groupMembersInputEl.value = "";
+    renderGroupMemberSuggestions();
+  } else if (event.key === "Backspace" && !groupMembersInputEl.value && selectedGroupMembers.length) {
+    selectedGroupMembers.pop();
+    renderGroupMemberChips();
+  }
+});
+groupMembersInputEl.addEventListener("input", () => {
+  const value = groupMembersInputEl.value;
+  if (value.includes(",")) {
+    const parts = value.split(",");
+    const remainder = parts.pop();
+    addGroupMembers(memberTokens(parts.join(",")));
+    groupMembersInputEl.value = remainder.trimStart();
+  }
+  renderGroupMemberSuggestions();
+});
+document.getElementById("groupName").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); groupMembersInputEl.focus(); }
 });
 
 document.getElementById("createGroupBtn").addEventListener("click", async () => {
   const name = document.getElementById("groupName").value;
-  const members = document.getElementById("groupMembers").value
-    .split(",").map((m) => m.trim()).filter(Boolean);
+  const members = [...new Set([...selectedGroupMembers, ...memberTokens(groupMembersInputEl.value)])];
   try {
     await session.createGroup(name, members);
     appendLog(`Requested group '${name}' with members: ${members.join(", ")}`);
-    document.getElementById("groupName").value = "";
-    document.getElementById("groupMembers").value = "";
+    toast(`Creating group “${name}”…`);
+    resetGroupCreateForm();
+    closeGroupCreateModal();
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2860,7 +4025,7 @@ document.getElementById("sendGroupMessageBtn").addEventListener("click", async (
       await session.editMessage(conversationId, messageId, text, expectedVersion);
       document.getElementById("groupMessageText").value = "";
     } catch (error) {
-      appendLog(`ERROR: ${error.message}`);
+      reportActionError(error);
     }
     return;
   }
@@ -2875,6 +4040,7 @@ document.getElementById("sendGroupMessageBtn").addEventListener("click", async (
   try {
     await session.sendGroupMessage(conversationId, text, replyToMessageId, clientMessageId);
     renderTextMessage(groupMessagesEl, "me", text, { replyToMessageId });
+    noteConversationActivity(true, conversationId, "me", text);
   } catch (error) {
     appendLog(`ERROR: ${error.message}`);
     renderFailedBubble(groupMessagesEl, text, {
@@ -2884,7 +4050,7 @@ document.getElementById("sendGroupMessageBtn").addEventListener("click", async (
   document.getElementById("groupMessageText").value = "";
 });
 document.getElementById("groupMessageText").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") { event.preventDefault(); document.getElementById("sendGroupMessageBtn").click(); }
+  if (event.key === "Enter" && enterToSendEnabled()) { event.preventDefault(); document.getElementById("sendGroupMessageBtn").click(); }
 });
 
 document.getElementById("loadGroupHistoryBtn").addEventListener("click", async () => {
@@ -2892,7 +4058,7 @@ document.getElementById("loadGroupHistoryBtn").addEventListener("click", async (
   try {
     await session.loadHistory(conversationId, true);
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2916,10 +4082,10 @@ function renderDeviceList(devices) {
     row.className = "row-card";
     row.style.cursor = "default";
     row.innerHTML = `
-      <div class="avatar sm">${initialOf(device.device_name)}</div>
+      <div class="avatar sm">${escapeHtml(initialOf(device.device_name))}</div>
       <div class="row-main">
-        <div class="row-title">${device.device_name || "(unnamed)"} <span class="row-sub">[${device.platform || "?"}]</span></div>
-        <div class="row-sub">${device.state} • ${device.device_id}</div>
+        <div class="row-title">${escapeHtml(device.device_name || "(unnamed)")} <span class="row-sub">[${escapeHtml(device.platform || "?")}]</span></div>
+        <div class="row-sub">${escapeHtml(device.state)} • <span class="mono">${escapeHtml(device.device_id)}</span></div>
       </div>`;
     deviceListEl.appendChild(row);
   }
@@ -2933,7 +4099,7 @@ document.getElementById("enrollDeviceBtn").addEventListener("click", async () =>
     );
     myDeviceIdEl.textContent = `${session.deviceId} (${result.state})`;
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2941,8 +4107,9 @@ document.getElementById("bindDeviceBtn").addEventListener("click", async () => {
   try {
     await session.bindDeviceSession();
     appendLog(`Bound this connection to device ${session.deviceId}.`);
+    toast("Session bound to this device", "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2952,7 +4119,7 @@ document.getElementById("listDevicesBtn").addEventListener("click", async () => 
     renderDeviceList(devices);
     if (session.deviceId) myDeviceIdEl.textContent = session.deviceId;
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2968,7 +4135,7 @@ document.getElementById("observeDeviceBtn").addEventListener("click", async () =
     observedDeviceFingerprint = peer.fingerprint;
     deviceFingerprintDisplayEl.textContent = `${targetDeviceId}: ${peer.fingerprint} [${peer.state}]`;
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2978,8 +4145,9 @@ document.getElementById("authorizeDeviceBtn").addEventListener("click", async ()
     session.confirmDevicePeerVerified(targetDeviceId, observedDeviceFingerprint);
     await session.authorizeDevice(targetDeviceId, observedDeviceFingerprint);
     appendLog(`Authorized device ${targetDeviceId}.`);
+    toast("Device authorized", "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2988,8 +4156,9 @@ document.getElementById("revokeDeviceBtn").addEventListener("click", async () =>
   try {
     await session.revokeDevice(targetDeviceId);
     appendLog(`Revoked device ${targetDeviceId}.`);
+    toast("Device revoked", "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });
 
@@ -2999,7 +4168,8 @@ document.getElementById("syncKeyBtn").addEventListener("click", async () => {
   try {
     await session.syncConversationKeyToDevice(targetDeviceId, conversationId, "direct");
     appendLog(`Synced conversation ${conversationId} to device ${targetDeviceId}.`);
+    toast("Conversation key synced", "success");
   } catch (error) {
-    appendLog(`ERROR: ${error.message}`);
+    reportActionError(error);
   }
 });

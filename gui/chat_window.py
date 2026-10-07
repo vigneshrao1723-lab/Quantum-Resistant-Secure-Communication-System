@@ -328,7 +328,6 @@ class ChatWindow(QWidget):
             "font-size: 15px; font-weight: 700;"
         )
         self.chat_partner_label.setMinimumWidth(0)
-        self.chat_partner_label.setWordWrap(True)
 
         # Phase 19.24 -- Presence/Last Seen: a direct conversation's
         # own online/offline subtitle -- Desktop previously showed NO
@@ -479,16 +478,19 @@ class ChatWindow(QWidget):
 
         self._current_direct_peer_username = None
 
-        header_identity_row = QHBoxLayout()
-        header_identity_row.setSpacing(8)
-        header_identity_row.addWidget(self.header_avatar_label)
-        header_identity_row.addWidget(self.chat_partner_label, 1)
-        header_identity_row.addWidget(self.view_profile_button)
-        header_identity_row.addWidget(self.verification_status_label)
-        header_layout.addLayout(header_identity_row)
+        header_top_row = QHBoxLayout()
+
+        header_top_row.addWidget(self.header_avatar_label)
+
+        header_top_row.addWidget(self.chat_partner_label, 1)
+
+        header_top_row.addWidget(self.view_profile_button)
+
+        header_layout.addLayout(header_top_row)
 
         header_actions_row = QHBoxLayout()
-        header_actions_row.setSpacing(4)
+        header_actions_row.setSpacing(6)
+        header_actions_row.addWidget(self.verification_status_label)
         header_actions_row.addWidget(self.verify_identity_button)
         header_actions_row.addWidget(self.request_verification_button)
         header_actions_row.addStretch()
@@ -1958,7 +1960,7 @@ class ChatWindow(QWidget):
 
             self.verification_status_label.setStyleSheet(
                 f"font-size: 11px; font-weight: 700; color: {COLOR_ONLINE}; "
-                "background: #2DC8A422; padding: 4px 9px; border-radius: 10px;"
+                "background: #E2F6EF; padding: 4px 9px; border-radius: 10px;"
             )
 
             self.verification_status_label.setVisible(True)
@@ -1975,7 +1977,7 @@ class ChatWindow(QWidget):
 
             self.verification_status_label.setStyleSheet(
                 f"font-size: 11px; font-weight: 700; color: {COLOR_DANGER}; "
-                "background: #D9525222; padding: 4px 9px; border-radius: 10px;"
+                "background: #FCEBED; padding: 4px 9px; border-radius: 10px;"
             )
 
             self.verification_status_label.setVisible(True)
@@ -1992,7 +1994,7 @@ class ChatWindow(QWidget):
 
             self.verification_status_label.setStyleSheet(
                 f"font-size: 11px; font-weight: 700; color: {COLOR_CLASSICAL}; "
-                "background: #C97A0A22; padding: 4px 9px; border-radius: 10px;"
+                "background: #FCF1DC; padding: 4px 9px; border-radius: 10px;"
             )
 
             self.verification_status_label.setVisible(True)

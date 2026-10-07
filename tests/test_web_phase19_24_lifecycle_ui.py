@@ -162,8 +162,14 @@ def test_web_edit_via_context_menu_updates_both_sides(
         # Bob's OWN bubble updates via the server's own broadcast-back
         # (never a local-only optimistic edit) -- proves main.js::
         # onMessageEdited actually applies to bob's own view too.
+        # Phase 1.5 UI: the edited state is shown in the bubble's footer
+        # ("edited · <time>") rather than as an inline "(edited)" suffix.
         assert _wait_for(
-            lambda: "after edit (edited)" in page.inner_text("#messages"),
+            lambda: page.evaluate(
+                "[...document.querySelectorAll('#messages .bubble')]"
+                ".some(b => b.querySelector('.bubble-text')?.textContent === 'after edit'"
+                " && !!b.querySelector('.bubble-footer .bubble-edited'))"
+            ),
             attempts=200, interval=0.1,
         )
 
@@ -268,9 +274,14 @@ def test_web_react_via_context_menu_shows_on_both_sides(
         page.click(".bubble-popup-emoji-row button >> nth=0")
 
         # Bob's own bubble reflects the reaction via the server's own
-        # broadcast-back (never applied locally/optimistically).
+        # broadcast-back (never applied locally/optimistically) -- as a
+        # reaction chip whose count reads 1 (the chip replaced the old
+        # inline "emoji×count" text in the Phase 1 UI polish pass).
         assert _wait_for(
-            lambda: "×1" in page.inner_text("#messages"),
+            lambda: page.evaluate(
+                "[...document.querySelectorAll('#messages .reaction-chip .reaction-count')]"
+                ".some(el => el.textContent === '1')"
+            ),
             attempts=200, interval=0.1,
         )
 
@@ -814,7 +825,14 @@ def test_web_mute_via_real_ui_toggle(running_server, gateway_url, browser_page, 
         _open_direct_chat_in_browser(page, alice.username)
 
         row_mute_btn = f".row-card:has-text('{alice.username}') .row-mute-btn"
-        assert page.inner_text(row_mute_btn) == "\U0001F514"  # 🔔, not yet muted
+
+        # The row's bell is an SVG icon since the Phase 1 UI polish pass
+        # (bell / bell-off) -- its muted state is the .is-muted class, not
+        # an emoji glyph in the button's text.
+        def _row_muted():
+            return page.locator(row_mute_btn).evaluate("el => el.classList.contains('is-muted')")
+
+        assert not _row_muted()  # bell, not yet muted
 
         page.click(row_mute_btn)
         page.click(".bubble-context-menu >> text=Mute for 1 hour")
@@ -822,7 +840,7 @@ def test_web_mute_via_real_ui_toggle(running_server, gateway_url, browser_page, 
         assert _wait_for(
             lambda: page.evaluate(f"window.__session.isConversationMuted({alice.username!r})")
         )
-        assert page.inner_text(row_mute_btn) == "\U0001F515"  # 🔕, now muted
+        assert _wait_for(_row_muted)  # bell-off, now muted
 
         page.click(row_mute_btn)
         page.click(".bubble-context-menu >> text=Unmute")
@@ -830,7 +848,7 @@ def test_web_mute_via_real_ui_toggle(running_server, gateway_url, browser_page, 
         assert _wait_for(
             lambda: not page.evaluate(f"window.__session.isConversationMuted({alice.username!r})")
         )
-        assert page.inner_text(row_mute_btn) == "\U0001F514"
+        assert _wait_for(lambda: not _row_muted())
     finally:
         _delete(bob_payload["username"])
 
