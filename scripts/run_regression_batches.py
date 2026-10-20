@@ -84,6 +84,8 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_production_tls_safety.py",
         "tests/test_configuration_separation.py",
         "tests/test_client_import_boundary.py",
+        "tests/test_release_packaging.py",
+        "tests/test_database_least_privilege.py",
     ],
     "device_security": [
         "tests/test_device_identity.py",
@@ -112,6 +114,7 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_server_connection_limits.py",
         "tests/test_network_frame_limits.py",
         "tests/test_registration_integration.py",
+        "tests/test_epoch_reservation_request_response.py",
     ],
     # Split 2026-10-04 (final acceptance pass) from a single 44-file
     # "messaging_groups" batch: that combined batch, which had always
@@ -229,6 +232,9 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_image_viewing.py",
         "tests/test_initial_chat_state.py",
         "tests/test_internal_messages_not_shown_as_chat.py",
+        "tests/test_phase19_23_ux_fixes.py",
+        "tests/test_desktop_chat_layout.py",
+        "tests/test_desktop_profile_picture_dialog.py",
     ],
     # Split further (from a single "desktop_gui_lifecycle" batch) after
     # THAT batch itself started reliably timing out at the 900s hard
@@ -267,15 +273,26 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_phase19_24_desktop_message_search.py",
         "tests/test_phase19_24_desktop_pinned_messages.py",
         "tests/test_phase19_24_desktop_voice_video.py",
+        "tests/test_phase19_24_desktop_media_gallery.py",
+        "tests/test_phase19_24_typing_indicator.py",
     ],
-    "web": [
+    # Split from a single 9-file "web" batch (2026-10-20). Each file passes on its own and
+    # the batch usually passes, but in ~1 of 3 full runs one to three tests fail at their shared
+    # setup step after ~10 minutes in one process (see docs/architecture/security/
+    # feature_security_matrix.md, 2026-10-20 addendum). Two smaller processes are this runner's own
+    # sanctioned remedy for long-process accumulation; no test was removed or weakened.
+    "web_a": [
         "tests/test_web_browser_e2e.py",
         "tests/test_web_client_crypto_interop.py",
         "tests/test_web_feature_completion_e2e.py",
         "tests/test_web_gateway_interop.py",
         "tests/test_web_persistence_reconnect.py",
         "tests/test_web_settings_and_inbox.py",
+    ],
+    "web_b": [
         "tests/test_web_phase19_24_lifecycle_ui.py",
+        "tests/test_web_messenger_layout_and_parity.py",
+        "tests/test_web_registration_and_login_ui.py",
     ],
 }
 

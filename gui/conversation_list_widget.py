@@ -15,24 +15,48 @@ gui/online_users_widget.py is left in place, unused, for this phase
 """
 
 from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
+from gui.avatar import AvatarWidget
+from gui.icons import toolbar_icon
 from gui.message_widget import to_local_time
 from gui.styles import (
-    COLOR_ACCENT,
-    COLOR_ONLINE,
+    COLOR_TEXT,
     COLOR_TEXT_MUTED,
     COLOR_UNREAD,
     LIST_ITEM_VERTICAL_MARGIN,
 )
+
+
+class ElidedLabel(QLabel):
+    """A QLabel that shows one line and ends it with an ellipsis when it does
+    not fit, instead of forcing its parent wider. ``text()`` still returns the
+    full text -- only what is painted is shortened."""
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def minimumSizeHint(self):
+        return QSize(0, super().minimumSizeHint().height())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        painter.setFont(self.font())
+        elided = self.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.width())
+        painter.drawText(self.rect(), int(self.alignment()) | Qt.AlignVCenter, elided)
+        painter.end()
 
 
 class ConversationRow(QWidget):
@@ -60,12 +84,9 @@ class ConversationRow(QWidget):
         self.summary = summary
         self.on_context_action = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(2)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(10)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(12)
 
         # Phase 4 (Secure Group Messaging Foundation): the only branch
         # in this class -- which display name to use. Everything else
@@ -74,31 +95,32 @@ class ConversationRow(QWidget):
         # written in Phase 2.
         display_name = summary.group_name if summary.is_group else summary.username
 
-        initial = display_name[0].upper() if display_name else "?"
+        # Presence is a property of a person, not of a group.
+        avatar = AvatarWidget(
+            display_name,
+            size=44,
+            online=None if summary.is_group else bool(summary.is_online),
+            is_group=summary.is_group,
+        )
 
-        avatar = QLabel(initial)
         # L-1: every label in this row renders a display name, a
         # group name or a message preview -- all of it written by
         # other users and none of it markup.
-        avatar.setTextFormat(Qt.PlainText)
-        avatar.setFixedSize(34, 34)
-        avatar.setAlignment(Qt.AlignCenter)
-        avatar.setStyleSheet(
-            f"background-color: {COLOR_ACCENT}; color: #FFFFFF; "
-            "border-radius: 17px; font-weight: 700;"
-        )
-
-        name = QLabel(display_name)
+        name = ElidedLabel(display_name)
         name.setTextFormat(Qt.PlainText)
-        name.setStyleSheet("font-size: 10.5pt; font-weight: 500;")
+        name.setStyleSheet(
+            f"font-size: 10.5pt; font-weight: 600; color: {COLOR_TEXT}; background: transparent;"
+        )
 
         # Phase 19.24 -- Mute: a small, always-present-but-hidden glyph,
         # same "zero-footprint until relevant" convention as the unread
         # badge below. Local UI preference only -- never part of
         # ConversationSummary, see set_muted()'s own docstring.
-        self.mute_icon = QLabel("🔕")
+        self.mute_icon = QLabel()
         self.mute_icon.setTextFormat(Qt.PlainText)
-        self.mute_icon.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 9pt;")
+        self.mute_icon.setPixmap(toolbar_icon("mute").pixmap(QSize(14, 14)))
+        self.mute_icon.setToolTip("Muted")
+        self.mute_icon.setStyleSheet("background: transparent;")
         self.mute_icon.setVisible(False)
 
         # BUG -- Timestamp/Timezone: summary.latest_message.timestamp
@@ -116,16 +138,19 @@ class ConversationRow(QWidget):
 
         timestamp = QLabel(timestamp_text)
         timestamp.setTextFormat(Qt.PlainText)
-        timestamp.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 8.5pt;")
+        timestamp.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font-size: 8.5pt; background: transparent;"
+        )
 
         self.unread_badge = QLabel("")
         self.unread_badge.setTextFormat(Qt.PlainText)
         self.unread_badge.setFixedHeight(20)
+        self.unread_badge.setMinimumWidth(20)
         self.unread_badge.setAlignment(Qt.AlignCenter)
         self.unread_badge.setStyleSheet(
             f"background-color: {COLOR_UNREAD}; color: #FFFFFF; "
             "border-radius: 10px; font-size: 8.5pt; font-weight: 700; "
-            "padding: 0px 7px;"
+            "padding: 0px 6px;"
         )
         self.unread_badge.setVisible(False)
 
@@ -151,31 +176,36 @@ class ConversationRow(QWidget):
         # contextMenuEvent()'s own guard.
         self._blocked = False
 
-        dot_color = COLOR_ONLINE if summary.is_online else COLOR_TEXT_MUTED
-
-        dot = QLabel("●")
-        dot.setTextFormat(Qt.PlainText)
-        dot.setStyleSheet(f"color: {dot_color}; font-size: 9pt;")
-
-        top_row.addWidget(avatar)
-        top_row.addWidget(name, stretch=1)
-        top_row.addWidget(self.mute_icon)
-        top_row.addWidget(timestamp)
-        top_row.addWidget(self.unread_badge)
-        top_row.addWidget(dot)
-
         preview_text = (
             summary.latest_message.render()
             if summary.latest_message
             else "No messages yet"
         )
 
-        preview = QLabel(preview_text)
+        preview = ElidedLabel(preview_text)
         preview.setTextFormat(Qt.PlainText)
-        preview.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 9pt;")
+        preview.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font-size: 9.5pt; background: transparent;"
+        )
 
-        layout.addLayout(top_row)
-        layout.addWidget(preview)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        title_row.addWidget(name, stretch=1)
+        title_row.addWidget(self.mute_icon)
+        title_row.addWidget(timestamp)
+
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(6)
+        preview_row.addWidget(preview, stretch=1)
+        preview_row.addWidget(self.unread_badge)
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(3)
+        text_column.addLayout(title_row)
+        text_column.addLayout(preview_row)
+
+        layout.addWidget(avatar, 0, Qt.AlignVCenter)
+        layout.addLayout(text_column, stretch=1)
 
     # ==========================================================
     # Public Methods
@@ -307,6 +337,10 @@ class ConversationListWidget(QListWidget):
         super().__init__()
 
         self.setSpacing(4)
+
+        # Rows elide their own text; a row that is a few px wider than the
+        # viewport must not summon a horizontal scrollbar.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.itemClicked.connect(self._on_item_clicked)
 

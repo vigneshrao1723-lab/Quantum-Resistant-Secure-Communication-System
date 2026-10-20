@@ -1802,6 +1802,19 @@ class ClientSession(QObject):
             except OSError:
                 pass
 
+            # shutdown() wakes the receiver thread, but it may still be INSIDE
+            # the TLS library's read. Closing the socket (and so releasing its
+            # TLS object) underneath it is a use-after-free that can kill the
+            # whole process with a native access violation, so wait for the
+            # receiver to leave first (bounded -- never forever). Skipped when
+            # this IS the receiver thread (a connection-loss path), which
+            # cannot wait for itself.
+            if (
+                self.receiver_thread is not None
+                and self.receiver_thread is not threading.current_thread()
+            ):
+                self.receiver_thread.join(timeout=2)
+
             self.client_socket.close()
 
             # Drop the reference to the now-closed socket object rather

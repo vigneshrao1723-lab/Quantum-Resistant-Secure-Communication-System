@@ -57,7 +57,7 @@ class StatusBarWidget(QWidget):
     def build_ui(self):
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 6, 4, 6)
+        layout.setContentsMargins(16, 6, 16, 6)
 
         self.connection_label = QLabel(
             f"● Disconnected"

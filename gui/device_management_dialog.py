@@ -198,6 +198,7 @@ class DeviceManagementDialog(QDialog):
 
         if viewer_is_authorized and state == "AUTHORIZED":
             revoke_button = QPushButton("Revoke")
+            revoke_button.setObjectName("DangerButton")
             revoke_button.setCursor(Qt.PointingHandCursor)
             revoke_button.clicked.connect(
                 lambda checked=False, d=device: self._handle_revoke(d)

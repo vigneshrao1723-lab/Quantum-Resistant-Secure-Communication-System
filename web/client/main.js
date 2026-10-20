@@ -379,6 +379,8 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.classList.add("is-active");
     btn.setAttribute("aria-selected", "true");
     document.querySelector(`.sidebar-panel[data-panel="${btn.dataset.tab}"]`).classList.add("is-active");
+    const sidebarTitleEl = document.getElementById("sidebarTitle");
+    if (sidebarTitleEl) sidebarTitleEl.textContent = btn.querySelector(".tab-label")?.textContent || "Chats";
     if (btn.dataset.tab === "inbox") renderInboxList();
   });
 });
@@ -397,7 +399,40 @@ document.getElementById("settingsBackBtn").addEventListener("click", () => setMa
 
 document.getElementById("settingsToggleBtn").addEventListener("click", () => {
   setMainView("settings");
+  loadMyBio();
   if (session) loadPeerAvatar(document.getElementById("myProfilePicAvatar"), session.username, initialOf(session.username));
+});
+
+// Bio: view/edit this account's own bio (the same bio_request/
+// change_bio_request round trips Desktop and Android use; the server caps it
+// at 256 characters and returns an error for more).
+const NO_BIO_HINT = "No bio set. It is shown on your profile.";
+async function loadMyBio() {
+  if (!session) return;
+  try {
+    const bio = await session.fetchBio(session.username);
+    document.getElementById("bioInput").value = bio;
+    document.getElementById("bioHint").textContent = bio || NO_BIO_HINT;
+  } catch { /* keep whatever is showing */ }
+}
+document.getElementById("bioToggleBtn").addEventListener("click", () => {
+  const form = document.getElementById("bioForm");
+  form.hidden = !form.hidden;
+  if (!form.hidden) document.getElementById("bioInput").focus();
+});
+document.getElementById("bioSaveBtn").addEventListener("click", async () => {
+  if (!session) return;
+  const hintEl = document.getElementById("bioHint");
+  const bio = document.getElementById("bioInput").value.trim();
+  try {
+    const result = await session.changeBio(bio);
+    if (!result.success) throw new Error(result.error || "Could not save your bio.");
+    hintEl.textContent = bio || NO_BIO_HINT;
+    document.getElementById("bioForm").hidden = true;
+    toast("Bio saved", "success");
+  } catch (error) {
+    hintEl.textContent = error.message;
+  }
 });
 
 // Phase 19.18 -- L-5/Web-parity closure: Change Username / Change
@@ -1330,6 +1365,106 @@ function showConfirmModal(title, message, confirmLabel, doAction) {
 
   mountOverlay(overlay, cancelBtn);
 }
+
+// Peer profile: picture, name, bio and presence for the open direct chat (the
+// same details Desktop's "View Profile" and Android's avatar tap show).
+async function showPeerProfile(username) {
+  if (!session || !username) return;
+  const overlay = document.createElement("div");
+  overlay.className = "confirm-modal";
+  const card = document.createElement("div");
+  card.className = "confirm-modal-card profile-card";
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-modal", "true");
+  overlay.appendChild(card);
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar lg";
+  avatar.dataset.tone = avatarTone(username);
+  avatar.textContent = initialOf(username);
+  card.appendChild(avatar);
+
+  const nameEl = document.createElement("div");
+  nameEl.className = "confirm-modal-title";
+  nameEl.id = `profile-title-${Date.now()}`;
+  nameEl.textContent = username;
+  card.setAttribute("aria-labelledby", nameEl.id);
+  card.appendChild(nameEl);
+
+  const presenceEl = document.createElement("div");
+  presenceEl.className = "profile-presence";
+  presenceEl.textContent = document.getElementById("peerPresence")?.textContent || "";
+  card.appendChild(presenceEl);
+
+  const bioEl = document.createElement("div");
+  bioEl.className = "confirm-modal-message profile-bio";
+  bioEl.textContent = "Loading...";
+  card.appendChild(bioEl);
+
+  const actionsRow = document.createElement("div");
+  actionsRow.className = "confirm-modal-actions";
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "btn btn-ghost btn-sm";
+  closeBtn.textContent = "Close";
+  closeBtn.addEventListener("click", () => dismissOverlay(overlay));
+  actionsRow.appendChild(closeBtn);
+  card.appendChild(actionsRow);
+
+  mountOverlay(overlay, closeBtn);
+
+  loadPeerAvatar(avatar, username, initialOf(username));
+  try {
+    const bio = await session.fetchBio(username);
+    bioEl.textContent = bio || "No bio set.";
+  } catch {
+    bioEl.textContent = "Profile details are unavailable right now.";
+  }
+}
+document.getElementById("peerProfileBtn").addEventListener("click", () => showPeerProfile(activeDirectPeer));
+
+// Group Info: add members / leave. Both only send the request -- the server
+// decides (admin adds directly, others go to the admin's Inbox) and the
+// result comes back as the group_members_added / group_member_left events.
+document.getElementById("groupAddMemberBtn").addEventListener("click", () => {
+  const conversationId = activeGroupIdEl.value;
+  const group = session?.groups.get(conversationId);
+  if (!group) return;
+  const input = document.getElementById("groupAddMemberInput");
+  const hint = document.getElementById("groupAddHint");
+  const names = input.value.split(/[\s,;]+/).map((n) => n.trim()).filter(Boolean);
+  if (names.length === 0) {
+    hint.textContent = "Enter a username to add.";
+    return;
+  }
+  const fresh = [...new Set(names)].filter((n) => n !== session.username && !group.members.includes(n));
+  if (fresh.length === 0) {
+    hint.textContent = "Everyone you entered is already in this group.";
+    return;
+  }
+  session.addGroupMembers(conversationId, fresh);
+  input.value = "";
+  hint.textContent = !group.admin || group.admin === session.username
+    ? "Adding... new members appear here once the server confirms."
+    : "Request sent. The group admin will see it in their Inbox.";
+});
+document.getElementById("groupAddMemberInput").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); document.getElementById("groupAddMemberBtn").click(); }
+});
+function doLeaveGroup(conversationId) {
+  if (session) session.leaveGroup(conversationId);
+}
+document.getElementById("leaveGroupBtn").addEventListener("click", () => {
+  const conversationId = activeGroupIdEl.value;
+  const group = session?.groups.get(conversationId);
+  if (!group) return;
+  showConfirmModal(
+    "Leave this group?",
+    `You will stop receiving messages from "${group.name}". Someone in the group can add you again later.`,
+    "Leave group",
+    () => doLeaveGroup(conversationId),
+  );
+});
 
 function doBlockUser(key) {
   if (!session) return;
@@ -2746,15 +2881,39 @@ async function loadPeerAvatar(el, username, initial) {
 let showArchivedChats = false;
 let showArchivedGroups = false;
 
+// Local narrowing of the lists already on screen: the search box's text (a
+// case-insensitive name match) and the "unread only" toggle. Nothing is sent
+// anywhere.
+//
+// The search box has a second job -- it holds the open chat's username, and
+// typing a username there opens that chat -- so its text only counts as a
+// SEARCH while (a) it differs from the open chat's name and (b) it matches at
+// least one existing conversation. Typing a brand-new username therefore never
+// empties the list, and an open chat never filters the Groups tab away.
+let sidebarUnreadOnly = false;
+function effectiveFilterText(labels) {
+  const value = (document.getElementById("peerUsername")?.value || "").trim().toLowerCase();
+  if (!value || value === String(activeDirectPeer || "").toLowerCase()) return "";
+  return labels.some((label) => String(label).toLowerCase().includes(value)) ? value : "";
+}
+function passesSidebarFilter(label, activity, filterText) {
+  if (sidebarUnreadOnly && !activity?.unread) return false;
+  return !filterText || String(label).toLowerCase().includes(filterText);
+}
+
 function renderChatList() {
   chatListEl.innerHTML = "";
-  const peers = Array.from(knownDirectPeers).filter(
+  const allPeers = Array.from(knownDirectPeers).filter(
     (peer) => Boolean(session?.isConversationArchived(peer)) === showArchivedChats
   );
+  const filterText = effectiveFilterText(allPeers);
+  const peers = allPeers.filter((peer) => passesSidebarFilter(peer, conversationActivity.get(activityKey(false, peer)), filterText));
   if (peers.length === 0) {
-    chatListEl.innerHTML = showArchivedChats
-      ? '<div class="empty-hint">No archived chats.</div>'
-      : '<div class="empty-hint">Type a username above and press Enter to open a direct chat.</div>';
+    chatListEl.innerHTML = sidebarUnreadOnly && allPeers.length > 0
+      ? '<div class="empty-hint">No unread chats.</div>'
+      : showArchivedChats
+        ? '<div class="empty-hint">No archived chats.</div>'
+        : '<div class="empty-hint">Type a username above and press Enter to open a direct chat.</div>';
     return;
   }
   const onlineUsers = session?.onlineUsers || new Set();
@@ -2790,6 +2949,35 @@ function renderChatList() {
   }
   updateTabBadges();
 }
+
+document.getElementById("peerUsername").addEventListener("input", () => {
+  renderChatList();
+  if (session) renderGroupList();
+});
+// Narrow screens show an already-verified peer's safety number on one line;
+// this expands the full number and the labelled actions (CSS does the rest).
+document.getElementById("securityBarToggle").addEventListener("click", (event) => {
+  const open = document.getElementById("securityBar").classList.toggle("is-expanded");
+  event.currentTarget.setAttribute("aria-expanded", String(open));
+  event.currentTarget.setAttribute("aria-label", open ? "Hide full safety number" : "Show full safety number");
+});
+
+document.getElementById("unreadFilterToggle").addEventListener("click", (event) => {
+  sidebarUnreadOnly = !sidebarUnreadOnly;
+  event.currentTarget.setAttribute("aria-pressed", String(sidebarUnreadOnly));
+  event.currentTarget.classList.toggle("is-active", sidebarUnreadOnly);
+  renderChatList();
+  if (session) renderGroupList();
+});
+// Header shortcuts: both do exactly what the existing controls already do.
+document.getElementById("newChatHeaderBtn").addEventListener("click", () => {
+  document.querySelector('.tab-btn[data-tab="chats"]').click();
+  document.getElementById("peerUsername").focus();
+});
+document.getElementById("newGroupHeaderBtn").addEventListener("click", () => {
+  document.querySelector('.tab-btn[data-tab="groups"]').click();
+  openGroupCreateModal();
+});
 
 document.getElementById("archivedChatsToggle").addEventListener("click", () => {
   showArchivedChats = !showArchivedChats;
@@ -3046,9 +3234,17 @@ document.getElementById("peerUsername").addEventListener("input", (event) => {
 function renderGroupList() {
   if (!session) return;
   groupListEl.innerHTML = "";
-  const groups = Array.from(session.groups.entries()).filter(
+  const allGroups = Array.from(session.groups.entries()).filter(
     ([conversationId]) => session.isConversationArchived(conversationId) === showArchivedGroups
   );
+  const groupFilterText = effectiveFilterText(allGroups.map(([, group]) => group.name));
+  const groups = allGroups.filter(([conversationId, group]) =>
+    passesSidebarFilter(group.name, conversationActivity.get(activityKey(true, conversationId)), groupFilterText));
+  if (groups.length === 0 && sidebarUnreadOnly && allGroups.length > 0) {
+    groupListEl.innerHTML = '<div class="empty-hint">No unread groups.</div>';
+    updateTabBadges();
+    return;
+  }
   if (groups.length === 0) {
     if (showArchivedGroups) {
       groupListEl.innerHTML = '<div class="empty-hint">No archived groups.</div>';
@@ -3475,6 +3671,15 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
       renderGroupList();
       if (!groupInfoViewEl.hidden) renderGroupInfo();
     },
+    // THIS account left a group (server-confirmed): close it if it was open.
+    onGroupLeft: (conversationId) => {
+      if (activeGroupIdEl.value === conversationId) {
+        activeGroupIdEl.value = "";
+        setMainView("empty");
+      }
+      renderGroupList();
+      toast("You left the group", "success");
+    },
     // Phase 19.23 -- Issue 3: no longer rendered as chat-adjacent text
     // at all -- resolveOldestUnackedSentTick() (below) is now the only
     // user-visible effect, exactly matching Desktop/Android's own
@@ -3730,8 +3935,26 @@ document.getElementById("enterToSendToggle")?.addEventListener("change", (event)
 syncEnterToSendControl();
 
 document.getElementById("messageText").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && enterToSendEnabled()) { event.preventDefault(); document.getElementById("sendBtn").click(); }
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && enterToSendEnabled()) { event.preventDefault(); document.getElementById("sendBtn").click(); }
 });
+
+// The composers are multi-line: one row when empty, growing with the text up
+// to a limit. Programmatic changes (sending, loading a draft, editing) set
+// .value too, so the setter is wrapped as well as the input event.
+function autosizeComposer(el) {
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+}
+for (const id of ["messageText", "groupMessageText"]) {
+  const el = document.getElementById(id);
+  const nativeValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+  Object.defineProperty(el, "value", {
+    configurable: true,
+    get() { return nativeValue.get.call(this); },
+    set(v) { nativeValue.set.call(this, v); autosizeComposer(this); },
+  });
+  el.addEventListener("input", () => autosizeComposer(el));
+}
 
 document.getElementById("markReadBtn")?.addEventListener("click", async () => {
   const peerUsername = document.getElementById("peerUsername").value;
@@ -4050,7 +4273,7 @@ document.getElementById("sendGroupMessageBtn").addEventListener("click", async (
   document.getElementById("groupMessageText").value = "";
 });
 document.getElementById("groupMessageText").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && enterToSendEnabled()) { event.preventDefault(); document.getElementById("sendGroupMessageBtn").click(); }
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && enterToSendEnabled()) { event.preventDefault(); document.getElementById("sendGroupMessageBtn").click(); }
 });
 
 document.getElementById("loadGroupHistoryBtn").addEventListener("click", async () => {
@@ -4173,3 +4396,10 @@ document.getElementById("syncKeyBtn").addEventListener("click", async () => {
     reportActionError(error);
   }
 });
+
+// The login form starts disabled (index.html): main.js is a module with many
+// imports, and a click that lands before the handlers above are attached is
+// silently lost -- the person (or a test) sees nothing happen. Everything is
+// wired by this point, so the form can be used.
+for (const id of ["connectBtn", "toggleModeBtn"]) document.getElementById(id).disabled = false;
+document.documentElement.dataset.appReady = "1";

@@ -47,9 +47,14 @@ from config import ROOT_DIR
 # server over TLS, never to PostgreSQL directly.
 # ---------------------------------------------------------------
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql+psycopg2://postgres:postgres@localhost:5432/qrscs"
-)
+# Deliberately NO default: a missing DATABASE_URL must stop the server, never
+# fall back to a well-known superuser login. The server connects as the
+# least-privilege runtime role created by scripts/setup_database_roles.py.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Used only by Alembic (alembic/env.py): a separate role that owns the schema.
+# Optional -- when unset, migrations use DATABASE_URL.
+MIGRATION_DATABASE_URL = os.environ.get("MIGRATION_DATABASE_URL", "")
 
 # ---------------------------------------------------------------
 # Authentication Configuration

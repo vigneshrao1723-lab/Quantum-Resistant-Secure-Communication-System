@@ -25,6 +25,30 @@ COLOR_PANEL = "#FFFFFF"
 COLOR_PANEL_ALT = "#ECECF2"
 COLOR_BORDER = "#E6E6ED"
 
+# Chat-window surfaces. Same values as the Web client's --sidebar-bg and
+# --accent-soft tokens (web/client/style.css), so both clients share one
+# palette: a navigation rail (PANEL_ALT), a slightly lighter conversation
+# sidebar, and the white conversation pane.
+COLOR_SIDEBAR = "#F7F7FA"
+COLOR_ACCENT_SOFT = "#EEEAFE"
+
+# Avatar tones: the Web client's --tone-0..5, indexed by the same name hash as
+# its avatarTone() (hash = hash * 31 + codepoint, 32-bit), so a contact has the
+# same colour on every client. A group with no tone falls back to the accent.
+AVATAR_TONES = ("#4B4F80", "#2E6D72", "#7A4A6F", "#3D6291", "#646E3E", "#8A593B")
+
+
+def avatar_tone_color(name, group=False):
+    if group and not name:
+        return COLOR_ACCENT
+
+    value = 0
+
+    for character in str(name or ""):
+        value = (value * 31 + ord(character)) & 0xFFFFFFFF
+
+    return AVATAR_TONES[value % len(AVATAR_TONES)]
+
 COLOR_TEXT = "#1D1D2E"
 COLOR_TEXT_MUTED = "#8E8E98"
 
@@ -242,13 +266,77 @@ QPushButton#SecondaryButton:hover {{
     background-color: {COLOR_PANEL_ALT};
 }}
 
+/* Toolbar glyph buttons. The base QPushButton rule above sets white
+   text, so an icon button must set its own colour -- and a symbol font,
+   so the search/pin/gallery/wallpaper/attach code points render as
+   monochrome glyphs in that colour instead of mixed-colour emoji. */
 QPushButton#IconButton {{
     background-color: transparent;
+    color: {COLOR_TEXT_MUTED};
     border-radius: 8px;
     padding: 6px;
+    min-width: 20px;
+    font-family: "Segoe UI Symbol", "Segoe UI", sans-serif;
+    font-size: 13pt;
+    font-weight: 400;
 }}
 
-QPushButton#IconButton:hover {{
+QPushButton#IconButton:hover,
+QPushButton#IconButton:focus {{
+    background-color: {COLOR_PANEL_ALT};
+    color: {COLOR_ACCENT};
+}}
+
+/* Destructive action (e.g. revoking a device): outlined in the danger
+   colour, filling on hover, so it can never be mistaken for the
+   accent-filled primary action beside it. */
+QPushButton#DangerButton {{
+    background-color: transparent;
+    color: {COLOR_DANGER};
+    border: 1.5px solid {COLOR_DANGER};
+    border-radius: 21px;
+    padding: 8px 18px;
+}}
+
+QPushButton#DangerButton:hover,
+QPushButton#DangerButton:focus {{
+    background-color: {COLOR_DANGER};
+    color: #FFFFFF;
+}}
+
+QPushButton#IconButton:pressed {{
+    background-color: {COLOR_BORDER};
+    color: {COLOR_ACCENT_PRESSED};
+}}
+
+/* Conversation-header actions (verify, request approval, profile, group
+   admin): secondary weight, so the open conversation's name -- not a
+   row of accent-filled pills -- is what leads the header. */
+QPushButton#HeaderActionButton,
+QPushButton#HeaderDangerButton {{
+    background-color: transparent;
+    color: {COLOR_ACCENT};
+    border: 1.5px solid {COLOR_BORDER};
+    border-radius: 14px;
+    padding: 4px 14px;
+    min-height: 16px;
+    font-size: 10pt;
+    font-weight: 600;
+}}
+
+QPushButton#HeaderActionButton:hover,
+QPushButton#HeaderActionButton:focus {{
+    border-color: {COLOR_ACCENT};
+    background-color: {COLOR_PANEL_ALT};
+}}
+
+QPushButton#HeaderDangerButton {{
+    color: {COLOR_DANGER};
+}}
+
+QPushButton#HeaderDangerButton:hover,
+QPushButton#HeaderDangerButton:focus {{
+    border-color: {COLOR_DANGER};
     background-color: {COLOR_PANEL_ALT};
 }}
 
@@ -318,6 +406,205 @@ QListWidget::item:hover {{
 
 
 /* ==========================================================
+   CHAT WINDOW -- navigation rail, conversation sidebar, header,
+   composer. Layout follows the three-region messenger pattern; every
+   colour below is an existing palette token.
+   ========================================================== */
+
+QFrame#NavRail {{
+    background-color: {COLOR_PANEL_ALT};
+    border: none;
+    border-right: 1px solid {COLOR_BORDER};
+    border-radius: 0px;
+}}
+
+/* Sizes are stated here as well as in code: a QSS min/max size overrides
+   QWidget.setFixedSize(), and an unstated one lets a bottom-aligned layout
+   shrink the button to its size hint. */
+QToolButton#RailButton {{
+    background-color: transparent;
+    border: none;
+    border-radius: 12px;
+    padding: 0px;
+    min-width: 48px;
+    max-width: 48px;
+    min-height: 46px;
+    max-height: 46px;
+}}
+
+QPushButton#ComposerButton {{
+    background-color: transparent;
+    border: none;
+    border-radius: 20px;
+    padding: 0px;
+    min-width: 40px;
+    max-width: 40px;
+    min-height: 40px;
+    max-height: 40px;
+}}
+
+QToolButton#RailButton:hover,
+QPushButton#ComposerButton:hover {{
+    background-color: {COLOR_BORDER};
+}}
+
+QToolButton#RailButton:checked {{
+    background-color: {COLOR_ACCENT_SOFT};
+}}
+
+QToolButton#RailButton:focus,
+QPushButton#ComposerButton:focus {{
+    background-color: {COLOR_BORDER};
+}}
+
+QToolButton#RailButton:checked:focus {{
+    background-color: {COLOR_ACCENT_SOFT};
+}}
+
+QLabel#RailBadge {{
+    background-color: {COLOR_UNREAD};
+    color: #FFFFFF;
+    border: 2px solid {COLOR_PANEL_ALT};
+    border-radius: 9px;
+    font-size: 8pt;
+    font-weight: 700;
+}}
+
+QLabel#BrandMark {{
+    background-color: {COLOR_ACCENT};
+    color: #FFFFFF;
+    border-radius: 12px;
+    font-size: 13pt;
+    font-weight: 700;
+}}
+
+QFrame#Sidebar {{
+    background-color: {COLOR_SIDEBAR};
+    border: none;
+    border-right: 1px solid {COLOR_BORDER};
+    border-radius: 0px;
+}}
+
+QLabel#SidebarTitle {{
+    background: transparent;
+    font-size: 17pt;
+    font-weight: 700;
+    color: {COLOR_TEXT};
+}}
+
+QLineEdit#SidebarSearch {{
+    background-color: {COLOR_PANEL_ALT};
+    border: 1.5px solid transparent;
+    border-radius: 12px;
+    padding: 8px 12px;
+    font-size: 10.5pt;
+}}
+
+QLineEdit#SidebarSearch:focus {{
+    background-color: {COLOR_PANEL};
+    border: 1.5px solid {COLOR_ACCENT};
+}}
+
+QListWidget#ConversationList {{
+    background-color: transparent;
+    border: none;
+    border-radius: 0px;
+    padding: 0px 6px;
+}}
+
+QListWidget#ConversationList::item {{
+    border-radius: 12px;
+    border: none;
+    margin: {_LIST_ITEM_MARGIN_PX}px 0px;
+}}
+
+QListWidget#ConversationList::item:hover {{
+    background-color: {COLOR_PANEL_ALT};
+}}
+
+QListWidget#ConversationList::item:selected {{
+    background-color: {COLOR_BORDER};
+    border: none;
+}}
+
+QFrame#MainPane {{
+    background-color: {COLOR_PANEL};
+    border: none;
+    border-radius: 0px;
+}}
+
+QFrame#ChatHeader {{
+    background-color: {COLOR_PANEL};
+    border: none;
+    border-bottom: 1px solid {COLOR_BORDER};
+    border-radius: 0px;
+}}
+
+QWidget#ComposerContext {{
+    background-color: {COLOR_ACCENT_SOFT};
+    border-top: 1px solid {COLOR_BORDER};
+}}
+
+QWidget#ChatContent {{
+    background-color: {COLOR_PANEL};
+}}
+
+QFrame#MessagesPane {{
+    background-color: {COLOR_PANEL};
+    border: none;
+    border-radius: 0px;
+}}
+
+QFrame#Composer {{
+    background-color: {COLOR_PANEL};
+    border: none;
+    border-top: 1px solid {COLOR_BORDER};
+    border-radius: 0px;
+}}
+
+QFrame#ComposerField {{
+    background-color: {COLOR_PANEL_ALT};
+    border: 1.5px solid transparent;
+    border-radius: 22px;
+}}
+
+QFrame#ComposerField[focused="true"] {{
+    background-color: {COLOR_PANEL};
+    border: 1.5px solid {COLOR_ACCENT};
+}}
+
+QPlainTextEdit#ComposerInput {{
+    background-color: transparent;
+    border: none;
+    padding: 0px;
+    font-size: 11pt;
+    selection-background-color: {COLOR_ACCENT};
+}}
+
+QPushButton#SendButton {{
+    background-color: {COLOR_ACCENT};
+    border: none;
+    border-radius: 20px;
+    padding: 0px;
+    min-width: 40px;
+    max-width: 40px;
+    min-height: 40px;
+    max-height: 40px;
+}}
+
+QPushButton#SendButton:hover {{
+    background-color: {COLOR_ACCENT_HOVER};
+}}
+
+QPushButton#SendButton:pressed {{
+    background-color: {COLOR_ACCENT_PRESSED};
+}}
+
+QPushButton#SendButton:disabled {{
+    background-color: {COLOR_BORDER};
+}}
+
+/* ==========================================================
    MEMBER PICKER (create group / add members)
 
    Scoped to #MemberList on purpose. The conversation sidebar is
@@ -374,9 +661,26 @@ QScrollBar::handle:vertical:hover {{
     background: {COLOR_TEXT_MUTED};
 }}
 
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 10px;
+    margin: 0px 4px;
+}}
+
+QScrollBar::handle:horizontal {{
+    background: {COLOR_BORDER};
+    border-radius: 5px;
+    min-width: 30px;
+}}
+
+QScrollBar::handle:horizontal:hover {{
+    background: {COLOR_TEXT_MUTED};
+}}
+
 QScrollBar::add-line,
 QScrollBar::sub-line {{
     height: 0px;
+    width: 0px;
 }}
 
 QScrollBar::add-page,

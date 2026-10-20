@@ -96,7 +96,13 @@ def jpeg_file(tmp_path):
 
 
 def _buttons(bubble):
-    return {button.text() for button in bubble.findChildren(QPushButton)}
+    # The hover "Message actions" overflow button is common to every bubble and
+    # is covered by the message-actions tests; everything else must be listed.
+    return {
+        button.text()
+        for button in bubble.findChildren(QPushButton)
+        if button is not getattr(bubble, "actions_button", None)
+    }
 
 
 def test_image_bubble_retains_the_original_bytes(png_file):

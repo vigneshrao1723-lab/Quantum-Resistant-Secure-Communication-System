@@ -13,25 +13,16 @@ tests).
 Run with:
     pytest tests/test_phase19_24_desktop_media_gallery.py -v
 
-KNOWN ENVIRONMENT LIMITATION -- run tests in this file individually,
-not as a whole-file batch, on this project's current Windows dev
-machine: any two tests in this file that BOTH send a real attachment
-through a real _two_windows() ChatWindow pair (i.e. any two of
-test_gallery_lists_a_sent_image_and_a_sent_file/test_gallery_reaches_
-the_real_recipient_too/test_deleted_attachment_is_excluded_from_the_
-gallery/test_media_gallery_dialog_shows_a_clickable_thumbnail_that_
-opens_the_viewer), run one after another in the SAME pytest process,
-reliably hang indefinitely -- confirmed via bisection (every pair
-where only one of the two sends an attachment runs fine; every pair
-where both do hangs). Every test in this file is independently
-correct and passes standalone, reliably and fast (1-2s). This is a
-new manifestation of this project's own documented Qt/Windows GUI
-resource-accumulation class (see this project's own memory notes) --
-specifically involving the real encrypted-attachment/blob-storage
-send path through multiple independent real ChatWindow/server pairs
-in one process, not merely plain widget construction. Not chased
-further per this phase's own "do not get stuck on environmental
-flakiness" testing-strategy guidance -- documented here instead.
+RESOLVED (2026-10-19) -- this file used to hang whenever two of its tests that
+send a real attachment ran in one pytest process. Root cause, found with
+faulthandler: a ChatWindow kept alive by an earlier test (``_KEEP_ALIVE``) was
+still receiving that test's in-flight attachment on the NEXT test's Qt event
+pump, after its session had been disconnected by fixture teardown;
+``mark_conversation_read()`` then failed and ChatWindow.show_error() opened a
+modal QMessageBox.critical that nothing in a headless run can dismiss. Not an
+application defect -- test-harness hygiene. tests/conftest.py's autouse
+``_retire_chat_windows_of_finished_test`` fixture now stops finished-test
+windows from raising modals; all tests in this file run together.
 """
 
 import os

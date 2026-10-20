@@ -375,3 +375,171 @@ unavailable-hardware limitation.
 **Net effect on the matrix**: none of the above changes any row's
 Status. Tally remains 36 PASS, 4 PARTIAL, 0 NOT IMPLEMENTED, 0
 fabricated evidence.
+
+## Reconfirmation — 2026-10-19 (final engineering window)
+
+Every row above was re-checked against the current working tree by running
+the project's own regression batches (`scripts/run_regression_batches.py`'s
+batch definitions) against the real server, the real PostgreSQL database and a
+real Chrome (Playwright), and by a live run of the actual launcher (`run.py`).
+Nothing was mocked at a security boundary. Evidence is limited to what ran:
+
+**Environment.** Python 3.12.10 in a clean virtualenv built from
+`requirements.txt`'s pins (PySide6 6.9.1, Kivy 2.3.1, pytest 8.4.2, Playwright
+1.62.0, quickjs 1.19.4), PostgreSQL 17 (Alembic head `d3f7b9c2e5a1`, no
+migration run), Windows 11. The README's documented interpreter is 3.12; the
+machine's default Python 3.14 with PySide6 6.12 is *not* a supported
+combination (two batches exited `0xC0000409` at interpreter shutdown after every
+test had passed, and Kivy/quickjs were absent) and was not used for acceptance.
+
+| Batch | Files | Passed | Failed | Skipped | Exit |
+|---|---|---|---|---|---|
+| crypto_unit | 22 | 381 | 0 | 0 | 0 |
+| device_security | 27 | 253 | 0 | 0 | 0 |
+| messaging_groups_a | 22 | 302 | 0 | 0 | 0 |
+| messaging_groups_b1 | 11 | 177 | 0 | 0 | 0 |
+| messaging_groups_b2 | 11 | 194 | 0 | 0 | 0 |
+| mobile | 20 | 104 | 0 | 0 | 0 |
+| desktop_gui | 16 | 177 | 0 | 0 | 0 |
+| desktop_gui_lifecycle_a | 8 | 107 | 0 | 0 | 0 |
+| desktop_gui_lifecycle_b1 | 5 | 36 | 0 | 0 | 0 |
+| desktop_gui_lifecycle_b2 | 7 | 43 | 0 | 0 | 0 |
+| web | 7 | 66 | 0 | 0 | 0 |
+| **Total** | **156** | **1840** | **0** | **0** | |
+
+Four test files (`test_epoch_reservation_request_response.py`,
+`test_phase19_23_ux_fixes.py`, `test_phase19_24_desktop_media_gallery.py`,
+`test_phase19_24_typing_indicator.py`) were in no batch and so never ran under
+the documented procedure; they are now included.
+
+**Defects found and fixed this pass** (none in a security control):
+
+- *Test-harness hang (root cause of the long-documented "Desktop GUI batch
+  hangs").* A ChatWindow kept alive by an earlier test received a late
+  message/error after its session was torn down, and `ChatWindow.show_error()`
+  opened a modal `QMessageBox` that nothing headless can dismiss. Fixed with an
+  autouse fixture in `tests/conftest.py` that retires finished-test windows,
+  and `test_phase19_24_desktop_block.py` now asserts the "User is offline"
+  report itself (and that it never reveals the block). `desktop_gui_lifecycle_b2`
+  went from a 900s timeout to 35s; the media-gallery file, documented as
+  unrunnable as a whole, now passes 6/6.
+- *Desktop message bubbles:* the footer painted an opaque band (white-on-white
+  timestamp/read tick on sent bubbles) and the last text line of a wrapped
+  message collided with it, because the hidden "message actions" button changed
+  the footer height after the row was measured. Fixed in `gui/message_widget.py`.
+- *Web contrast:* placeholder text (2.9–3.3:1), sent-bubble timestamps
+  (3.7:1) and white-on-accent text in dark mode (3.5:1) raised to >= 4.5:1 via
+  design tokens only.
+
+**Web batch stability.** The 7-file web batch passed 66/66 on three full runs
+(the last two with the machine held awake). Two further
+full runs failed 2/66 and 1/66 (different tests each time, all at the shared
+"peer public key received" wait), and the same test failed identically on an
+unmodified export of HEAD run under the same conditions, so the failures are
+not attributable to this pass's changes. The failed tests passed when rerun
+in isolation (two of them 3/3). The laptop (on battery, 10-minute idle sleep) was observed to
+sleep and resume several times mid-run -- one earlier web run stalled for 25
+minutes across such events -- so this is recorded as an environmental timing
+sensitivity that was mitigated (system held awake), not proven fixed.
+
+**Live stack.** `run.py` started the TLS server (:5000), web gateway (:8765),
+static web client (:8000) and the Desktop app; the Desktop window was
+responsive; a real Desktop `ClientSession` and a real Chrome session
+authenticated, verified each other's identity, established an ML-KEM session
+key and exchanged messages in both directions with no console or page errors.
+
+**Android.** A debug APK was rebuilt from the current source (sanitized copy:
+no `.env`, `.git` or private keys; patched python-for-android checkout as used
+by the earlier builds): `org.qrscs.qrscs_mobile` 0.1.0 (versionCode 1024100),
+minSdk 24, targetSdk 36, arm64-v8a, permissions INTERNET/RECORD_AUDIO/CAMERA,
+29,544,821 bytes, SHA-256
+`8bb5bb9c42cedbac926b689c9ab6fe206ebba9b94136c455c1764fb4047597b1`. The package
+contains no `.env`/key material and only the public `certs/dev/ca.crt`. **No
+Android device or emulator was attached** (`adb devices -l` empty), so nothing
+about this build was installed or run; the 104 `mobile` software tests above
+are the only evidence for it, and rows 13, 14, 37 and 38 keep their PARTIAL
+status.
+
+**Net effect on the matrix:** none. Tally remains 36 PASS, 4 PARTIAL
+(13/14/37/38, Android voice/video physical validation), 0 NOT IMPLEMENTED.
+
+## Reconfirmation — 2026-10-20 (security hygiene, parity and stability pass)
+
+No row's status above changes: tally remains **36 PASS, 4 PARTIAL** (13, 14, 37,
+38 — Android voice/video, still unvalidated on a physical device, which is
+deferred), 0 NOT IMPLEMENTED. This section records what changed in the
+security posture of the project and the evidence for it. No secret value
+appears in this document, in any log it cites, or in the release archive.
+
+### Security changes made
+
+| Area | Before | Now | Evidence |
+|---|---|---|---|
+| Database login | The server connected as the `postgres` superuser | Runtime role `qrscs_app`: login only; no superuser, createdb, createrole, replication or row-security bypass; SELECT/INSERT/UPDATE/DELETE on the application tables and sequence use only; no DDL, no TRUNCATE, no access to `alembic_version`, cannot create roles, run `ALTER SYSTEM`, `COPY ... PROGRAM` or create databases | `scripts/setup_database_roles.py` (idempotent, verifies as the new roles, prints pass/fail only); **`tests/test_database_least_privilege.py` (5 tests, run on every regression)**; every DB-backed batch passes running as `qrscs_app` |
+| Migrations | Same superuser | Separate role `qrscs_migrator` owns the database and schema objects; Alembic uses `MIGRATION_DATABASE_URL` when set; default privileges grant future tables to `qrscs_app` automatically | `alembic current` through the migrator = head `d3f7b9c2e5a1`; no migration was run |
+| Default login | `config_server.py` fell back to a built-in superuser URL if `DATABASE_URL` was unset | No default: a missing `DATABASE_URL` stops the server with an explicit message | `config_server.py`, `database/connection.py` |
+| Administrator credential | In the project `.env` (archived with the project) | Moved to `~/.qrscs/admin.env` (outside the repository, owner-only ACL), used only by the setup script | script output; `.env` holds only the two role URLs |
+| Obsolete secrets | Two WSL `.env` copies held a database password and JWT secret that no longer work | Secret values replaced by placeholders in both; non-secret settings kept (two expiry settings that my first pass overwrote were restored to the documented defaults 15 / 7) | audit compared hashes without printing values: both differed from the active ones before the change; neither contains a secret now |
+| Source archive | Hand-zipping the folder included `.env` and private keys | `scripts/package_release.py` archives only what Git considers part of the project, refuses secret-shaped names regardless, then validates the finished archive: forbidden names, private-key blocks / cloud keys / JWT-shaped tokens / credentialed database URLs, and **none of this machine's live secret values anywhere**; failure deletes the archive | **`tests/test_release_packaging.py` (23 tests, run on every regression)**; real archive of the final tree: 364 files, 0 env/key/cert/log entries |
+| TLS socket teardown | `web/gateway/gateway.py` and `ClientSession.disconnect()` closed a TLS socket while another thread could still be inside `ssl.read` (a use-after-free) | shutdown, wait for the reader/in-flight send to leave, then close (bounded waits) | a loop that crashed the interpreter with a native access violation at its 5th run completed 14 + 30 runs clean afterwards (see limitations: a crash of the same class still occurred once in a test-server thread) |
+
+### Regression evidence (official runner, Python 3.12 venv, real PostgreSQL and Chrome)
+
+| Batch | Passed | Failed | Skipped |
+|---|---|---|---|
+| crypto_unit | 409 | 0 | 0 |
+| device_security | 253 | 0 | 0 |
+| messaging_groups_a | 302 | 0 | 0 |
+| messaging_groups_b1 | 177 | 0 | 0 |
+| messaging_groups_b2 | 194 | 0 | 0 |
+| mobile | 104 | 0 | 0 |
+| desktop_gui | 197 | 0 | 0 |
+| desktop_gui_lifecycle_a | 107 | 0 | 0 |
+| desktop_gui_lifecycle_b1 | 36 | 0 | 0 |
+| desktop_gui_lifecycle_b2 | 43 | 0 | 0 |
+| web_a | 39 | 0 | 0 |
+| web_b | 58 | 0 | 0 |
+| **Total** | **1919** | **0** | **0** |
+
+The Web batch was split into `web_a` (6 files) and `web_b` (3 files); together
+they cover all 9 Web test files exactly once (checked programmatically: no
+omission, no duplicate, nothing unbatched). No test was removed, skipped or
+weakened. One earlier-in-session figure is superseded: the previous single
+`web` batch had 91 tests before the 6 registration tests were added.
+
+Interruptions, recorded separately from application failures: the first full run
+of this pass lost its Web batch and stalled for ~10 hours when the laptop
+(on battery, 10-minute idle sleep) slept — a session token expired inside
+`test_attachment_from_a_previous_session_still_decrypts`; the batch passed when
+rerun with the machine held awake. In the final run `device_security` was killed
+by a native `Windows fatal exception: access violation` inside `ssl.read` (the
+documented crash class; no test failed, the process died, the runner reported no
+counts) and passed 3/3 on immediate rerun (253 each).
+
+### Remaining known limitations
+
+1. **Intermittent Web timing failures in long single-process runs — UNRESOLVED.**
+   Across 11 full Web-batch runs of this pass's code, 6 passed and 5 had 1–3
+   failures; after the login-race fix below, 4 of 5 passed (the failing run had
+   3 failures: a null WebSocket, a 'disconnected' status and a wait for a draft
+   to save). Every failure was at a connection step shared by many tests, and
+   the same shape occurred on the one run of an unmodified export of HEAD.
+   Fixed with evidence: a login click lost when it landed before `main.js`
+   attached its handlers (2 of 30 page loads before, 0 of 30 after), and the TLS
+   teardown ordering above. Not reproducible in isolation: 40 of 40 held
+   connections, 30 of 30 setups at 0.4 s or less, and no thread/handle growth
+   across a 97-test run. Mitigation: smaller batches and a held-awake machine;
+   the residual sensitivity is **not fixed**.
+2. **Native `ssl.read` access violation** (documented earlier) can still kill a
+   test process; the test-server harness already quarantines what it can.
+3. The Desktop and Android clients keep every group-key epoch; the **Web client
+   keeps only the newest**, so Web cannot show pre-rotation group history.
+4. **Group pictures** do not exist on any platform (schema + protocol change,
+   not started — see `feature_parity_matrix.md`).
+5. **Android physical validation** (voice/video recording, video playback,
+   install and launch of the rebuilt APK) remains deferred; no Android
+   evidence was gathered in this pass.
+6. `postgresql.conf` still has `listen_addresses = '*'` (pg_hba allows only
+   loopback, so it is not reachable from other hosts); not changed because it
+   needs a service restart.
+7. Profile pictures and bios are not end-to-end encrypted (documented design).

@@ -85,7 +85,7 @@ export class WebClientSession {
     onAttachment, onGroupCreated, onReadReceipt, onHistoryLoaded, onOnlineUsersChanged,
     onInboxUpdated, onMessageDelivered, onMessageQueued,
     onMessageEdited, onMessageDeleted, onReactionUpdated, onTypingIndicator,
-    onMessagePinned, onMessageUnpinned,
+    onMessagePinned, onMessageUnpinned, onGroupLeft,
     reconnectBaseDelayMs, reconnectMaxDelayMs, reconnectMaxAttempts,
   }) {
     this.gatewayUrl = gatewayUrl;
@@ -97,6 +97,7 @@ export class WebClientSession {
     // Phase 18 -- Web UX + Feature Completion.
     this.onAttachment = onAttachment || (() => {}); // (identityKey, sender, payloadType, bytes, contentMetadata)
     this.onGroupCreated = onGroupCreated || (() => {}); // (conversationId, name, members)
+    this.onGroupLeft = onGroupLeft || (() => {}); // (conversationId) -- THIS account left (server-confirmed)
     this.onReadReceipt = onReadReceipt || (() => {}); // (conversationId, reader)
     // Phase 19.23 -- Issue 3: server/client_handler.py has sent these
     // live packets since Phase 19.14 (message_delivered) and always
@@ -740,10 +741,24 @@ export class WebClientSession {
       // performed the removal. `members` is the complete, authoritative
       // remaining list -- replaced wholesale, never patched.
       case "group_member_left":
-        if (this.groups.has(packet.conversation_id)) {
+        // One packet, two meanings (mirrors client/session.py::
+        // handle_group_member_left()): if the departed member is THIS
+        // account, the leave it asked for is confirmed; otherwise a
+        // different member left and the remaining list is authoritative.
+        if (packet.username === this.username) {
+          this._handleSelfLeftGroup(packet.conversation_id);
+        } else if (this.groups.has(packet.conversation_id)) {
           this.groups.get(packet.conversation_id).members = packet.members || [];
           this.onGroupCreated(); // reuses the existing "groups changed, re-render" signal
         }
+        break;
+      case "group_members_added":
+        this._handleGroupMembersAdded(packet);
+        break;
+      case "group_key_rotation_required":
+        // Fire-and-forget (async): distributing a key is a real network
+        // operation -- same shape as group_create_result above.
+        this._handleGroupKeyRotationRequired(packet).catch((error) => this.log(`ERROR: ${error.message}`));
         break;
       case "group_create_result":
         // Fire-and-forget (async): distributing the group key on
@@ -1068,14 +1083,18 @@ export class WebClientSession {
     const groupKey = C.randomAesKey();
     const epoch = 1;
     this.sessionKeys.set(conversationId, { key: groupKey, epoch });
+    await this._distributeGroupKey(conversationId, groupKey, epoch, participants);
+  }
 
+  // Fan ONE group key out to `participants` for `epoch` (mirrors
+  // ClientSession._distribute_group_key()): each member gets the key wrapped
+  // for their own verified ML-KEM public key, under a signed canonical
+  // payload. A member with no known identity, or one that is not VERIFIED, is
+  // skipped -- it never stops the others from receiving the key.
+  async _distributeGroupKey(conversationId, groupKey, epoch, participants) {
     for (const member of participants) {
       const peer = this.peers.get(member);
 
-      // Mirrors ClientSession._distribute_group_key()'s own D6 --
-      // Group Key Distribution Robustness: one member with no known
-      // public key, or not yet VERIFIED, is skipped -- it never stops
-      // the OTHER members in the loop from receiving the key.
       if (!peer) {
         this.log(`No observed identity for ${member}; cannot distribute the group key yet.`);
         continue;
@@ -1102,6 +1121,86 @@ export class WebClientSession {
     }
 
     await this._persistState();
+  }
+
+  // The server asked THIS client to distribute a group's next key epoch (after
+  // a member left, was removed or was added). Mirrors ClientSession.
+  // handle_group_key_rotation_required() exactly: reuse a key already held
+  // for this exact epoch rather than minting a second, conflicting one, then
+  // report completion so the server can advance. Only ever acts for a group
+  // this account is currently a member of.
+  async _handleGroupKeyRotationRequired(packet) {
+    const conversationId = packet.conversation_id;
+    const epoch = packet.epoch;
+
+    if (!conversationId || !Number.isInteger(epoch) || !this.groups.has(conversationId)) return;
+
+    const recipients = (packet.members || []).filter((member) => member !== this.username);
+    const existing = this.sessionKeys.get(conversationId);
+    let groupKey;
+
+    if (existing && existing.epoch === epoch) {
+      groupKey = existing.key;
+    } else {
+      groupKey = C.randomAesKey();
+      this.sessionKeys.set(conversationId, { key: groupKey, epoch });
+    }
+
+    await this._distributeGroupKey(conversationId, groupKey, epoch, recipients);
+
+    this.ws.send(JSON.stringify(P.createGroupKeyRotationCompletePacket(conversationId, epoch)));
+    this.log(`Rotated group key for ${conversationId} to epoch ${epoch}.`);
+  }
+
+  // Mirrors ClientSession.handle_group_members_added(): sent to every current
+  // member, old and new alike, so no "am I new here" branch is needed. Key
+  // material for a new member arrives separately, via the rotation above.
+  _handleGroupMembersAdded(packet) {
+    const conversationId = packet.conversation_id;
+    if (!conversationId) return;
+
+    const previous = this.groups.get(conversationId);
+    const members = packet.members || [];
+
+    this.groups.set(conversationId, {
+      name: packet.name || previous?.name || "Group",
+      members,
+      admin: previous?.admin || null,
+    });
+    this.onGroupCreated(conversationId, packet.name, members);
+    this._persistState().catch(() => {});
+  }
+
+  // THIS account's own leave, confirmed by the server -- the only
+  // acknowledgement that ever arrives for it (no optimistic local removal).
+  _handleSelfLeftGroup(conversationId) {
+    this.groups.delete(conversationId);
+    this.sessionKeys.delete(conversationId);
+    this._persistState().catch(() => {});
+    this.onGroupLeft(conversationId);
+    this.onGroupCreated();
+  }
+
+  // Ask the server to add members. A group's admin adds directly; any other
+  // member's request becomes an approval request in the admin's Inbox (decided
+  // server-side -- nothing here can grant more than the server allows).
+  addGroupMembers(conversationId, memberUsernames) {
+    this.ws.send(JSON.stringify(P.createGroupAddMembersPacket(this.username, conversationId, memberUsernames)));
+  }
+
+  leaveGroup(conversationId) {
+    this.ws.send(JSON.stringify(P.createGroupLeavePacket(this.username, conversationId)));
+  }
+
+  async changeBio(bio) {
+    return this._sendRequest(P.createChangeBioRequestPacket(bio));
+  }
+
+  // "" covers both "no bio set" and "no such account" -- the same
+  // account-enumeration guard as fetch_bio() on Desktop/Android.
+  async fetchBio(username) {
+    const response = await this._sendRequest(P.createBioRequestPacket(username));
+    return response.found ? (response.bio || "") : "";
   }
 
   async sendGroupMessage(conversationId, text, replyToMessageId, clientMessageId, contentMetadata = null) {

@@ -1422,3 +1422,30 @@ USB), and picking up from "app already logged in and verified with a
 reachable Desktop peer" -- registration/login/verification do not need
 to be repeated once both sides are back on the same network, since
 QRSCS persists sessions/verified-peer state locally.
+
+## 2026-10-19 -- reproducing the APK build from a clean directory
+
+Rebuilt from the current source in a sanitized copy under WSL (no `.env`, no
+`.git`, no private keys, no tests/server code), not in the Windows working tree:
+`scripts/build_android_apk.sh` swaps `main.py` in place and the working tree is
+CRLF, so the copy's shell scripts must be converted to LF first
+(`sed -i 's/\r$//' scripts/*.sh`). A fresh build directory needs three things
+that an old, already-built one silently has:
+
+1. **The locally patched python-for-android checkout** used by every earlier
+   build (modified `build.py`, `recipe.py` and the argon2-cffi/cryptography/
+   openssl recipes -- see the patch notes above). Copy it to
+   `.buildozer/android/platform/python-for-android` *before* the first build;
+   a fresh `git clone` of the same upstream commit builds Kivy 2.3.1 with errors
+   ("Dependency for ... not resolved: config.pxi").
+2. **`pycparser` and `cffi` in p4a's host Python** (the `hostpython3/.../pip3`
+   under `.buildozer/.../build-arm64-v8a/build/other_builds/hostpython3/`), or the
+   argon2-cffi step fails with "No module named 'pycparser'". Build-time only.
+3. **`~/.cargo/bin` on `PATH`** (rustup + the `aarch64-linux-android` target)
+   for the cryptography recipe.
+
+Result: `org.qrscs.qrscs_mobile` 0.1.0 (versionCode 1024100), arm64-v8a, minSdk
+24 / targetSdk 36, permissions INTERNET, RECORD_AUDIO, CAMERA, 29,544,821 bytes,
+SHA-256 `8bb5bb9c42cedbac926b689c9ab6fe206ebba9b94136c455c1764fb4047597b1`; zip
+integrity OK; no `.env`/key material inside, only the public `certs/dev/ca.crt`.
+It was **not installed or run**: no Android device or emulator was attached.

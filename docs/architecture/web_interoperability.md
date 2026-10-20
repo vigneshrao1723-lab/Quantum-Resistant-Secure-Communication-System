@@ -932,3 +932,44 @@ evidence-backed, documented decision rather than an unexamined default.
   polling/auto-refresh for the device list (a user must click "List
   devices" again to see a state change) -- consistent with this
   client's existing "deliberately plain" design philosophy throughout.
+
+## Messenger layout and Android-parity additions (2026-10-20)
+
+**Layout.** The app shell is a navigation rail, a conversation sidebar and the
+conversation pane (`index.html`, `style.css` "Messenger layout"). The rail holds
+the same elements the sidebar and top bar used to hold, moved rather than
+rewritten (`.tab-btn[data-tab]`, `#settingsToggleBtn`, `#logoutBtn`), and the
+connection status moved into the sidebar header, so every id and selector is
+unchanged. At 800 px and below one pane shows at a time and the rail becomes a
+bottom bar that is hidden while a conversation is open. On a phone, a
+*verified* peer's safety number collapses to one row (the number truncated, the
+three actions as icon buttons, a toggle to expand); an unverified or
+key-changed peer always keeps the full number and labelled actions.
+
+**Login form readiness.** `#connectBtn` and `#toggleModeBtn` start `disabled`
+and are enabled at the very end of `main.js`. `main.js` is an ES module with
+many imports; a click that arrived before its handlers were attached was lost
+silently (measured: 2 of 30 fresh page loads, 0 of 30 after the change).
+
+**New Web capabilities** (same packets and server handlers as Desktop/Android):
+bio (view/edit, peer profile card), leave group, add members to an existing
+group (admin adds directly; anyone else's request goes to the admin's Inbox),
+the `group_members_added` and self-`group_member_left` events, and the group
+key-rotation initiator (`group_key_rotation_required`: reuse the key already
+held for that epoch, distribute it to each VERIFIED member through the same
+KEM-then-DEM wrap as group creation, report completion). The Web client still
+keeps one key per conversation (the newest epoch) — see
+`feature_parity_matrix.md`.
+
+**Composer.** The message fields are auto-growing textareas: Enter sends
+(unless "Press Enter to send" is off), Shift+Enter inserts a line break.
+
+**Sidebar search.** The search box also holds the open chat's username (typing
+a username there opens that chat), so its text filters the lists only while it
+differs from the open chat's name and matches at least one existing
+conversation.
+
+**Teardown.** `web/gateway/gateway.py` now waits for its TCP reader thread and
+any in-flight send before closing the TLS socket (previously it closed it
+underneath them, which could kill the interpreter with a native access
+violation in `ssl.read`); `ClientSession.disconnect()` follows the same order.

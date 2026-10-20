@@ -308,13 +308,19 @@ Copy the template and fill in real local values — **`.env` holds real database
 cp .env.example .env
 ```
 
-At minimum, set `DATABASE_URL` to point at the database you just created, e.g.:
+Set `JWT_SECRET_KEY` to a real random value (see the generation command inside `.env.example`) — the server refuses to start with the built-in development placeholder — and, for the one-time bootstrap below, point `DATABASE_URL` at the database you just created using an administrator login:
 
 ```
-DATABASE_URL=postgresql+psycopg2://<user>:<password>@localhost:5432/qrscs
+DATABASE_URL=postgresql+psycopg2://<admin-user>:<admin-password>@localhost:5432/qrscs
 ```
 
-and set `JWT_SECRET_KEY` to a real random value (see the generation command inside `.env.example`) — the server refuses to start with the built-in development placeholder.
+**The server never runs as a database superuser.** Create the least-privilege roles it runs with:
+
+```bash
+python scripts/setup_database_roles.py
+```
+
+This creates `qrscs_app` (the runtime login: read/write on the application tables, no schema changes, no superuser rights) and `qrscs_migrator` (owns the schema; used only by Alembic), writes their random passwords into `.env` as `DATABASE_URL` and `MIGRATION_DATABASE_URL`, moves the administrator credential out of the project folder to `~/.qrscs/admin.env`, and verifies the restrictions. It is safe to re-run (`--rotate` issues new passwords). There is deliberately no default `DATABASE_URL`: if it is missing the server stops instead of guessing a login.
 
 ### Database schema
 
@@ -324,6 +330,8 @@ Apply the Alembic migrations to the database you just created:
 alembic upgrade head
 ```
 
+Alembic connects with `MIGRATION_DATABASE_URL` (the schema-owning role) when it is set, so the runtime role never needs DDL rights.
+
 ### TLS certificates
 
 Development TLS certificates are generated locally and are **not committed** (`certs/` is gitignored — see `docs/architecture/tls_transport.md`):
@@ -331,6 +339,17 @@ Development TLS certificates are generated locally and are **not committed** (`c
 ```bash
 python scripts/generate_dev_certs.py
 ```
+
+### Packaging a source archive
+
+Do not zip the project folder by hand — `.env` and the private TLS keys live in it. Build the archive with:
+
+```bash
+python scripts/package_release.py          # -> dist/qrscs-source-YYYYMMDD.zip
+python scripts/package_release.py --verify some.zip
+```
+
+It archives only what Git considers part of the project (so everything in `.gitignore` is left out), refuses secret-shaped files regardless, and then validates the finished archive: no `.env`/key/database files, no private-key blocks, tokens or credentials in any file, and none of this machine's own secret values anywhere. A failed check deletes the archive and exits non-zero.
 
 ---
 

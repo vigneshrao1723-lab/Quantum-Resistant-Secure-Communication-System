@@ -10,7 +10,7 @@ import mimetypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QBuffer, QByteArray, QIODevice, QSize, QUrl
+from PySide6.QtCore import Qt, QBuffer, QByteArray, QEvent, QIODevice, QObject, QSize, QUrl
 from PySide6.QtGui import QImageReader, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -143,27 +143,67 @@ def _create_message_actions_button(bubble):
     button = QPushButton("⋯")
     button.setAccessibleName("Message actions")
     button.setToolTip("Message actions")
-    button.setFixedSize(28, 24)
+    button.setFixedSize(28, 20)
+    # Shown only once the server has assigned the message an id (see
+    # refresh_actions_button()), which is after the list row was already
+    # measured. Reserve its space while hidden so showing it later cannot
+    # grow the footer into the message text above it.
+    size_policy = button.sizePolicy()
+    size_policy.setRetainSizeWhenHidden(True)
+    button.setSizePolicy(size_policy)
     button.setCursor(Qt.PointingHandCursor)
-    button.setStyleSheet(
-        f"background: transparent; color: {bubble._content_meta_color}; "
-        "border: none; border-radius: 8px; padding: 0; font-size: 15pt; "
-        "font-weight: 700;"
-    )
+    button.setStyleSheet(_actions_button_style(bubble._content_meta_color))
     button.setVisible(False)
     button.clicked.connect(lambda: _show_message_action_menu(bubble, button))
+
+    # Quiet until needed: the glyph shows while the pointer is over the bubble
+    # or the button has keyboard focus (its space is reserved either way).
+    bubble._hover_reveal = _HoverReveal(button)
+    bubble.installEventFilter(bubble._hover_reveal)
     return button
+
+
+def _actions_button_style(color):
+    return (
+        "QPushButton { background: transparent; color: transparent; border: none; "
+        "border-radius: 8px; padding: 0; font-size: 15pt; font-weight: 700; } "
+        f'QPushButton[revealed="true"], QPushButton:hover, QPushButton:focus {{ color: {color}; }}'
+    )
+
+
+class _HoverReveal(QObject):
+    """Event filter that flags a bubble's actions button as revealed while the
+    pointer is over the bubble (see _actions_button_style())."""
+
+    def __init__(self, button):
+        super().__init__(button)
+        self._button = button
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Enter, QEvent.Leave):
+            self._button.setProperty("revealed", event.type() == QEvent.Enter)
+            style = self._button.style()
+            style.unpolish(self._button)
+            style.polish(self._button)
+        return False
 
 
 def _message_footer(bubble, time_label):
     footer = QWidget()
+    # Without this the footer falls through to the application-wide
+    # ``QWidget { background-color }`` rule and paints an opaque band over
+    # the bubble -- the white-on-white timestamp/read tick on a sent
+    # bubble, and the last text line cut off on a received one. Scoped by
+    # object name so it never cascades onto the labels/button inside it.
+    footer.setObjectName("MessageFooter")
+    footer.setStyleSheet("#MessageFooter { background: transparent; }")
     layout = QHBoxLayout(footer)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
-    layout.addWidget(time_label)
-    layout.addStretch()
     bubble.actions_button = _create_message_actions_button(bubble)
     layout.addWidget(bubble.actions_button)
+    layout.addStretch()
+    layout.addWidget(time_label)
     return footer
 
 
@@ -181,6 +221,19 @@ def _row_size_hint(widget):
     LIST_ITEM_VERTICAL_MARGIN's docstring in gui/styles.py for the
     visible symptom this caused.
     """
+
+    # A widget's stylesheet font (a bubble's 10.5pt message text, for
+    # instance) only takes effect when the widget is polished, which Qt does
+    # lazily at first show -- after this hint was already measured. Measured
+    # unpolished, a wrapped label is sized with the 9pt default font, so the
+    # row comes out a line-fraction too short and the last text line collides
+    # with the timestamp footer beneath it. Polish first, then measure.
+    widget.ensurePolished()
+    for child in widget.findChildren(QWidget):
+        child.ensurePolished()
+    layout = widget.layout()
+    if layout is not None:
+        layout.invalidate()
 
     hint = widget.sizeHint()
     return QSize(hint.width(), hint.height() + LIST_ITEM_VERTICAL_MARGIN)
@@ -810,11 +863,7 @@ class MessageBubble(QWidget):
         self.time_label.setStyleSheet(
             f"color: {self._content_meta_color}; font-size: 8pt; background: transparent;"
         )
-        self.actions_button.setStyleSheet(
-            f"background: transparent; color: {self._content_meta_color}; "
-            "border: none; border-radius: 8px; padding: 0; font-size: 15pt; "
-            "font-weight: 700;"
-        )
+        self.actions_button.setStyleSheet(_actions_button_style(self._content_meta_color))
 
     def refresh_actions_button(self):
         """Expose message actions only after the server assigns an addressable id."""
@@ -1995,7 +2044,8 @@ class MessageWidget(QListWidget):
         )
 
         self.setStyleSheet(
-            "QListWidget { border: none; background: transparent; }"
+            "QListWidget { border: none; border-radius: 0px; background: transparent; "
+            "padding: 8px 14px; outline: none; }"
         )
 
         self.setSpacing(2)
@@ -2469,8 +2519,8 @@ class MessageWidget(QListWidget):
 
         self.setStyleSheet(
             f"QListWidget {{ background: {background}; "
-            f"border: 1px solid {COLOR_BORDER}; border-radius: 16px; "
-            "padding: 6px; outline: none; }"
+            "border: none; border-radius: 0px; "
+            "padding: 8px 14px; outline: none; }"
         )
 
     # ==========================================================

@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRectF, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QRectF, QTimer, Signal
 from PySide6.QtGui import QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QMessageBox,
     QPushButton,
+    QToolButton,
 )
 
 from client.session import PEER_KEY_STATE_CHANGED, PeerNotVerifiedError
@@ -44,6 +45,7 @@ from gui.message_widget import (
     STATUS_DELIVERED, STATUS_FAILED, MessageWidget, to_local_time,
     MessageBubble, ImageMessageBubble, FileMessageBubble,
 )
+from gui.icons import toolbar_icon
 from gui.input_bar import InputBar
 from gui.status_bar import StatusBarWidget
 from gui.styles import (
@@ -53,6 +55,7 @@ from gui.styles import (
     COLOR_ONLINE,
     COLOR_TEXT_MUTED,
     WALLPAPER_PRESETS,
+    avatar_tone_color,
 )
 from gui.verify_identity_dialog import VerifyIdentityDialog
 from storage.secure_key_store import PEER_STATE_UNVERIFIED, PEER_STATE_VERIFIED
@@ -84,6 +87,34 @@ SECURITY_REJECTION_MESSAGES = {
     "decryption_failure": "it could not be processed safely",
     "other_security_rejection": "it failed a security check",
 }
+
+
+def _style_toolbar_icon_button(button, icon_name, tooltip):
+    """Icon-only header button: vector icon, tooltip, and an accessible name
+    (an icon alone tells a screen reader nothing)."""
+
+    button.setIcon(toolbar_icon(icon_name))
+    button.setIconSize(QSize(18, 18))
+    button.setFixedSize(34, 32)
+    button.setToolTip(tooltip)
+    button.setAccessibleName(tooltip)
+
+
+def _style_rail_button(button, icon_name, tooltip):
+    """Navigation-rail destination: icon only, with a tooltip and an
+    accessible name so the destination is still announced."""
+
+    # A QToolButton in icon-only mode: the label stays the button's real
+    # text() (what a test or assistive tool reads) but only the icon is drawn.
+    button.setText(tooltip)
+    button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    button.setObjectName("RailButton")
+    button.setIcon(toolbar_icon(icon_name))
+    button.setIconSize(QSize(24, 24))
+    button.setFixedSize(48, 46)
+    button.setCursor(Qt.PointingHandCursor)
+    button.setToolTip(tooltip)
+    button.setAccessibleName(tooltip)
 
 
 class ChatWindow(QWidget):
@@ -123,61 +154,68 @@ class ChatWindow(QWidget):
 
         root_layout = QHBoxLayout(self)
 
-        root_layout.setContentsMargins(16, 16, 16, 16)
+        # Three regions edge to edge, like a desktop messenger: navigation
+        # rail | conversation sidebar | conversation pane.
+        root_layout.setContentsMargins(0, 0, 0, 0)
 
-        root_layout.setSpacing(16)
+        root_layout.setSpacing(0)
 
         # -----------------------------
-        # Left Panel
+        # Navigation rail
         # -----------------------------
+        #
+        # Every destination below is a real, already-existing workflow -- the
+        # same button objects (and handlers) the sidebar toolbar used to hold,
+        # restyled as icon buttons. There is deliberately no "Calls" entry:
+        # this application has no calling feature on any platform.
 
-        left_panel = QFrame()
+        nav_rail = QFrame()
 
-        left_panel.setObjectName("Panel")
+        nav_rail.setObjectName("NavRail")
 
-        left_layout = QVBoxLayout(left_panel)
+        nav_rail.setFixedWidth(72)
 
-        left_layout.setContentsMargins(14, 14, 14, 14)
+        rail_layout = QVBoxLayout(nav_rail)
 
-        users_title = QLabel("CHATS")
+        rail_layout.setContentsMargins(12, 14, 12, 14)
 
-        users_title.setObjectName("SectionTitle")
+        rail_layout.setSpacing(10)
 
-        self.find_user_button = QPushButton("Find User")
+        rail_layout.setAlignment(Qt.AlignHCenter)
 
-        self.find_user_button.setCursor(Qt.PointingHandCursor)
+        brand_mark = QLabel("Q")
 
-        self.find_user_button.clicked.connect(
-            self.handle_find_user
+        brand_mark.setObjectName("BrandMark")
+
+        brand_mark.setFixedSize(40, 40)
+
+        brand_mark.setAlignment(Qt.AlignCenter)
+
+        brand_mark.setToolTip("Quantum-Resistant Secure Communication System")
+
+        self.chats_nav_button = QToolButton()
+
+        self.chats_nav_button.setCheckable(True)
+
+        self.chats_nav_button.setChecked(True)
+
+        self.chats_nav_button.clicked.connect(
+            self._handle_chats_nav_clicked
         )
 
-        self.new_group_button = QPushButton("+ Group")
-
-        self.new_group_button.setCursor(Qt.PointingHandCursor)
-
-        self.new_group_button.clicked.connect(
-            self.handle_create_group
-        )
-
-        self.inbox_button = QPushButton("Inbox")
-
-        self.inbox_button.setCursor(Qt.PointingHandCursor)
+        self.inbox_button = QToolButton()
 
         self.inbox_button.clicked.connect(
             self.handle_open_inbox
         )
 
-        self.account_settings_button = QPushButton("Settings")
-
-        self.account_settings_button.setCursor(Qt.PointingHandCursor)
+        self.account_settings_button = QToolButton()
 
         self.account_settings_button.clicked.connect(
             self.handle_open_account_settings
         )
 
-        self.device_management_button = QPushButton("Devices")
-
-        self.device_management_button.setCursor(Qt.PointingHandCursor)
+        self.device_management_button = QToolButton()
 
         self.device_management_button.clicked.connect(
             self.handle_open_device_management
@@ -189,9 +227,7 @@ class ChatWindow(QWidget):
         # self._show_archived, this button only flips that flag.
         self._show_archived = False
 
-        self.archived_toggle_button = QPushButton("Archived")
-
-        self.archived_toggle_button.setCursor(Qt.PointingHandCursor)
+        self.archived_toggle_button = QToolButton()
 
         self.archived_toggle_button.setCheckable(True)
 
@@ -199,33 +235,154 @@ class ChatWindow(QWidget):
             self._handle_archived_toggle
         )
 
+        _style_rail_button(self.chats_nav_button, "chat", "Chats")
+        _style_rail_button(self.archived_toggle_button, "archive", "Archived")
+        _style_rail_button(self.inbox_button, "inbox", "Inbox")
+        _style_rail_button(self.device_management_button, "devices", "Devices")
+        _style_rail_button(self.account_settings_button, "settings", "Settings")
+
+        # Pending-request count on the Inbox entry: hidden at zero.
+        self.inbox_badge = QLabel("", self.inbox_button)
+
+        self.inbox_badge.setObjectName("RailBadge")
+
+        self.inbox_badge.setAlignment(Qt.AlignCenter)
+
+        self.inbox_badge.setFixedHeight(18)
+
+        self.inbox_badge.setMinimumWidth(18)
+
+        self.inbox_badge.move(26, 0)
+
+        self.inbox_badge.setVisible(False)
+
+        self.inbox_badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        rail_layout.addWidget(brand_mark, 0, Qt.AlignHCenter)
+
+        rail_layout.addSpacing(10)
+
+        rail_layout.addWidget(self.chats_nav_button, 0, Qt.AlignHCenter)
+
+        rail_layout.addWidget(self.archived_toggle_button, 0, Qt.AlignHCenter)
+
+        rail_layout.addWidget(self.inbox_button, 0, Qt.AlignHCenter)
+
+        rail_layout.addWidget(self.device_management_button, 0, Qt.AlignHCenter)
+
+        rail_layout.addStretch()
+
+        rail_layout.addWidget(self.account_settings_button, 0, Qt.AlignHCenter)
+
+        # -----------------------------
+        # Conversation sidebar
+        # -----------------------------
+
+        left_panel = QFrame()
+
+        left_panel.setObjectName("Sidebar")
+
+        left_panel.setFixedWidth(340)
+
+        left_layout = QVBoxLayout(left_panel)
+
+        left_layout.setContentsMargins(16, 18, 10, 8)
+
+        left_layout.setSpacing(12)
+
+        self.sidebar_title = QLabel("Chats")
+
+        self.sidebar_title.setObjectName("SidebarTitle")
+
+        self.sidebar_title.setTextFormat(Qt.PlainText)
+
+        self.find_user_button = QPushButton()
+
+        self.find_user_button.clicked.connect(
+            self.handle_find_user
+        )
+
+        self.new_group_button = QPushButton()
+
+        self.new_group_button.clicked.connect(
+            self.handle_create_group
+        )
+
+        _style_toolbar_icon_button(self.find_user_button, "compose", "New chat")
+        _style_toolbar_icon_button(self.new_group_button, "group", "New group")
+
+        for button in (self.find_user_button, self.new_group_button):
+            button.setObjectName("IconButton")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setIconSize(QSize(20, 20))
+
         conversations_header = QHBoxLayout()
 
-        conversations_header.addWidget(users_title)
+        conversations_header.setContentsMargins(0, 0, 6, 0)
+
+        conversations_header.setSpacing(2)
+
+        conversations_header.addWidget(self.sidebar_title)
 
         conversations_header.addStretch()
 
-        conversations_actions = QGridLayout()
-        conversations_actions.setContentsMargins(0, 4, 0, 4)
-        conversations_actions.setHorizontalSpacing(6)
-        conversations_actions.setVerticalSpacing(6)
-        sidebar_actions = (
-            self.find_user_button,
-            self.new_group_button,
-            self.inbox_button,
-            self.account_settings_button,
-            self.device_management_button,
-            self.archived_toggle_button,
+        conversations_header.addWidget(self.find_user_button)
+
+        conversations_header.addWidget(self.new_group_button)
+
+        # Search across the conversations already loaded (names and the
+        # latest-message preview) -- purely local, nothing is sent anywhere.
+        self.conversation_search = QLineEdit()
+
+        self.conversation_search.setObjectName("SidebarSearch")
+
+        self.conversation_search.setPlaceholderText("Search chats")
+
+        self.conversation_search.setClearButtonEnabled(True)
+
+        self.conversation_search.setAccessibleName("Search chats")
+
+        self.conversation_search.addAction(
+            toolbar_icon("search"), QLineEdit.LeadingPosition
         )
-        for index, button in enumerate(sidebar_actions):
-            button.setObjectName("SidebarToolButton")
-            button.setMinimumWidth(0)
-            conversations_actions.addWidget(button, index // 3, index % 3)
+
+        self.conversation_search.textChanged.connect(
+            self._handle_conversation_filter_changed
+        )
+
+        self._conversation_filter_mode = "all"
+
+        self.conversation_filter_button = QPushButton()
+
+        self.conversation_filter_button.setObjectName("IconButton")
+
+        _style_toolbar_icon_button(self.conversation_filter_button, "filter", "Filter chats")
+
+        self.conversation_filter_button.setCursor(Qt.PointingHandCursor)
+
+        self.conversation_filter_button.setIconSize(QSize(20, 20))
+
+        self.conversation_filter_button.clicked.connect(
+            self._show_conversation_filter_menu
+        )
+
+        search_row = QHBoxLayout()
+
+        search_row.setContentsMargins(0, 0, 6, 0)
+
+        search_row.setSpacing(6)
+
+        search_row.addWidget(self.conversation_search, 1)
+
+        search_row.addWidget(self.conversation_filter_button)
 
         self.conversation_list = ConversationListWidget()
 
+        self.conversation_list.setObjectName("ConversationList")
+
         left_layout.addLayout(conversations_header)
-        left_layout.addLayout(conversations_actions)
+
+        left_layout.addLayout(search_row)
 
         left_layout.addWidget(self.conversation_list)
 
@@ -235,7 +392,9 @@ class ChatWindow(QWidget):
 
         right_layout = QVBoxLayout()
 
-        right_layout.setSpacing(12)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        right_layout.setSpacing(0)
 
         # Header: current chat partner (primary) + app title (secondary)
         #
@@ -248,13 +407,13 @@ class ChatWindow(QWidget):
 
         header = QFrame()
 
-        header.setObjectName("Panel")
+        header.setObjectName("ChatHeader")
 
-        header_layout = QVBoxLayout(header)
+        header_layout = QHBoxLayout(header)
 
-        header_layout.setContentsMargins(18, 12, 18, 12)
+        header_layout.setContentsMargins(20, 12, 16, 12)
 
-        header_layout.setSpacing(2)
+        header_layout.setSpacing(10)
 
         app_title = QLabel("Quantum-Resistant Secure Chat")
 
@@ -263,6 +422,8 @@ class ChatWindow(QWidget):
         )
 
         self.add_members_button = QPushButton("Add Members")
+
+        self.add_members_button.setObjectName("HeaderActionButton")
 
         self.add_members_button.setCursor(Qt.PointingHandCursor)
 
@@ -274,6 +435,8 @@ class ChatWindow(QWidget):
 
         self.group_info_button = QPushButton("Group Info")
 
+        self.group_info_button.setObjectName("HeaderActionButton")
+
         self.group_info_button.setCursor(Qt.PointingHandCursor)
 
         self.group_info_button.clicked.connect(
@@ -283,6 +446,8 @@ class ChatWindow(QWidget):
         self.group_info_button.setVisible(False)
 
         self.leave_group_button = QPushButton("Leave Group")
+
+        self.leave_group_button.setObjectName("HeaderDangerButton")
 
         self.leave_group_button.setCursor(Qt.PointingHandCursor)
 
@@ -305,7 +470,7 @@ class ChatWindow(QWidget):
         # back to the same colored-initial placeholder ConversationRow
         # already uses everywhere else in this app for consistency.
         self.header_avatar_label = QLabel()
-        self.header_avatar_label.setFixedSize(32, 32)
+        self.header_avatar_label.setFixedSize(40, 40)
         self.header_avatar_label.setAlignment(Qt.AlignCenter)
         self.header_avatar_label.setTextFormat(Qt.PlainText)
 
@@ -369,6 +534,8 @@ class ChatWindow(QWidget):
 
         self.verify_identity_button = QPushButton("Verify Identity")
 
+        self.verify_identity_button.setObjectName("HeaderActionButton")
+
         self.verify_identity_button.setCursor(Qt.PointingHandCursor)
 
         self.verify_identity_button.clicked.connect(
@@ -394,6 +561,8 @@ class ChatWindow(QWidget):
         # identity has been observed yet at all.
         self.request_verification_button = QPushButton("Request Approval")
 
+        self.request_verification_button.setObjectName("HeaderActionButton")
+
         self.request_verification_button.setCursor(Qt.PointingHandCursor)
 
         self.request_verification_button.clicked.connect(
@@ -403,6 +572,8 @@ class ChatWindow(QWidget):
         self.request_verification_button.setVisible(False)
 
         self.view_profile_button = QPushButton("View Profile")
+
+        self.view_profile_button.setObjectName("HeaderActionButton")
 
         self.view_profile_button.setCursor(Qt.PointingHandCursor)
 
@@ -415,9 +586,11 @@ class ChatWindow(QWidget):
         # Phase 19.24 -- Chat Wallpaper: always visible once a
         # conversation is open (direct or group alike) -- see
         # handle_open_wallpaper_picker()'s own docstring.
-        self.wallpaper_button = QPushButton("\U0001F5BC")
+        self.wallpaper_button = QPushButton()
 
         self.wallpaper_button.setObjectName("IconButton")
+
+        _style_toolbar_icon_button(self.wallpaper_button, "wallpaper", "Chat wallpaper")
 
         self.wallpaper_button.setCursor(Qt.PointingHandCursor)
 
@@ -431,9 +604,11 @@ class ChatWindow(QWidget):
         # (built below, next to messages_panel_layout). Always
         # visible once a conversation is open, same as wallpaper_
         # button -- see handle_toggle_search_bar()'s own docstring.
-        self.search_button = QPushButton("\U0001F50D")
+        self.search_button = QPushButton()
 
         self.search_button.setObjectName("IconButton")
+
+        _style_toolbar_icon_button(self.search_button, "search", "Search in this conversation")
 
         self.search_button.setCursor(Qt.PointingHandCursor)
 
@@ -448,9 +623,11 @@ class ChatWindow(QWidget):
         # pinned_messages_panel()'s own docstring) listing every
         # currently-pinned message in the open conversation, with
         # click-to-navigate.
-        self.pinned_messages_button = QPushButton("\U0001F4CC")
+        self.pinned_messages_button = QPushButton()
 
         self.pinned_messages_button.setObjectName("IconButton")
+
+        _style_toolbar_icon_button(self.pinned_messages_button, "pin", "Pinned messages")
 
         self.pinned_messages_button.setCursor(Qt.PointingHandCursor)
 
@@ -464,9 +641,11 @@ class ChatWindow(QWidget):
         # over already-decrypted, already-rendered image/video/voice/
         # file bubbles -- see handle_open_media_gallery()'s own
         # docstring.
-        self.gallery_button = QPushButton("\U0001F39E")
+        self.gallery_button = QPushButton()
 
         self.gallery_button.setObjectName("IconButton")
+
+        _style_toolbar_icon_button(self.gallery_button, "gallery", "Media gallery")
 
         self.gallery_button.setCursor(Qt.PointingHandCursor)
 
@@ -478,40 +657,45 @@ class ChatWindow(QWidget):
 
         self._current_direct_peer_username = None
 
-        header_top_row = QHBoxLayout()
+        # One compact row: avatar | name + presence | state/actions | tools.
+        header_top_row = header_layout
+
+        header_top_row.setSpacing(10)
 
         header_top_row.addWidget(self.header_avatar_label)
 
-        header_top_row.addWidget(self.chat_partner_label, 1)
+        title_column = QVBoxLayout()
 
+        title_column.setSpacing(0)
+
+        title_column.addWidget(self.chat_partner_label)
+
+        title_column.addWidget(self.presence_label)
+
+        header_top_row.addLayout(title_column, 1)
+
+        header_top_row.addWidget(self.verification_status_label)
+        header_top_row.addWidget(self.verify_identity_button)
+        header_top_row.addWidget(self.request_verification_button)
         header_top_row.addWidget(self.view_profile_button)
+        header_top_row.addWidget(self.add_members_button)
+        header_top_row.addWidget(self.group_info_button)
+        header_top_row.addWidget(self.leave_group_button)
+        header_top_row.addSpacing(6)
+        header_top_row.addWidget(self.search_button)
+        header_top_row.addWidget(self.pinned_messages_button)
+        header_top_row.addWidget(self.gallery_button)
+        header_top_row.addWidget(self.wallpaper_button)
 
-        header_layout.addLayout(header_top_row)
-
-        header_actions_row = QHBoxLayout()
-        header_actions_row.setSpacing(6)
-        header_actions_row.addWidget(self.verification_status_label)
-        header_actions_row.addWidget(self.verify_identity_button)
-        header_actions_row.addWidget(self.request_verification_button)
-        header_actions_row.addStretch()
-        header_actions_row.addWidget(self.search_button)
-        header_actions_row.addWidget(self.pinned_messages_button)
-        header_actions_row.addWidget(self.gallery_button)
-        header_actions_row.addWidget(self.wallpaper_button)
-        header_actions_row.addWidget(self.add_members_button)
-        header_actions_row.addWidget(self.group_info_button)
-        header_actions_row.addWidget(self.leave_group_button)
-        header_layout.addLayout(header_actions_row)
-
-        header_layout.addWidget(self.presence_label)
-
-        header_layout.addWidget(app_title)
+        # The static product subtitle that used to sit under the header is
+        # redundant next to the rail's brand mark; kept as an attribute only.
+        app_title.setVisible(False)
 
         # Messages panel
 
         messages_panel = QFrame()
 
-        messages_panel.setObjectName("Panel")
+        messages_panel.setObjectName("MessagesPane")
 
         messages_panel_layout = QVBoxLayout(messages_panel)
 
@@ -601,7 +785,7 @@ class ChatWindow(QWidget):
         self.composer_status_label.setTextFormat(Qt.PlainText)
 
         self.composer_status_label.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 9pt; font-style: italic;"
+            f"color: {COLOR_TEXT_MUTED}; font-size: 9pt; font-style: italic; padding: 4px 20px 0px 20px;"
         )
 
         self.composer_status_label.setVisible(False)
@@ -614,7 +798,7 @@ class ChatWindow(QWidget):
         self.typing_status_label = QLabel("")
         self.typing_status_label.setTextFormat(Qt.PlainText)
         self.typing_status_label.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 9pt; font-style: italic;"
+            f"color: {COLOR_TEXT_MUTED}; font-size: 9pt; font-style: italic; padding: 4px 20px 0px 20px;"
         )
         self.typing_status_label.setVisible(False)
 
@@ -625,8 +809,9 @@ class ChatWindow(QWidget):
         # cases and _clear_composer_context()). Same visible-only-when-
         # relevant pattern as composer_status_label just above.
         self.composer_context_bar = QWidget()
+        self.composer_context_bar.setObjectName("ComposerContext")
         composer_context_layout = QHBoxLayout(self.composer_context_bar)
-        composer_context_layout.setContentsMargins(0, 0, 0, 0)
+        composer_context_layout.setContentsMargins(20, 8, 12, 8)
         composer_context_layout.setSpacing(8)
 
         self.composer_context_label = QLabel("")
@@ -637,10 +822,14 @@ class ChatWindow(QWidget):
         )
         composer_context_layout.addWidget(self.composer_context_label, stretch=1)
 
-        composer_context_cancel = QPushButton("✕")
-        composer_context_cancel.setFixedSize(24, 24)
+        composer_context_cancel = QPushButton()
+        composer_context_cancel.setObjectName("IconButton")
+        composer_context_cancel.setIcon(toolbar_icon("close"))
+        composer_context_cancel.setIconSize(QSize(16, 16))
+        composer_context_cancel.setFixedSize(28, 28)
         composer_context_cancel.setCursor(Qt.PointingHandCursor)
         composer_context_cancel.setToolTip("Cancel")
+        composer_context_cancel.setAccessibleName("Cancel")
         composer_context_cancel.clicked.connect(self._clear_composer_context)
         composer_context_layout.addWidget(composer_context_cancel)
 
@@ -654,11 +843,13 @@ class ChatWindow(QWidget):
         # rather than juggling two widgets' visibility separately.
         self.chat_content = QWidget()
 
+        self.chat_content.setObjectName("ChatContent")
+
         chat_content_layout = QVBoxLayout(self.chat_content)
 
         chat_content_layout.setContentsMargins(0, 0, 0, 0)
 
-        chat_content_layout.setSpacing(12)
+        chat_content_layout.setSpacing(0)
 
         chat_content_layout.addWidget(messages_panel, stretch=1)
 
@@ -713,9 +904,17 @@ class ChatWindow(QWidget):
 
         right_layout.addWidget(self.status)
 
-        root_layout.addWidget(left_panel, 1)
+        root_layout.addWidget(nav_rail)
 
-        root_layout.addLayout(right_layout, 3)
+        root_layout.addWidget(left_panel)
+
+        main_pane = QFrame()
+
+        main_pane.setObjectName("MainPane")
+
+        main_pane.setLayout(right_layout)
+
+        root_layout.addWidget(main_pane, 1)
 
     # ==========================================================
     # Initialization
@@ -737,6 +936,8 @@ class ChatWindow(QWidget):
         self.status.set_username(
             self.session.get_username()
         )
+
+        QTimer.singleShot(0, self.refresh_inbox_badge)
 
     # ==========================================================
     # Signal Connections
@@ -785,6 +986,11 @@ class ChatWindow(QWidget):
         self.input_bar.message_input.textChanged.connect(
             self._on_composer_text_changed
         )
+
+        # Inbox badge: a new request arriving (or one being answered
+        # elsewhere) means "ask the server again" -- see
+        # ClientSession.inbox_updated's own docstring.
+        self.session.inbox_updated.connect(self.refresh_inbox_badge)
 
     # ==========================================================
     # Backend Callbacks
@@ -976,6 +1182,10 @@ class ChatWindow(QWidget):
             if self.session.is_conversation_archived(s.key) == self._show_archived
         ]
 
+        # Sidebar search and filter: local, presentation-only narrowing of
+        # what was already loaded -- nothing is requested from the server.
+        summaries = [s for s in summaries if self._conversation_matches_filter(s)]
+
         self.conversation_list.render(summaries)
 
         for summary in summaries:
@@ -1014,8 +1224,107 @@ class ChatWindow(QWidget):
         filtered sidebar views render_conversations() shows."""
 
         self._show_archived = checked
+        self.chats_nav_button.setChecked(not checked)
+        self.sidebar_title.setText("Archived" if checked else "Chats")
         self.archived_toggle_button.setText("Back to Chats" if checked else "Archived")
+        self.archived_toggle_button.setToolTip("Back to Chats" if checked else "Archived")
+        self.archived_toggle_button.setAccessibleName("Back to Chats" if checked else "Archived")
         self.render_conversations()
+
+    def _handle_chats_nav_clicked(self):
+        """The Chats rail entry always returns to the main (non-archived)
+        list; clicking it while already there simply stays checked."""
+
+        self.archived_toggle_button.setChecked(False)
+        self.chats_nav_button.setChecked(True)
+
+    # ==========================================================
+    # Sidebar search / filter
+    # ==========================================================
+
+    _FILTER_LABELS = (
+        ("all", "All chats"),
+        ("unread", "Unread"),
+        ("direct", "Direct messages"),
+        ("groups", "Groups"),
+    )
+
+    def _conversation_matches_filter(self, summary):
+        mode = self._conversation_filter_mode
+
+        if mode == "unread" and self.session.get_unread_count(summary.key) <= 0:
+            return False
+
+        if mode == "direct" and summary.is_group:
+            return False
+
+        if mode == "groups" and not summary.is_group:
+            return False
+
+        query = self.conversation_search.text().strip().casefold()
+
+        if not query:
+            return True
+
+        name = summary.group_name if summary.is_group else summary.username
+        preview = summary.latest_message.render() if summary.latest_message else ""
+
+        return query in (name or "").casefold() or query in (preview or "").casefold()
+
+    def _handle_conversation_filter_changed(self, _text=None):
+        self.render_conversations()
+
+    def _show_conversation_filter_menu(self):
+        menu = QMenu(self)
+
+        for mode, label in self._FILTER_LABELS:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(mode == self._conversation_filter_mode)
+            action.setData(mode)
+
+        button = self.conversation_filter_button
+        chosen = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+        if chosen is None:
+            return
+
+        self._conversation_filter_mode = chosen.data()
+        self.conversation_filter_button.setToolTip(
+            "Filter chats" if self._conversation_filter_mode == "all"
+            else f"Filter chats: {chosen.text()}"
+        )
+        self.conversation_filter_button.setIcon(
+            toolbar_icon("filter", color=COLOR_ACCENT)
+            if self._conversation_filter_mode != "all" else toolbar_icon("filter")
+        )
+        self.render_conversations()
+
+    # ==========================================================
+    # Inbox badge
+    # ==========================================================
+
+    def refresh_inbox_badge(self, *_ignored):
+        """Show how many inbox requests are waiting for THIS account's answer
+        (requests it sent itself are not counted). Failure to read the inbox
+        simply leaves the badge as it was."""
+
+        try:
+            notifications = self.session.load_inbox()
+        except Exception:  # noqa: BLE001
+            return
+
+        me = getattr(self.session, "username", None)
+        pending = sum(
+            1 for n in notifications
+            if n.get("status") == "pending" and n.get("requester_username") != me
+        )
+
+        self.inbox_badge.setText(str(pending) if pending < 100 else "99+")
+        self.inbox_badge.setVisible(pending > 0)
+        self.inbox_button.setToolTip(
+            f"Inbox ({pending} waiting)" if pending else "Inbox"
+        )
 
     def _handle_mute_action(self, summary, action):
         """
@@ -1130,6 +1439,9 @@ class ChatWindow(QWidget):
 
         dialog = InboxDialog(self.session, self)
         dialog.exec()
+
+        # Responding inside the dialog changes what is still waiting.
+        self.refresh_inbox_badge()
 
     def handle_open_account_settings(self):
         """
@@ -1799,15 +2111,15 @@ class ChatWindow(QWidget):
                     (pixmap.height() - side) // 2,
                     side, side,
                 )
-                self.header_avatar_label.setPixmap(self._circular_pixmap(square, 32))
+                self.header_avatar_label.setPixmap(self._circular_pixmap(square, 40))
                 self.header_avatar_label.setStyleSheet("")
                 return
 
         initial = display_name[0].upper() if display_name else "?"
         self.header_avatar_label.setText(initial)
         self.header_avatar_label.setStyleSheet(
-            f"background-color: {COLOR_ACCENT}; color: #FFFFFF; "
-            "border-radius: 16px; font-weight: 700;"
+            f"background-color: {avatar_tone_color(display_name)}; color: #FFFFFF; "
+            "border-radius: 20px; font-weight: 700; font-size: 12pt;"
         )
 
     @staticmethod
@@ -2688,7 +3000,7 @@ class ChatWindow(QWidget):
     # Phase 19.24 -- Typing Indicator.
     # ------------------------------------------------------------------
 
-    def _on_composer_text_changed(self, text):
+    def _on_composer_text_changed(self, text=None):
         """
         Debounced typing-indicator sender: arms on the FIRST keystroke
         after being idle (is_typing=True, once, not re-sent on every
@@ -2708,6 +3020,11 @@ class ChatWindow(QWidget):
 
         if conversation_id is None or self.session.current_chat is None:
             return
+
+        if text is None:
+            # The composer is a multi-line QPlainTextEdit whose textChanged
+            # carries no argument.
+            text = self.input_bar.message_input.text()
 
         if not text:
             self._stop_typing_immediately()

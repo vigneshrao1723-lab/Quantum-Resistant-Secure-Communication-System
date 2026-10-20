@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from client.session import PEER_KEY_STATE_CHANGED
-from gui.styles import COLOR_DANGER
+from gui.styles import COLOR_DANGER, COLOR_PANEL_ALT
 from storage.secure_key_store import KeyStoreError, PEER_STATE_VERIFIED
 
 
@@ -63,6 +63,9 @@ class VerifyIdentityDialog(QDialog):
         )
 
         self.setWindowTitle("Verify Identity")
+
+        # Wide enough that the 16 fingerprint groups sit on two even rows.
+        self.setMinimumWidth(470)
 
         self.build_ui()
 
@@ -135,8 +138,16 @@ class VerifyIdentityDialog(QDialog):
         )
         self.fingerprint_label.setTextFormat(Qt.PlainText)
         self.fingerprint_label.setWordWrap(True)
+        # The one thing this dialog asks a person to compare by eye, so it
+        # gets a real fixed-width face (the bare ``monospace`` family does
+        # not resolve to one on Windows, which left it in the UI font) in a
+        # quiet inset panel, and can be selected for copying.
+        self.fingerprint_label.setObjectName("Fingerprint")
+        self.fingerprint_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.fingerprint_label.setStyleSheet(
-            "font-family: monospace; font-size: 13px; font-weight: 700;"
+            '#Fingerprint { font-family: "Cascadia Mono", "Consolas", '
+            '"Courier New", monospace; font-size: 11pt; font-weight: 600; '
+            f"padding: 10px 12px; border-radius: 10px; background: {COLOR_PANEL_ALT}; }}"
         )
         layout.addWidget(self.fingerprint_label)
 

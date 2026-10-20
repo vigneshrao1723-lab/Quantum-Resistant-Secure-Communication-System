@@ -71,6 +71,31 @@ export function createChangeUsernameRequestPacket(newUsername) {
   return { type: "change_username_request", new_username: newUsername };
 }
 
+// Profile bio and group membership -- the same packets utils/protocol.py's
+// create_change_bio_request_packet()/create_bio_request_packet()/
+// create_group_leave_packet()/create_group_add_members_packet()/
+// create_group_key_rotation_complete_packet() build, handled by the same
+// already-existing, already-tested server handlers every other client uses.
+export function createChangeBioRequestPacket(bio) {
+  return { type: "change_bio_request", bio };
+}
+
+export function createBioRequestPacket(username) {
+  return { type: "bio_request", username };
+}
+
+export function createGroupLeavePacket(sender, conversationId) {
+  return { type: "group_leave", sender, conversation_id: conversationId };
+}
+
+export function createGroupAddMembersPacket(sender, conversationId, memberUsernames) {
+  return { type: "group_add_members", sender, conversation_id: conversationId, members: memberUsernames };
+}
+
+export function createGroupKeyRotationCompletePacket(conversationId, epoch) {
+  return { type: "group_key_rotation_complete", conversation_id: conversationId, epoch };
+}
+
 export function createChangePasswordRequestPacket(currentPassword, newPassword, confirmPassword) {
   return {
     type: "change_password_request",

@@ -148,3 +148,41 @@ at the top of every such test file) lets these run on a CI/headless
 machine with no real display attached — the widgets are still fully
 real, constructed, and laid out; only the final pixel presentation is
 skipped.
+
+## 10. Chat window layout (2026-10-20)
+
+`gui/chat_window.py` lays the window out as three regions, edge to edge:
+
+| Region | Widget | Contents |
+|---|---|---|
+| Navigation rail (72 px) | `QFrame#NavRail` | brand mark; Chats, Archived, Inbox (with a pending-request badge), Devices; Settings at the bottom |
+| Conversation sidebar (340 px) | `QFrame#Sidebar` | "Chats" title, New chat / New group, search box, filter menu (All, Unread, Direct, Groups), `ConversationListWidget` |
+| Conversation pane | `QFrame#MainPane` | one-row header (avatar, name, presence, verification state and actions, tools), message list, composer, status bar |
+
+Every control is the same widget object and handler as before the redesign
+(`find_user_button`, `new_group_button`, `inbox_button`,
+`account_settings_button`, `device_management_button`,
+`archived_toggle_button`); only their presentation changed. The rail buttons are
+icon-only `QToolButton`s that keep their label as `text()`. There is no "Calls"
+destination: no platform has a calling feature.
+
+Notes for maintainers:
+
+- **Colours** are the existing palette tokens in `gui/styles.py`; the new
+  `COLOR_SIDEBAR` / `COLOR_ACCENT_SOFT` match the Web client's `--sidebar-bg` /
+  `--accent-soft`, and `avatar_tone_color()` reproduces the Web client's
+  `avatarTone()` so a contact has the same colour on both.
+- **Icons** are drawn by `gui/icons.py` (QPainter strokes, accent on
+  hover/checked) instead of emoji.
+- **A QSS `min-/max-width/height` overrides `setFixedSize()`.** Buttons whose
+  size matters (`RailButton`, `ComposerButton`, `SendButton`) state it in the
+  stylesheet, otherwise a bottom-aligned layout shrinks them to their hint.
+- **Row heights** are measured after `ensurePolished()` (`_row_size_hint()`), and
+  the "message actions" button keeps its space while hidden, so a bubble's
+  footer never grows into its text after the row was measured.
+- **The composer** (`gui/input_bar.py::ComposerTextEdit`) is a `QPlainTextEdit`
+  that keeps the `QLineEdit` surface the rest of the app uses (`text()`,
+  `setText()`, `returnPressed`). Enter sends, Shift+Enter inserts a line break,
+  and it grows to six lines before scrolling.
+- Sidebar search/filter only narrows the already-loaded conversations; nothing
+  is sent to the server.
