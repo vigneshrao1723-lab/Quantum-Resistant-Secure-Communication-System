@@ -9,7 +9,7 @@ Anything not listed as verified is not verified.
 |---|---|---|
 | `master` | Baseline; unchanged by this work | `22a6a73` |
 | `preservation/android-desktop-web-baseline-2026-10-20` | Safety checkpoint of everything before the Desktop/Website completion work, including all Android sources. **Do not delete.** Pushed to `origin`; remote hash verified with `git ls-remote` and by reading the remote tree | `3861769` (`38617690cc7437a789cc7c0252d0d8a151d6fbae`) |
-| `work/desktop-web-completion-2026-10-20` | Active branch for the Desktop executable and Website work | based on `3861769`; **all changes since are uncommitted** |
+| `work/desktop-web-completion-2026-10-20` | Active branch for the Desktop executable and Website work | based on `3861769`; the Phase 19.24 work is **committed and pushed to `origin`** (commit `eb886fd`, 2026-10-22) |
 | `origin/main` | An older, unrelated 10-commit prototype history (RSA-era, 38 files; no common ancestor with `master`). Untouched; nothing merged from it | `a97ceb5` |
 
 Remote: `https://github.com/vigneshrao1723-lab/Quantum-Resistant-Secure-Communication-System`
@@ -21,8 +21,7 @@ Active: Desktop application and its Windows executable, Website, multi-user acce
 preserved and unchanged; no hardware validation done). Phase 20 has not been started.
 
 **Gate:** automated testing is complete and the applications are ready for **manual acceptance**
-(`docs/manual_acceptance_checklist.md`). Nothing has been cleaned up, committed, merged or pushed beyond the preservation branch.
-No manual acceptance has happened.
+(`docs/owner_manual_test_checklist.md`, with `docs/manual_acceptance_checklist.md` as the full reference). The work branch has been committed and pushed (`eb886fd`); nothing has been merged into `master` or `main`, and the preservation branch is unchanged. No manual acceptance has happened.
 
 **For the owner now:** the short ordered checklist with a result sheet is `docs/owner_manual_test_checklist.md`; the test-result values and charts for
 the project report are in `docs/report/` (`test_results_summary.md`, `test_results_values.csv`, `charts/*.png|svg`; regenerate with
@@ -86,7 +85,7 @@ files) and removed 10 of 316 files; it was rebuilt with no Desktop window runnin
 ## Checkpoint 2026-10-22 — owner's manual acceptance round 1 and the fixes made for it
 
 The owner ran the 20-item checklist: **14 PASS, 6 FAIL** (T11, T12, T14, T17, T20; T05's note asked for the Website's picture-editing
-method on the Desktop). Nothing was marked NOT TESTED. Fixes below are uncommitted, like everything else on this branch.
+method on the Desktop). Nothing was marked NOT TESTED. Fixes below were committed with the rest of the branch in `eb886fd`.
 
 | Reported | Cause | Change | Focused evidence |
 |---|---|---|---|
