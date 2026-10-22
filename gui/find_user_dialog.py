@@ -26,7 +26,7 @@ class FindUserDialog(QDialog):
     found anyone.
     """
 
-    def __init__(self, session, parent=None):
+    def __init__(self, session, parent=None, initial_query=""):
         super().__init__(parent)
 
         self.session = session
@@ -35,6 +35,11 @@ class FindUserDialog(QDialog):
         self.setWindowTitle("Find User")
 
         self.build_ui()
+
+        # Started from the sidebar search box: look the number up straight away.
+        if initial_query:
+            self.id_input.setText(initial_query)
+            self.handle_search()
 
     # ==========================================================
     # UI

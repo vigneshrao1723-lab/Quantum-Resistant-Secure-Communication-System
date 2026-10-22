@@ -51,7 +51,7 @@ export function createConversationListRequestPacket() {
   return { type: "conversation_list_request" };
 }
 
-export function createInboxResponsePacket(notificationId, approve) {
+export function createInboxResponsePacket(notificationId, approve, consentInvitations = false) {
   return { type: "inbox_response", notification_id: notificationId, approve };
 }
 
@@ -80,6 +80,21 @@ export function createChangeBioRequestPacket(bio) {
   return { type: "change_bio_request", bio };
 }
 
+// Display names: users.username is the account's unique internal handle (what every packet
+// routes on); the display name is what a person chose and is NOT unique.
+export function createDisplayNamesRequestPacket(usernames) {
+  return { type: "display_names_request", usernames };
+}
+
+export function createChangeDisplayNameRequestPacket(displayName) {
+  return { type: "change_display_name_request", display_name: displayName };
+}
+
+// Look a person up by the phone number they registered with (the server normalises it).
+export function createUserLookupByPhoneRequestPacket(phoneNumber) {
+  return { type: "user_lookup_request", identifier_type: "phone", identifier: phoneNumber };
+}
+
 export function createBioRequestPacket(username) {
   return { type: "bio_request", username };
 }
@@ -88,8 +103,16 @@ export function createGroupLeavePacket(sender, conversationId) {
   return { type: "group_leave", sender, conversation_id: conversationId };
 }
 
-export function createGroupAddMembersPacket(sender, conversationId, memberUsernames) {
-  return { type: "group_add_members", sender, conversation_id: conversationId, members: memberUsernames };
+export function createGroupAddMembersPacket(sender, conversationId, memberUsernames, consentInvitations = false) {
+  const packet = { type: "group_add_members", sender, conversation_id: conversationId, members: memberUsernames };
+  if (consentInvitations) packet.consent_invitations = true;
+  return packet;
+}
+
+// "I am a member of this group but do not hold its current key; please ask a connected member to
+// send it again." Carries no key and no identity -- the server checks membership itself.
+export function createGroupKeyRequestPacket(conversationId) {
+  return { type: "group_key_request", conversation_id: conversationId };
 }
 
 export function createGroupKeyRotationCompletePacket(conversationId, epoch) {
@@ -227,8 +250,12 @@ export function createMessageUnpinPacket(messageId) {
 // Phase 18 -- Web UX + Feature Completion.
 // -------------------------------------------------------------
 
-export function createGroupCreatePacket(sender, name, memberUsernames) {
-  return { type: "group_create", sender, name, members: memberUsernames };
+// `consentInvitations`: the listed people are INVITED -- each gets an Inbox item and becomes a member
+// only by approving it (the group is created with just its creator).
+export function createGroupCreatePacket(sender, name, memberUsernames, consentInvitations = false) {
+  const packet = { type: "group_create", sender, name, members: memberUsernames };
+  if (consentInvitations) packet.consent_invitations = true;
+  return packet;
 }
 
 export function createMessageHistoryRequestPacket(conversationId, isGroup) {

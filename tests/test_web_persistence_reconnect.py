@@ -96,6 +96,7 @@ def test_page_reload_restores_identity_and_trust_state(
         # happy path, condensed.
         assert _wait_for(lambda: alice.key_manager.get_public_key(bob_username) is not None)
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         assert _wait_for(lambda: alice.username in page.inner_text("#fingerprintDisplay"))
         page.click("#confirmVerifiedBtn")
         assert _wait_for(lambda: "marked VERIFIED" in page.inner_text("#log"))
@@ -167,6 +168,7 @@ def test_page_reload_restores_identity_and_trust_state(
         # naturally starts with it empty, exactly like every other form
         # field, and must be re-filled the same way a real user would.
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.fill("#messageText", "Hello again, after reload")
         page.click("#sendBtn")
         assert _wait_for(lambda: received.get("text") == "Hello again, after reload")
@@ -206,6 +208,7 @@ def test_reconnect_after_dropped_websocket_resumes_messaging(
 
         assert _wait_for(lambda: alice.key_manager.get_public_key(bob_username) is not None)
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         assert _wait_for(lambda: alice.username in page.inner_text("#fingerprintDisplay"))
         page.click("#confirmVerifiedBtn")
         assert _wait_for(lambda: "marked VERIFIED" in page.inner_text("#log"))

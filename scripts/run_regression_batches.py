@@ -46,6 +46,7 @@ wait indefinitely on a suspected-hung Windows test process.
 from __future__ import annotations
 
 import argparse
+import re
 import os
 import subprocess
 import sys
@@ -86,6 +87,7 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_client_import_boundary.py",
         "tests/test_release_packaging.py",
         "tests/test_database_least_privilege.py",
+        "tests/test_desktop_exe_build.py",
     ],
     "device_security": [
         "tests/test_device_identity.py",
@@ -114,6 +116,9 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_server_connection_limits.py",
         "tests/test_network_frame_limits.py",
         "tests/test_registration_integration.py",
+        "tests/test_duplicate_display_names.py",
+        "tests/test_reply_reference_integrity.py",
+        "tests/test_profile_picture_validation.py",
         "tests/test_epoch_reservation_request_response.py",
     ],
     # Split 2026-10-04 (final acceptance pass) from a single 44-file
@@ -143,9 +148,13 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_direct_conversation_relay_resolution.py",
         "tests/test_direct_conversation_request_response.py",
         "tests/test_group_messaging_integration.py",
+        "tests/test_message_replay_idempotency.py",
         "tests/test_group_membership_integration.py",
         "tests/test_group_add_members_integration.py",
         "tests/test_group_admin_and_inbox.py",
+        "tests/test_group_key_late_verification.py",
+        "tests/test_group_invitation_flow.py",
+        "tests/test_contact_request_approval_flow.py",
         "tests/test_group_creation_multi_member.py",
         "tests/test_group_device_key_sync.py",
         "tests/test_group_history_reconnect_recovery.py",
@@ -154,6 +163,8 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_group_key_distribution_resilience.py",
         "tests/test_group_key_protocol.py",
         "tests/test_group_re_add_membership.py",
+        "tests/test_group_membership_events.py",
+        "tests/test_group_attachments.py",
     ],
     "messaging_groups_b1": [
         "tests/test_read_receipts_integration.py",
@@ -230,11 +241,27 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_composer_public_key_availability.py",
         "tests/test_date_separators.py",
         "tests/test_image_viewing.py",
+    ],
+    # Split from one 25-file "desktop_gui" batch (2026-10-21): with the Desktop UI-parity tests added
+    # it hit the documented PySide6 resource-accumulation access violation (a native fault at fixture
+    # setup in test_initial_chat_state.py after ~170 Qt tests in one process; every file passes
+    # standalone). Same sanctioned remedy as the earlier splits: halve the file list, not the timeout.
+    "desktop_gui_b": [
         "tests/test_initial_chat_state.py",
         "tests/test_internal_messages_not_shown_as_chat.py",
         "tests/test_phase19_23_ux_fixes.py",
         "tests/test_desktop_chat_layout.py",
         "tests/test_desktop_profile_picture_dialog.py",
+        "tests/test_desktop_message_accessibility.py",
+        "tests/test_desktop_branding.py",
+        "tests/test_desktop_display_names.py",
+        "tests/test_desktop_reply_reactions.py",
+        "tests/test_desktop_chat_settings.py",
+        "tests/test_desktop_website_parity_fixes.py",
+        "tests/test_desktop_group_invitations.py",
+        "tests/test_desktop_theme_and_navigation_parity.py",
+        "tests/test_desktop_group_events.py",
+        "tests/test_desktop_group_attachments_gui.py",
     ],
     # Split further (from a single "desktop_gui_lifecycle" batch) after
     # THAT batch itself started reliably timing out at the 900s hard
@@ -286,6 +313,9 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_web_client_crypto_interop.py",
         "tests/test_web_feature_completion_e2e.py",
         "tests/test_web_gateway_interop.py",
+        "tests/test_web_gateway_first_request.py",
+        "tests/test_web_gateway_teardown.py",
+        "tests/test_web_reconnect_after_outage.py",
         "tests/test_web_persistence_reconnect.py",
         "tests/test_web_settings_and_inbox.py",
     ],
@@ -293,6 +323,22 @@ BATCHES: dict[str, list[str]] = {
         "tests/test_web_phase19_24_lifecycle_ui.py",
         "tests/test_web_messenger_layout_and_parity.py",
         "tests/test_web_registration_and_login_ui.py",
+        "tests/test_own_safety_number.py",
+        "tests/test_web_group_key_history.py",
+    ],
+    # Chat settings menu, voice/video recorder modal and the collapsed gateway setting (real Chrome).
+    "web_c": [
+        "tests/test_web_chat_settings_and_recorder.py",
+        "tests/test_web_group_attachments_and_events.py",
+        "tests/test_web_reply_and_reactions.py",
+        "tests/test_web_group_member_lookup.py",
+        "tests/test_web_late_verification_and_approval.py",
+        "tests/test_web_group_invitations.py",
+    ],
+    # Real voice/video clips decoded by Desktop (Qt) and by Chrome, both directions, plus the
+    # graceful-failure path for media that cannot be decoded.
+    "media_interop": [
+        "tests/test_media_playback_interop.py",
     ],
 }
 
@@ -377,6 +423,25 @@ def run_batch(name: str, files: list[str], timeout_seconds: int) -> tuple[bool, 
         return False, elapsed, f"TIMED OUT after {timeout_seconds}s -- process tree killed, not hung indefinitely"
 
 
+_COUNT = re.compile(r"(\d+) (passed|failed|skipped|error|errors|deselected|xfailed|xpassed)")
+
+
+def _counts(tail: str) -> dict[str, int]:
+    """Test counts from pytest's final summary line (the last line that carries any)."""
+    for line in reversed(tail.splitlines()):
+        found = _COUNT.findall(line)
+        if found:
+            out: dict[str, int] = {}
+            for number, word in found:
+                out[word] = out.get(word, 0) + int(number)
+            return out
+    return {}
+
+
+def _describe(counts: dict[str, int]) -> str:
+    return ", ".join(f"{n} {word}" for word, n in counts.items()) or "no summary found"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", help="Run only this named batch")
@@ -401,18 +466,23 @@ def main() -> int:
         ok, elapsed, tail = run_batch(name, files, args.timeout_seconds)
         results.append((name, ok, elapsed, tail))
         status = "PASS" if ok else "FAIL"
-        print(f"[{status}] {name} in {elapsed:.1f}s")
+        print(f"[{status}] {name} in {elapsed:.1f}s -- {_describe(_counts(tail))}")
         if not ok:
             print(tail)
 
     print("\n=== Summary ===")
     overall_ok = True
-    for name, ok, elapsed, _tail in results:
+    totals: dict[str, int] = {}
+    for name, ok, elapsed, tail in results:
         status = "PASS" if ok else "FAIL"
-        print(f"  {status:4s}  {name:20s}  {elapsed:7.1f}s")
+        counts = _counts(tail)
+        for word, n in counts.items():
+            totals[word] = totals.get(word, 0) + n
+        print(f"  {status:4s}  {name:26s}  {elapsed:7.1f}s  {_describe(counts)}")
         overall_ok = overall_ok and ok
 
-    print(f"\nOverall: {'PASS' if overall_ok else 'FAIL'}")
+    print(f"\nTotal: {_describe(totals)}")
+    print(f"Overall: {'PASS' if overall_ok else 'FAIL'}")
     return 0 if overall_ok else 1
 
 

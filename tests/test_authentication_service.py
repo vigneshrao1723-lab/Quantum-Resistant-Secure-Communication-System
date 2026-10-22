@@ -80,17 +80,27 @@ def test_register_user_success(auth_service, registration_payload):
     assert result.errors is None
 
 
-def test_register_user_duplicate_username(
+def test_register_user_with_a_name_already_in_use_gets_its_own_handle(
     auth_service, registration_payload, unique_suffix
 ):
-    _register(auth_service, registration_payload)
+    """Requirement 2 (2026-10-21): display names are not unique. A second person choosing the
+    same name registers successfully under a different internal handle; the first account is
+    untouched. (Before, this registration was refused with a "username" error.)"""
+    first = _register(auth_service, registration_payload)
 
     dup_payload = dict(registration_payload)
     dup_payload["email"] = f"different_{unique_suffix}@example.com"
-    result = _register(auth_service, dup_payload)
+    dup_payload["phone_number"] = "+91" + str(uuid.uuid4().int % 10**10).zfill(10)
+    second = _register(auth_service, dup_payload)
 
-    assert result.success is False
-    assert "username" in result.errors
+    assert first.success is True and second.success is True
+    assert first.user_id != second.user_id
+    repo = auth_service.user_repo
+    original, newcomer = repo.get_by_id(first.user_id), repo.get_by_id(second.user_id)
+    assert original.username == registration_payload["username"]
+    assert newcomer.username != original.username
+    assert newcomer.username.startswith(registration_payload["username"][:25])
+    assert newcomer.display_name == original.display_name == registration_payload["full_name"]
 
 
 def test_register_user_duplicate_email(
@@ -100,10 +110,30 @@ def test_register_user_duplicate_email(
 
     dup_payload = dict(registration_payload)
     dup_payload["username"] = f"different_{unique_suffix}"
+    # A different phone number, so this exercises the duplicate e-MAIL rule on its own (a
+    # duplicate phone number now returns its own single message first -- Requirement 1).
+    dup_payload["phone_number"] = "+91" + str(uuid.uuid4().int % 10**10).zfill(10)
     result = _register(auth_service, dup_payload)
 
     assert result.success is False
     assert "email" in result.errors
+
+
+def test_register_user_with_an_existing_phone_number_gets_one_plain_message(
+    auth_service, registration_payload, unique_suffix
+):
+    """Requirement 1: one sentence the person can act on, not a chain of field errors."""
+    from auth.authentication_service import ACCOUNT_EXISTS_MESSAGE
+
+    _register(auth_service, registration_payload)
+    again = dict(registration_payload)
+    again["username"] = f"someone_else_{unique_suffix}"
+    again["email"] = f"someone_else_{unique_suffix}@example.com"
+    result = _register(auth_service, again)
+
+    assert result.success is False
+    assert result.message == ACCOUNT_EXISTS_MESSAGE
+    assert result.errors == {"phone_number": ACCOUNT_EXISTS_MESSAGE}
 
 
 def test_register_user_password_policy_violation(auth_service, registration_payload):

@@ -22,12 +22,24 @@ client genuinely credential-free.
 
 import hashlib
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-ROOT_DIR = Path(__file__).resolve().parent
-load_dotenv(ROOT_DIR / ".env")
+# Packaged (PyInstaller) builds: bundled read-only resources such as the
+# gui/ images and the public CA certificate are unpacked next to the
+# interpreter (sys._MEIPASS), while the operator-editable ``.env`` sits
+# beside the executable. From source both are the project root, exactly as
+# before.
+FROZEN = bool(getattr(sys, "frozen", False))
+ROOT_DIR = (
+    Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    if FROZEN
+    else Path(__file__).resolve().parent
+)
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else ROOT_DIR
+load_dotenv(APP_DIR / ".env")
 
 # ---------------------------------------------------------------
 # Network Configuration

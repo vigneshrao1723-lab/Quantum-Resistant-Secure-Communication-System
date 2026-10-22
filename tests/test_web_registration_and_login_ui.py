@@ -19,6 +19,7 @@ from tests.test_web_browser_e2e import (  # noqa: F401 -- fixtures reused, not r
     browser_page,
     gateway_url,
     running_server,
+    set_gateway,
     static_url,
 )
 
@@ -53,7 +54,7 @@ def _new_identity():
 
 
 def _open_register_form(page, gateway_url):
-    page.fill("#gatewayUrl", gateway_url)
+    set_gateway(page, gateway_url)
     page.click("#toggleModeBtn")
     assert page.is_visible("#regUsername")
     assert page.is_visible("#regConfirmPassword")
@@ -128,28 +129,56 @@ def test_registration_rejects_a_weak_password_and_creates_nothing(running_server
         _purge(identity["username"])
 
 
-def test_registering_an_existing_username_is_refused_and_keeps_the_original_account(
+def test_registering_a_name_someone_already_uses_creates_a_separate_account_and_keeps_the_original(
     running_server, gateway_url, browser_page
 ):
+    # Names are not unique (the phone number is): the new person keeps the name they chose as
+    # their display name and gets their own account handle; the original account is untouched.
     page = browser_page["page"]
     existing = _register("dupe_")  # a real, already-registered account
+    new_phone = f"+91{uuid.uuid4().int % 10**12:012d}"
+    created = None
     try:
         _open_register_form(page, gateway_url)
-        _fill_register(page, existing["username"], f"+91{uuid.uuid4().int % 10**12:012d}", PASSWORD, PASSWORD)
+        _fill_register(page, existing["username"], new_phone, PASSWORD, PASSWORD)
+        page.click("#connectBtn")
+
+        assert _wait_for(lambda: "Account created" in _status(page), attempts=200, interval=0.1)
+
+        db = SessionLocal()
+        try:
+            repo = UserRepository(db)
+            original = repo.get_by_username(existing["username"])
+            created = repo.get_by_phone_number(new_phone)
+            assert original is not None and created is not None
+            assert created.id != original.id
+            assert created.username != original.username
+            assert created.display_name == existing["username"]
+            assert original.phone_number == existing["phone_number"]
+            created = created.username
+        finally:
+            db.close()
+    finally:
+        _purge(existing["username"])
+        if created:
+            _purge(created)
+
+
+def test_registering_an_existing_phone_number_says_so_in_one_sentence(running_server, gateway_url, browser_page):
+    page = browser_page["page"]
+    existing = _register("phone_")
+    identity = _new_identity()
+    try:
+        _open_register_form(page, gateway_url)
+        _fill_register(page, identity["username"], existing["phone_number"], PASSWORD, PASSWORD)
         page.click("#connectBtn")
 
         assert _wait_for(lambda: "is-error" in page.get_attribute("#authStatus", "class"), attempts=200, interval=0.1)
-        assert "Account created" not in _status(page)
-
-        # The original account is untouched: its own phone number + password still log in.
-        db = SessionLocal()
-        try:
-            users = [u for u in [UserRepository(db).get_by_username(existing["username"])] if u]
-        finally:
-            db.close()
-        assert len(users) == 1
+        assert _status(page) == "An account with this phone number already exists. Please log in."
+        assert _user(identity["username"]) is None
     finally:
         _purge(existing["username"])
+        _purge(identity["username"])
 
 
 def test_the_form_toggles_between_login_and_register_and_clears_the_status(running_server, gateway_url, browser_page):
@@ -173,7 +202,7 @@ def test_login_with_an_unreachable_gateway_shows_an_error_and_stays_on_the_login
     running_server, gateway_url, browser_page
 ):
     page = browser_page["page"]
-    page.fill("#gatewayUrl", "ws://127.0.0.1:1")  # nothing listens on port 1
+    set_gateway(page, "ws://127.0.0.1:1")  # nothing listens on port 1
     page.fill("#phoneNumber", "+910000000000")
     page.fill("#password", PASSWORD)
     page.click("#connectBtn")

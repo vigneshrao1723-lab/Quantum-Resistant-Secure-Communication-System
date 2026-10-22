@@ -129,7 +129,8 @@ def test_blocked_users_dialog_lists_and_unblocks(tmp_path, connect, accounts):
     row_widget = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
 
     labels = [c for c in row_widget.children() if isinstance(c, QLabel)]
-    assert any(label.text() == bob_username for label in labels)
+    # Shown by display name with the account handle beside it (names are not unique).
+    assert any(bob_username in label.text() for label in labels)
 
     # Real click on the real Unblock button embedded in the row.
     buttons = [c for c in row_widget.children() if isinstance(c, QPushButton)]

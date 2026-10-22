@@ -369,6 +369,24 @@ python main.py
 
 Multiple client instances can be run concurrently against the same server for multi-user testing.
 
+### Windows Desktop executable
+
+Build the Desktop client into a one-folder Windows application (inside the project's Python 3.12 virtual environment, with `requirements-dev.txt` installed):
+
+```bash
+python scripts/build_desktop_exe.py
+```
+
+The result is `dist/desktop/QRSCS-Desktop/QRSCS-Desktop.exe`; distribute the whole `QRSCS-Desktop` folder. It contains only the client: no `.env`, no private keys, no database or server code. The public CA certificate it trusts is bundled (`--ca-cert PATH` selects another one). To point it at a different server, copy the generated `.env.example` in that folder to `.env` next to the executable and set `SERVER_HOST` / `SERVER_PORT` (the host must appear in the server certificate's subject alternative names). Per-user keys and logs are stored under `%LOCALAPPDATA%\QuantumResistantSecureComms`. The build script validates its own output and fails (removing it) if it finds a secret-like file or a configured live secret value.
+
+### Acceptance tests (separate from the regression batches)
+
+`tests/acceptance/` drives the **built executable** and the **Website in Chrome** through their real user interfaces against an isolated PostgreSQL database (`qrscs_accept`, created by `scripts/acceptance_db.py`, least-privilege roles). Build the executable first, then:
+
+```bash
+python -m pytest tests/acceptance -p no:cacheprovider
+```
+
 ### Android
 
 Building the Android APK requires WSL2 (Buildozer/python-for-android have no native Windows target). From inside an already-provisioned WSL2 environment (see `docs/architecture/mobile_client.md`'s "Phase 19.7" section for the one-time SDK/NDK/JDK setup):
@@ -406,7 +424,7 @@ No further slice beyond D8 is currently defined in project documentation; the or
 
 ## Project Status
 
-The D-series work through D8 (see [Current Implementation Status](#current-implementation-status)) plus subsequent origin-authentication hardening is committed on the local `master` branch; `master` is currently ahead of `origin/master` (not yet pushed). This section does not claim the project is production- or deployment-ready — see [Future Work](#future-work) for known gaps.
+The current engineering state — branches, what has been verified and how, open items and next actions — is kept in [`PROJECT_STATE.md`](PROJECT_STATE.md); the per-feature, per-platform audit is [`docs/architecture/feature_parity_matrix.md`](docs/architecture/feature_parity_matrix.md), and the multi-user acceptance suite is described in [`docs/architecture/acceptance_testing.md`](docs/architecture/acceptance_testing.md). This section does not claim the project is production- or deployment-ready — see [Future Work](#future-work) for known gaps.
 
 Functionally, the system supports multi-user direct and group messaging, file/image transfer, read receipts, phone-number-based user discovery, and reconnection/history recovery, all mediated by an authenticated, TLS-secured server backed by PostgreSQL, with client-side AES-256-GCM payload encryption, Kyber768 (ML-KEM-768) as the default post-quantum key-exchange algorithm, and ML-DSA-65 origin authentication of identity, message, and key-establishment traffic against explicitly human-verified peer identities (see [Security Model](#security-model)).
 

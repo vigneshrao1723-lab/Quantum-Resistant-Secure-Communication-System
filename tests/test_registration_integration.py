@@ -177,15 +177,18 @@ def test_register_creates_a_real_account(running_server, monkeypatch):
         _delete_user(username)
 
 
-def test_register_duplicate_username_is_rejected(running_server, monkeypatch):
+def test_register_with_a_name_already_in_use_succeeds_under_a_different_handle(running_server, monkeypatch):
+    """Requirement 2 (2026-10-21) reverses the old rule that refused a taken username: the
+    newcomer is registered under its own unique handle and the existing account is untouched."""
     _state, port = running_server
     monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
     existing = _committed_user("dup_")
+    created = None
 
     session = ClientSession()
     try:
         result = session.register(
-            full_name="Someone Else",
+            full_name=existing["username"],
             username=existing["username"],
             email=f"different_{uuid.uuid4().hex[:10]}@example.com",
             password="Str0ng!Passw0rd",
@@ -193,8 +196,42 @@ def test_register_duplicate_username_is_rejected(running_server, monkeypatch):
             phone_number=f"+91{uuid.uuid4().int % 10**12:012d}",
         )
 
+        assert result.success is True, result.errors
+        db = SessionLocal()
+        try:
+            created = UserRepository(db).get_by_id(result.user_id)
+            original = UserRepository(db).get_by_username(existing["username"])
+            assert created.username != existing["username"]
+            assert created.display_name == existing["username"]
+            assert original is not None and original.email == existing["email"]  # untouched
+        finally:
+            db.close()
+    finally:
+        if created is not None:
+            _delete_user(created.username)
+        _delete_user(existing["username"])
+
+
+def test_register_with_a_phone_number_already_in_use_says_so_once(running_server, monkeypatch):
+    from auth.authentication_service import ACCOUNT_EXISTS_MESSAGE
+
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+    existing = _committed_user("dupphone_")
+
+    try:
+        result = ClientSession().register(
+            full_name="Another Person",
+            username=f"another_{uuid.uuid4().hex[:10]}",
+            email=f"another_{uuid.uuid4().hex[:10]}@example.com",
+            password="Str0ng!Passw0rd",
+            confirm_password="Str0ng!Passw0rd",
+            phone_number=existing["phone_number"],
+        )
+
         assert result.success is False
-        assert result.errors and "username" in result.errors
+        assert result.message == ACCOUNT_EXISTS_MESSAGE
+        assert result.errors == {"phone_number": ACCOUNT_EXISTS_MESSAGE}
     finally:
         _delete_user(existing["username"])
 

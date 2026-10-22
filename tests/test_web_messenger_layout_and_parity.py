@@ -15,6 +15,8 @@ import uuid
 
 import pytest
 
+from tests.image_fixtures import solid_png
+
 from tests.test_web_browser_e2e import (  # noqa: F401 -- fixtures reused, not re-implemented
     PASSWORD,
     _connect_browser,
@@ -22,6 +24,7 @@ from tests.test_web_browser_e2e import (  # noqa: F401 -- fixtures reused, not r
     _register,
     _wait_for,
     browser_page,
+    chat_tool,
     desktop_app,
     gateway_url,
     running_server,
@@ -96,7 +99,9 @@ def test_web_bio_can_be_edited_and_is_seen_by_desktop(running_server, gateway_ur
         page.click("#bioSaveBtn")
 
         assert _wait_for(lambda: alice.fetch_bio(bob_payload["username"]) == "Quantum-safe since 2026")
-        assert "Quantum-safe since 2026" in page.inner_text("#bioHint")
+        # The page shows it when the server's reply reaches the browser, which can be a moment after
+        # the Desktop already sees it on the server: wait for the page, do not race it.
+        assert _wait_for(lambda: "Quantum-safe since 2026" in page.inner_text("#bioHint"), attempts=100, interval=0.1)
     finally:
         _delete(bob_payload["username"])
 
@@ -128,8 +133,9 @@ def test_web_peer_profile_shows_the_desktop_users_bio_and_name(
         assert alice.change_bio("Desktop says hello").get("success")
 
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.wait_for_selector("#chatView:not([hidden])")
-        page.click("#peerProfileBtn")
+        chat_tool(page, "peerProfileBtn")
 
         page.wait_for_selector(".profile-card")
         assert alice.username in page.inner_text(".profile-card")
@@ -325,6 +331,7 @@ def test_enter_sends_shift_enter_adds_a_line_and_the_composer_grows(
     alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
     try:
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.click("#establishKeyBtn")
         assert _wait_for(lambda: "Session key established" in page.inner_text("#log"))
 
@@ -359,32 +366,60 @@ def test_enter_sends_shift_enter_adds_a_line_and_the_composer_grows(
 # ============================================================ Search + filters
 
 
-def test_sidebar_search_narrows_the_chat_list_and_never_empties_it_for_a_new_username(
+def test_sidebar_search_filters_the_chat_list_and_never_creates_a_conversation(
     running_server, gateway_url, browser_page, desktop_app
 ):
     alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
     carol = desktop_app["launch"](desktop_app["register"]("carol_"))
+    dave_payload = desktop_app["register"]("dave_")
     try:
-        # Two real conversations in the list.
-        page.fill("#peerUsername", alice.username)
+        # Two real conversations in the list (verified contacts are listed).
+        _verify_browser_observes_desktop(carol, page)
         page.wait_for_selector(f'#chatList .row-card:has-text("{alice.username}")')
-        page.fill("#peerUsername", carol.username)
         page.wait_for_selector(f'#chatList .row-card:has-text("{carol.username}")')
 
-        def rows(name):
-            return page.locator(f'#chatList .row-card:has-text("{name}")').count()
+        def rows(name=""):
+            selector = f'#chatList .row-card:has-text("{name}")' if name else "#chatList .row-card"
+            return page.locator(selector).count()
 
-        # Each check below runs right after the fill, before the field's own
-        # (pre-existing) 300 ms "open this username" debounce fires.
-        # Search text that matches ONE conversation narrows the list to it
-        # (case-insensitively)...
+        # Search text that matches ONE conversation narrows the list to it (case-insensitively).
         page.fill("#peerUsername", alice.username[:-6].upper())
         assert rows(alice.username) == 1 and rows(carol.username) == 0
 
-        # ...text that matches nothing is a new username being typed, not a
-        # search: the list is left alone.
-        page.fill("#peerUsername", "zzz-no-such-chat")
-        assert rows(alice.username) == 1 and rows(carol.username) == 1
+        # Typing a phone number one keystroke at a time (the screenshot showed "+91",
+        # "+91 11111" ... each becoming a conversation) creates nothing, however long it sits.
+        for partial in ("+9", "+91", "+91 1", "+91 11111", "+91 111112222"):
+            page.fill("#peerUsername", partial)
+        page.wait_for_timeout(900)
+        assert rows() == 0
+        assert page.locator("#startChatBtn").count() == 1  # a separate search result, not a row
+        page.fill("#peerUsername", "")
+        assert rows() == 2
+
+        # Enter on a number nobody uses: a message, no conversation.
+        page.fill("#peerUsername", "+91 9999999999")
+        page.press("#peerUsername", "Enter")
+        assert _wait_for(lambda: "No account uses that phone number." in page.inner_text("#toastRegion"))
+        page.fill("#peerUsername", "")
+        assert rows() == 2
+
+        # Enter on a real phone number opens a chat with THAT account (resolved by the server),
+        # and the search box is cleared, but no list row appears until a message is exchanged.
+        page.fill("#peerUsername", dave_payload["phone_number"])
+        page.press("#peerUsername", "Enter")
+        page.wait_for_selector("#chatView:not([hidden])")
+        assert _wait_for(lambda: page.evaluate("document.querySelector('#chatTitle .chat-header-name').title")
+                         == f"@{dave_payload['username']}")
+        assert page.input_value("#peerUsername") == ""
+        page.wait_for_timeout(600)
+        assert rows(dave_payload["username"]) == 0 and rows() == 2
+
+        # Repeated searches for the same thing never duplicate anything.
+        for _ in range(3):
+            page.fill("#peerUsername", carol.username)
+            assert rows(carol.username) == 1
+        page.fill("#peerUsername", "")
+        assert rows() == 2
     finally:
         _delete(bob_payload["username"])
 
@@ -393,11 +428,15 @@ def test_an_open_chat_never_filters_the_groups_tab_away(running_server, gateway_
     alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
     try:
         _group_with_web_member(alice, page, "still-visible-group")
-        page.fill("#peerUsername", alice.username)  # an open chat leaves its username in the box
+        page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.wait_for_selector("#chatView:not([hidden])")
 
         page.click('.tab-btn[data-tab="groups"]')
 
+        assert page.locator('#groupList .row-card:has-text("still-visible-group")').count() == 1
+        # A phone number being looked up matches no group: the Groups tab is left as it is.
+        page.fill("#peerUsername", "+91 98765")
         assert page.locator('#groupList .row-card:has-text("still-visible-group")').count() == 1
     finally:
         _delete(bob_payload["username"])
@@ -409,6 +448,7 @@ def test_unread_filter_hides_conversations_without_unread_messages(
     alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
     try:
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.wait_for_selector(f'#chatList .row-card:has-text("{alice.username}")')
 
         page.click("#unreadFilterToggle")
@@ -487,6 +527,7 @@ def test_phone_layout_shows_one_pane_with_a_bottom_navigation_bar(
             page.click("#chatBackBtn")
         else:
             page.fill("#peerUsername", alice.username)
+            page.press("#peerUsername", "Enter")
             page.wait_for_selector("#chatView:not([hidden])")
 
         # The list: the rail is a bottom bar (phones) with every destination reachable.
@@ -505,45 +546,118 @@ def test_phone_layout_shows_one_pane_with_a_bottom_navigation_bar(
         _delete(bob_payload["username"])
 
 
-def test_verified_peer_safety_number_collapses_on_phones_but_stays_reachable(
+def test_a_verified_contact_is_one_concise_line_with_the_comparison_on_demand(
     running_server, gateway_url, browser_page, desktop_app
 ):
     alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
     try:
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.wait_for_selector("#chatView:not([hidden])")
         assert _wait_for(lambda: page.get_attribute("#securityBar", "data-state") == "VERIFIED")
         full_number = page.inner_text("#fingerprintDisplay")
 
-        page.set_viewport_size({"width": 390, "height": 800})
-        page.wait_for_timeout(300)
+        for width in (1280, 390):
+            page.set_viewport_size({"width": width, "height": 800})
+            page.wait_for_timeout(250)
 
-        bar = page.locator("#securityBar")
-        collapsed_height = bar.bounding_box()["height"]
-        assert collapsed_height < 60, f"verified bar should be one compact row, was {collapsed_height}px"
-        assert page.locator("#securityBarToggle").is_visible()
-        assert page.get_attribute("#securityBarToggle", "aria-expanded") == "false"
-        # The actions are still there and tappable.
-        for selector in ("#confirmVerifiedBtn", "#requestVerificationBtn", "#establishKeyBtn"):
-            box = page.locator(selector).bounding_box()
-            assert box and box["width"] >= 30 and box["height"] >= 30, selector
-        # Nothing was dropped from the DOM: the whole safety number is still there.
-        assert page.inner_text("#fingerprintDisplay") == full_number or all(
-            group in page.evaluate("document.getElementById('fingerprintDisplay').textContent")
-            for group in full_number.split()[-4:]
-        )
+            # The bar says only what matters: "Verified", and the one action.
+            bar = page.locator("#securityBar")
+            assert bar.bounding_box()["height"] < 60, f"the verified bar should be one row at {width}px"
+            assert page.inner_text("#securityStatusText").strip() == "Verified"
+            assert page.locator("#reverifyBtn").is_visible()
+            assert page.locator("#reverifyBtn").inner_text().strip() == "Re-verify"
+            # No full number, no Confirm / Request Approval, no own number while it is not needed.
+            assert not page.locator("#safetyDetails").is_visible()
+            assert not page.locator("#confirmVerifiedBtn").is_visible()
+            assert not page.locator("#requestVerificationBtn").is_visible()
+            assert not page.locator("#ownSafetyNumber").is_visible()
+            # Nothing was dropped from the DOM: the whole safety number is still there for the comparison.
+            assert page.evaluate("document.getElementById('fingerprintDisplay').textContent").count(
+                full_number.split()[-1]
+            ) >= 1
+            assert _no_horizontal_overflow(page)
 
-        page.click("#securityBarToggle")
-        expanded_height = bar.bounding_box()["height"]
-        assert expanded_height > collapsed_height + 40
-        assert page.get_attribute("#securityBarToggle", "aria-expanded") == "true"
-        assert page.locator("#fingerprintDisplay .fp-label").is_visible()
+            # Re-verify opens the comparison (and the explicit confirmation).
+            page.click("#reverifyBtn")
+            assert page.locator("#safetyDetails").is_visible()
+            assert page.locator("#fingerprintDisplay .fp-value").is_visible()
+            assert page.locator("#confirmVerifiedBtn").is_visible()
+            assert page.get_attribute("#securityBarToggle", "aria-expanded") == "true"
+            assert _no_horizontal_overflow(page)
 
-        page.click("#securityBarToggle")
-        assert bar.bounding_box()["height"] < 60
+            # Your own number appears only when asked for, and is the one the peer observes for you.
+            assert not page.locator("#ownSafetyNumber").is_visible()
+            page.click("#showOwnNumberBtn")
+            page.wait_for_function(
+                "document.getElementById('ownSafetyNumber').textContent.trim().split(/\\s+/).length === 16",
+                timeout=10000,
+            )
+            assert " ".join(page.inner_text("#ownSafetyNumber").split()) == " ".join(
+                alice.get_peer_fingerprint_for_verification(bob_payload["username"]).split()
+            )
+            page.click("#showOwnNumberBtn")
+            assert not page.locator("#ownSafetyNumber").is_visible()
+
+            # The chevron collapses it again.
+            page.click("#securityBarToggle")
+            assert not page.locator("#safetyDetails").is_visible()
+            assert page.get_attribute("#securityBarToggle", "aria-expanded") == "false"
+
         # The conversation is never squeezed out: the message area keeps real room.
         assert page.locator("#messages").bounding_box()["height"] > 250
         assert page.locator("#messageText").is_visible()
+    finally:
+        _delete(bob_payload["username"])
+
+
+def test_a_changed_key_immediately_stops_the_contact_counting_as_verified(
+    running_server, gateway_url, browser_page, desktop_app
+):
+    """A VERIFIED contact whose identity key changes is not VERIFIED any more -- at once, in the
+    state, the header chip, the bar and the actions -- and only an explicit confirmation of the new
+    number restores it."""
+    alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
+    try:
+        page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
+        assert _wait_for(lambda: page.get_attribute("#securityBar", "data-state") == "VERIFIED")
+        assert page.evaluate(f"window.__session.isPeerVerified({alice.username!r})")
+
+        # The contact presents a DIFFERENT identity (what a reinstall -- or an impostor -- looks like).
+        page.evaluate(
+            """async (peer) => {
+              const session = window.__session;
+              const seen = session.peers.get(peer);
+              const changedKey = new Uint8Array(seen.signingKey);
+              changedKey[0] ^= 0xFF;
+              const updated = await session._upsertPeerObservation(peer, seen.kemWire, changedKey);
+              session.onPeerObserved(peer, updated.fingerprint, updated.state);
+            }""",
+            alice.username,
+        )
+
+        assert not page.evaluate(f"window.__session.isPeerVerified({alice.username!r})")
+        assert page.get_attribute("#securityBar", "data-state") == "KEY_CHANGED"
+        assert page.get_attribute("#peerVerifiedBadge", "data-state") == "KEY_CHANGED"
+        assert "Verified" not in page.inner_text("#peerVerifiedBadge").replace("Unverified", "")
+        assert "Key changed" in page.inner_text("#securityStatusText")
+        # The comparison is open and the explicit confirmation is the way back.
+        assert page.locator("#safetyDetails").is_visible()
+        assert page.locator("#confirmVerifiedBtn").is_visible()
+        assert not page.locator("#reverifyBtn").is_visible()
+
+        # Sending protected messages is refused until it is re-verified.
+        refused = page.evaluate(
+            """async (peer) => { try { await window.__session.sendMessage(peer, 'hi'); return 'sent'; }
+                                   catch (e) { return String(e.message); } }""",
+            alice.username,
+        )
+        assert refused != "sent"
+
+        page.click("#confirmVerifiedBtn")
+        assert _wait_for(lambda: page.get_attribute("#securityBar", "data-state") == "VERIFIED")
+        assert page.evaluate(f"window.__session.isPeerVerified({alice.username!r})")
     finally:
         _delete(bob_payload["username"])
 
@@ -559,6 +673,7 @@ def test_unverified_peer_keeps_the_full_safety_number_on_phones(running_server, 
 
         page.set_viewport_size({"width": 390, "height": 800})
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         assert _wait_for(lambda: alice.username in page.inner_text("#fingerprintDisplay"))
         assert page.get_attribute("#securityBar", "data-state") == "UNVERIFIED"
 
@@ -574,39 +689,197 @@ def test_unverified_peer_keeps_the_full_safety_number_on_phones(running_server, 
 
 # ============================================================ Profile picture
 
-# A genuinely valid 1x1 PNG.
-_PNG = bytes.fromhex(
-    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63f8cfc0f01f0005000201"
-    "a5f645400000000049454e44ae426082"
-)
+
+def _decode_png(png_bytes):
+    from PySide6.QtGui import QGuiApplication, QImage
+
+    QGuiApplication.instance() or QGuiApplication([])
+    image = QImage()
+    assert image.loadFromData(png_bytes)
+    return image
 
 
-def test_web_profile_picture_upload_is_stored_and_visible_to_the_desktop(
+def _choose_picture(page, name, mime, data):
+    page.click("#settingsToggleBtn")
+    page.set_input_files("#profilePicInput", {"name": name, "mimeType": mime, "buffer": data})
+
+
+def test_web_profile_picture_is_cropped_uploaded_and_visible_to_the_desktop(
     running_server, gateway_url, browser_page, desktop_app
 ):
     alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
     try:
-        page.click("#settingsToggleBtn")
-        page.set_input_files("#profilePicInput", {"name": "me.png", "mimeType": "image/png", "buffer": _PNG})
+        # Not square, so the crop matters.
+        _choose_picture(page, "me.png", "image/png", solid_png(400, 240))
 
-        assert _wait_for(lambda: alice.fetch_profile_picture(bob_payload["username"]) == _PNG, attempts=200, interval=0.1)
-        # The Settings avatar shows the real image, not the initial.
-        assert page.locator("#myProfilePicAvatar img").count() == 1
+        # Choosing a picture opens the crop dialog; nothing is uploaded yet.
+        page.wait_for_selector(".crop-card #cropSaveBtn")
+        assert alice.fetch_profile_picture(bob_payload["username"]) is None
+        assert page.locator(".crop-canvas").is_visible()
+
+        # Position it (drag) and zoom, then save.
+        canvas = page.locator(".crop-canvas")
+        box = canvas.bounding_box()
+        page.mouse.move(box["x"] + 140, box["y"] + 140)
+        page.mouse.down()
+        page.mouse.move(box["x"] + 90, box["y"] + 140, steps=4)
+        page.mouse.up()
+        page.locator("#cropZoom").fill("1.6")
+        page.click("#cropSaveBtn")
+
+        stored = None
+
+        def _stored():
+            nonlocal stored
+            stored = alice.fetch_profile_picture(bob_payload["username"])
+            return stored is not None
+
+        assert _wait_for(_stored, attempts=200, interval=0.1)
+        image = _decode_png(stored)
+        assert image.width() == image.height() == 256                  # a square, a fixed size
+        assert page.locator(".crop-card").count() == 0                 # the dialog closed
+        assert page.locator("#myProfilePicAvatar img").count() == 1    # Settings shows the real picture
+        assert "Profile picture updated" in page.inner_text("#toastRegion")
     finally:
         _delete(bob_payload["username"])
 
 
-def test_web_profile_picture_over_the_server_limit_is_refused_and_nothing_is_stored(
+def test_cancelling_the_crop_uploads_nothing(running_server, gateway_url, browser_page, desktop_app):
+    alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
+    try:
+        _choose_picture(page, "me.png", "image/png", solid_png(200, 200))
+        page.wait_for_selector(".crop-card #cropSaveBtn")
+
+        page.click(".crop-card .btn-ghost")
+
+        assert page.locator(".crop-card").count() == 0
+        page.wait_for_timeout(500)
+        assert alice.fetch_profile_picture(bob_payload["username"]) is None
+        assert page.locator("#myProfilePicAvatar img").count() == 0
+    finally:
+        _delete(bob_payload["username"])
+
+
+def test_web_profile_picture_files_are_validated_before_anything_is_uploaded(
+    running_server, gateway_url, browser_page, desktop_app
+):
+    alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
+    try:
+        cases = [
+            ("notes.pdf", "application/pdf", b"%PDF-1.7 " + b"x" * 100, "Choose a PNG, JPEG, WebP or GIF"),
+            ("fake.png", "image/png", b"this is not really a png", "couldn't be read"),
+            ("tiny.png", "image/png", solid_png(40, 40), "too small"),
+            ("wide.png", "image/png", solid_png(9000, 70), "too large"),
+            ("huge.png", "image/png", solid_png(100, 100) + b"\x00" * (11 * 1024 * 1024), "too large"),
+        ]
+        for name, mime, data, expected in cases:
+            _choose_picture(page, name, mime, data)
+            assert _wait_for(lambda: expected in page.inner_text("#myProfilePicHint"), attempts=100, interval=0.1), name
+            assert page.locator(".crop-card").count() == 0, name          # never reaches the crop step
+            assert alice.fetch_profile_picture(bob_payload["username"]) is None, name
+    finally:
+        _delete(bob_payload["username"])
+
+
+def test_a_server_refusal_is_shown_in_the_crop_dialog_and_nothing_changes(
+    running_server, gateway_url, browser_page, desktop_app
+):
+    alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
+    try:
+        page.evaluate("""window.__session.uploadProfilePicture = async () => ({success: false, error: 'Image must be under 2 MB.'})""")
+        _choose_picture(page, "me.png", "image/png", solid_png(300, 300))
+        page.wait_for_selector(".crop-card #cropSaveBtn")
+
+        page.click("#cropSaveBtn")
+
+        assert _wait_for(lambda: "Image must be under 2 MB." in page.inner_text(".crop-error"), attempts=100, interval=0.1)
+        assert page.locator(".crop-card").count() == 1               # still open, nothing lost
+        assert page.locator("#cropSaveBtn").is_enabled()
+        assert alice.fetch_profile_picture(bob_payload["username"]) is None
+    finally:
+        _delete(bob_payload["username"])
+
+
+def test_the_crop_dialog_is_keyboard_operable(running_server, gateway_url, browser_page, desktop_app):
+    alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
+    try:
+        _choose_picture(page, "me.png", "image/png", solid_png(500, 300))
+        page.wait_for_selector(".crop-card #cropSaveBtn")
+        assert page.evaluate("document.activeElement === document.querySelector('.crop-canvas')")
+
+        for key in ("ArrowLeft", "ArrowLeft", "+", "+", "ArrowUp"):
+            page.keyboard.press(key)
+        assert float(page.input_value("#cropZoom")) > 1.1               # + zoomed in
+        page.keyboard.press("Escape")
+
+        assert page.locator(".crop-card").count() == 0                   # Escape cancels
+        assert alice.fetch_profile_picture(bob_payload["username"]) is None
+    finally:
+        _delete(bob_payload["username"])
+
+
+def test_the_settings_picture_opens_the_enlarged_viewer_where_change_lives(
     running_server, gateway_url, browser_page, desktop_app
 ):
     alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
     try:
         page.click("#settingsToggleBtn")
-        too_big = _PNG + b"\x00" * (2 * 1024 * 1024)  # just over the server's 2 MB limit
-        page.set_input_files("#profilePicInput", {"name": "big.png", "mimeType": "image/png", "buffer": too_big})
+        # The profile row: the name and the handle, and no separate "Profile Picture [Change]" row.
+        assert _wait_for(lambda: page.inner_text("#ownHandle") == f"@{bob_payload['username']}")
+        assert page.inner_text("#ownDisplayName").strip()
+        assert page.locator("#profilePicChangeBtn").count() == 0
 
-        assert _wait_for(lambda: "Upload failed" in page.inner_text("#myProfilePicHint"), attempts=200, interval=0.1)
-        assert alice.fetch_profile_picture(bob_payload["username"]) is None
-        assert page.locator("#myProfilePicAvatar img").count() == 0
+        # No picture yet: the viewer shows a polished placeholder and says so.
+        page.click("#myProfilePicAvatar")
+        page.wait_for_selector(".picture-viewer-card")
+        assert _wait_for(lambda: "haven't added a profile picture" in page.inner_text(".picture-viewer-card"))
+        assert page.locator(".picture-viewer-card .avatar.xl").is_visible()
+        assert page.inner_text("#pictureChangeBtn").strip() == "Add a picture"
+
+        # Change is offered only here, and opens the chooser (we answer it with a real file).
+        with page.expect_file_chooser() as chooser:
+            page.click("#pictureChangeBtn")
+        chooser.value.set_files({"name": "me.png", "mimeType": "image/png", "buffer": solid_png(240, 240)})
+        page.wait_for_selector(".crop-card #cropSaveBtn")
+        page.click("#cropSaveBtn")
+        assert _wait_for(lambda: alice.fetch_profile_picture(bob_payload["username"]) is not None, attempts=200, interval=0.1)
+
+        # Now the viewer shows the real picture, and offers to change it.
+        page.click("#myProfilePicAvatar")
+        page.wait_for_selector(".picture-viewer-card .avatar.xl img")
+        assert page.inner_text("#pictureChangeBtn").strip() == "Change picture"
+        page.keyboard.press("Escape")
+        assert page.locator(".picture-viewer-card").count() == 0
+    finally:
+        _delete(bob_payload["username"])
+
+
+def test_the_header_avatar_opens_the_contacts_picture_with_no_change_control(
+    running_server, gateway_url, browser_page, desktop_app
+):
+    alice, _ap, bob_payload, page = _pair(desktop_app, browser_page, gateway_url)
+    try:
+        page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
+        page.wait_for_selector("#chatView:not([hidden])")
+
+        # The avatar is a real, labelled, focusable button -- and the old profile icon is gone.
+        assert page.evaluate("document.getElementById('chatAvatar').tagName") == "BUTTON"
+        assert page.get_attribute("#chatAvatar", "aria-label") == "View profile picture"
+        assert page.locator("#peerProfileBtn").is_visible() is False   # only in the Chat settings menu
+
+        # A contact without a picture: placeholder + plain caption.
+        page.click("#chatAvatar")
+        page.wait_for_selector(".picture-viewer-card")
+        assert _wait_for(lambda: "hasn't added a profile picture" in page.inner_text(".picture-viewer-card"))
+        assert page.locator("#pictureChangeBtn").count() == 0
+        page.keyboard.press("Escape")
+
+        # Once they set one, everyone who looks them up sees it (Desktop uploads here).
+        assert alice.upload_profile_picture(solid_png(256, 256), content_type="image/png")["success"]
+        page.focus("#chatAvatar")
+        page.keyboard.press("Enter")                                    # keyboard-operable
+        page.wait_for_selector(".picture-viewer-card .avatar.xl img")
+        assert page.locator("#pictureChangeBtn").count() == 0
     finally:
         _delete(bob_payload["username"])

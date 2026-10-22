@@ -120,7 +120,7 @@ def test_image_bubble_offers_view_and_save_actions(png_file):
     _path, original = png_file
     bubble = ImageMessageBubble(original, kind="received", sender="alice")
 
-    assert _buttons(bubble) == {"View", "Save As..."}
+    assert _buttons(bubble) == {"View", "Save"}
 
 
 def test_thumbnail_never_upscales_a_small_image(png_file):

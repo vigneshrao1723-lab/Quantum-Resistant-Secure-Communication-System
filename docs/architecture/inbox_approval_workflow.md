@@ -110,12 +110,62 @@ outcome that arrived while offline is visible on reconnect.
   preventing an "approve" the client can't actually back up.
 - Desktop mirrors the same two calls on `ClientSession`.
 
-**Not implemented on the web client** — `web/client/` has no `inbox`
-references at all. A web-client user can still be the *target* of a
-verification or group-add request (the request itself is server/
-desktop/mobile-driven), but cannot see or act on their own inbox from
-the browser. This asymmetry is a known limitation, not a bug — see
-the project's Known Limitations section.
+**Web client** — out of date in earlier versions of this document: the Website has an Inbox tab
+(`web/client/main.js::renderInboxCard()`), can send a verification request (`requestVerification()`), and
+approves or denies from the same cards. Its approve path (`respondToInbox()`) mirrors the Desktop's.
+
+## 4b. What follows an approval (2026-10-22)
+
+Approval used to stop at "bookkeeping", and two things were missing, which together made a person added to a
+group before anyone had verified anyone unable to read it:
+
+1. **The requester's half.** The Desktop already completed it (`ClientSession._complete_requester_side_verification()`);
+   the Website did not. `WebClientSession._completeRequesterSideVerification()` now does the same, from the identity the
+   Website has itself observed (never from the notification, which carries no key material), and then secures the direct
+   connection (`secureDirectConnection()` → `establishSessionKey()`), reporting `establishing` / `ready` / `failed` as it
+   happens. **Both clients refuse to do it for a KEY_CHANGED identity**, and both clients now refuse to *approve* a
+   requester whose identity changed (the approve path would otherwise verify a never-compared key).
+2. **A group key skipped because its recipient was not verified was forgotten.** `_distribute_group_key()` /
+   `_distributeGroupKey()` skip such a member on purpose (a key is only ever wrapped for, and accepted from, a VERIFIED
+   identity). The skip is now remembered (`_skipped_group_key_distributions` / `_skippedGroupKeys`) and retried when that
+   member is verified (`_after_peer_verified()` / `_afterPeerVerified()`, called only from the explicit, fingerprint-checked
+   confirm methods) or, if they were already verified, when their identity is first seen.
+3. **The other order.** A member who verifies the key holder *after* the key was sent (and rejected as coming from an
+   unverified sender) now asks again with a new, thin packet: `group_key_request` → `handle_group_key_request()`. It checks
+   the requester is an ACTIVE member, then reuses the existing `group_key_rotation_required` instruction for the current
+   epoch with the requester as the only recipient. It asks the group's **admin** (who created the key); if the admin is
+   offline and the requester is not the admin, nothing is sent, because any other member might not hold the key and the
+   rotation instruction makes a member without the epoch create a new one. No key passes through the server.
+
+Policy (changed again 2026-10-22, see §4c): nobody becomes a member of a group by being added. Each person is INVITED and
+joins only by approving the invitation in their own Inbox; a non-admin's request needs the admin's approval and then the
+person's.
+
+On the Desktop the direct session key is created at the first message (existing design), so there is no "Establish key"
+step to automate there; on the Website it is established automatically after an approved request and is otherwise still
+the explicit **Establish key** button.
+
+## 4c. Joining a group by invitation (2026-10-22)
+
+Requested by the owner: when an admin creates a group or adds people, each person must get a notice in their Inbox saying who
+wants to add them to which group, and **only the people who approve are added**; after that they chat normally and the key
+establishment and secure connection happen by themselves.
+
+| Step | What happens | Where |
+|---|---|---|
+| Create / add | The Desktop and Website create the group with `consent_invitations` set: the group exists with only its creator, and the server records one `group_invitation` per person (recipient = the invitee, requester = the inviter, plus the group) and pushes it to those online. Unknown people and people blocked either way are skipped silently; a repeat is the same single pending item | `handle_group_create()`, `handle_group_add_members()`, `_invite_candidates()` |
+| Non-admin asks | Their request goes to the admin as before; when the admin approves with `consent_invitations`, the candidate is **invited** instead of added | `handle_inbox_response()` |
+| Invitee approves | Only the recipient can decide (anyone else is rejected exactly like a bogus id). The invitation must still be valid: not older than 14 days, and the inviter still an active member; otherwise it becomes `expired` and nobody is added. A block in either direction is re-checked at approval. A valid approval runs `_perform_group_add_members()` as the inviter, so the group's "added" event names the real actor | `handle_inbox_response()` |
+| Trust | The invitee's client verifies the inviter from the identity **it has itself observed** before it sends the approval (and refuses for a changed key, or an inviter it has not observed). The inviter's client verifies the invitee the same way when the approval arrives. This is the same rule a verification request already uses | `respond_to_inbox()`, `_complete_requester_side_verification()` and the Website's equivalents |
+| Key | The new epoch's key is distributed by the group's **admin** (the server now asks the admin first), who now trusts the new member and is trusted by them; keys the admin held back are sent as soon as the verification completes (§4b). No one presses "Establish key" | `_dispatch_pending_rotation_if_needed()`, `_after_peer_verified()` |
+| Decline / ignore | A denial adds nobody, verifies nobody and sends no key; the inviter is told. An unanswered invitation stays pending (and expires after 14 days) | |
+
+Members need not verify one another: messages are authenticated by each sender's observed signing identity, and the key comes
+from the admin, whom each member verified at approval. Group info shows, on both clients, who is still deciding.
+
+Older clients (Android, and any client that does not send `consent_invitations`) keep the original immediate add. An Android
+person who is *invited* sees the item in their Inbox as a group request and can approve it, but Android does not verify the
+inviter on approval, so they would need to verify by hand before the key reaches them. Android was not changed or validated.
 
 ## 5. What this workflow is not
 

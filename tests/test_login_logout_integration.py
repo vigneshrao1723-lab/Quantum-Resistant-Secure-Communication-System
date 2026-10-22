@@ -237,8 +237,33 @@ def test_login_invalid_password_is_rejected(running_server, monkeypatch):
         result = session.authenticate_credentials(user["phone_number"], "WrongPassword!123")
 
         assert result.success is False
-        assert result.errors and "password" in result.errors
+        # Generic on purpose: see test_a_wrong_password_and_an_unknown_phone_number_look_identical.
+        assert result.errors == {"credentials": "Invalid phone number or password."}
         assert result.token_pair is None
+    finally:
+        _delete_user(user["username"])
+
+
+def test_a_wrong_password_and_an_unknown_phone_number_look_identical(running_server, monkeypatch):
+    """Whether a phone number has an account must not be learnable from the login reply.
+
+    The reply for a real account with the wrong password and for a number nobody registered used to
+    differ in its ``errors`` ("Password verification failed." / "User not found."), and the Desktop
+    showed that text. Everything the caller can see must now be the same."""
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+    user = _committed_user("enum_")
+
+    try:
+        wrong_password = ClientSession().authenticate_credentials(user["phone_number"], "WrongPassword!123")
+        unknown_number = ClientSession().authenticate_credentials("+919999999998", "WrongPassword!123")
+
+        for result in (wrong_password, unknown_number):
+            assert result.success is False and result.token_pair is None
+        assert wrong_password.message == unknown_number.message
+        assert wrong_password.errors == unknown_number.errors
+        assert "not found" not in str(unknown_number.errors).lower()
+        assert "verification" not in str(wrong_password.errors).lower()
     finally:
         _delete_user(user["username"])
 
@@ -255,7 +280,7 @@ def test_login_unknown_identifier_is_rejected(running_server, monkeypatch):
     result = session.authenticate_credentials("+919999999999", "whatever")
 
     assert result.success is False
-    assert result.errors and "identifier" in result.errors
+    assert result.errors == {"credentials": "Invalid phone number or password."}
     assert result.token_pair is None
 
 

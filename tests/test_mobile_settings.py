@@ -142,6 +142,24 @@ def test_change_password_rejects_policy_violation(running_server, monkeypatch, t
     assert response["error"]
 
 
+def _real_png(width, height):
+    """A genuine, valid solid-colour PNG (no image library needed)."""
+    import struct
+    import zlib
+
+    def chunk(kind, payload):
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body))
+
+    row = b"\x00" + b"\x76\x5c\xf2" * width
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
+
+
 def test_profile_picture_upload_fetch_roundtrip_and_privacy(running_server, monkeypatch, tmp_path):
     uploader, payload = _new_session(running_server, monkeypatch, "pic1", tmp_path)
     viewer, _ = _new_session(running_server, monkeypatch, "pic2", tmp_path)
@@ -150,7 +168,7 @@ def test_profile_picture_upload_fetch_roundtrip_and_privacy(running_server, monk
     # return placeholder bytes.
     assert viewer.fetch_profile_picture(payload["username"]) is None
 
-    image_bytes = b"\x89PNG\r\n\x1a\n" + os.urandom(256)
+    image_bytes = _real_png(16, 16)  # the server now checks the format and size of what it stores
     upload_response = uploader.upload_profile_picture(image_bytes, content_type="image/png")
     assert upload_response["success"], upload_response
 

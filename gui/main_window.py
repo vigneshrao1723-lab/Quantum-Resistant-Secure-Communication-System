@@ -11,6 +11,23 @@ from gui.chat_window import ChatWindow
 from gui.login_window import LoginWindow
 
 
+def registration_error_text(result):
+    """
+    One readable message for a refused registration: each distinct reason once, one per
+    line (the server already answers an existing phone number with a single sentence),
+    falling back to the overall message.
+    """
+
+    reasons = []
+
+    for reason in (result.errors or {}).values():
+        reason = str(reason).strip()
+        if reason and reason not in reasons:
+            reasons.append(reason)
+
+    return "\n".join(reasons) or result.message or "Registration failed."
+
+
 class MainWindow(QMainWindow):
     """
     Root application window.
@@ -101,13 +118,15 @@ class MainWindow(QMainWindow):
         depend on -- email remains a valid login identifier for anyone
         who registered before this change, and the server accepts it.
 
-        display_name = username, which is exactly what the app shows.
+        display_name = username, which is exactly what the app shows. The
+        name need not be unique: when it is already somebody's account
+        handle, the server gives this account a distinct handle of its own
+        (and a distinct synthetic email) -- see AuthenticationService.
+        register_user(). The phone number is the unique login identifier.
 
         email is synthesised from the username under the .invalid TLD,
         which RFC 2606 reserves precisely so it can never resolve or be
-        routed to. Uniqueness follows from the username's own UNIQUE
-        constraint, so the derived value cannot collide any more often
-        than the username itself. Nothing is ever sent to it.
+        routed to. Nothing is ever sent to it.
         """
 
         try:
@@ -124,9 +143,7 @@ class MainWindow(QMainWindow):
             return
 
         if not result.success:
-            self.login_window.show_connection_error(
-                result.errors and "; ".join(result.errors.values()) or result.message
-            )
+            self.login_window.show_registration_error(registration_error_text(result))
             return
 
         self.login_window.set_mode(False)

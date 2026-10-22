@@ -19,8 +19,10 @@ from sqlalchemy import select
 from database.models.inbox_notification import (
     STATUS_APPROVED,
     STATUS_DENIED,
+    STATUS_EXPIRED,
     STATUS_PENDING,
     TYPE_GROUP_ADD_REQUEST,
+    TYPE_GROUP_INVITATION,
     TYPE_VERIFICATION_REQUEST,
     InboxNotification,
 )
@@ -98,6 +100,53 @@ class InboxRepository(BaseRepository):
                 candidate_user_id=candidate_id,
             )
         )
+
+    def create_group_invitation(self, inviter_id, invitee_id, conversation_id):
+        """
+        Create a pending group_invitation from ``inviter_id`` to ``invitee_id`` for ``conversation_id``
+        (the invitee is the recipient and decides), or return the one already pending for this
+        (conversation, invitee) unchanged -- never two approvable invitations for the same person to
+        the same group, however many times it is asked or by whom.
+        """
+
+        existing = self.db.scalar(
+            select(InboxNotification).where(
+                InboxNotification.type == TYPE_GROUP_INVITATION,
+                InboxNotification.status == STATUS_PENDING,
+                InboxNotification.conversation_id == conversation_id,
+                InboxNotification.recipient_user_id == invitee_id,
+            )
+        )
+
+        if existing is not None:
+            return existing
+
+        return self.add(
+            InboxNotification(
+                type=TYPE_GROUP_INVITATION,
+                status=STATUS_PENDING,
+                requester_user_id=inviter_id,
+                recipient_user_id=invitee_id,
+                conversation_id=conversation_id,
+                candidate_user_id=invitee_id,
+            )
+        )
+
+    def mark_expired(self, notification_id):
+        """Transition a still-PENDING notification to EXPIRED (no longer valid); None if it was
+        not pending. Like resolve(), only a pending row is ever touched."""
+
+        notification = self.db.get(InboxNotification, notification_id)
+
+        if notification is None or notification.status != STATUS_PENDING:
+            return None
+
+        notification.status = STATUS_EXPIRED
+        notification.resolved_at = _utc_now()
+
+        self.db.flush()
+
+        return notification
 
     def get_for_user(self, user_id):
         """

@@ -28,6 +28,8 @@ const KEY_EXCHANGE_ALGORITHM = "KYBER"; // this client only ever speaks Kyber/ML
 // defaults). Capped attempt count -- never an infinite tight retry
 // loop -- after which reconnecting is abandoned and a clear terminal
 // "disconnected" state is reported via onConnectionState().
+// How long a one-shot request (login, registration) waits for its reply before giving up.
+const REPLY_TIMEOUT_MS = 30000;
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 1000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 const DEFAULT_RECONNECT_MAX_ATTEMPTS = 8;
@@ -85,10 +87,28 @@ export class WebClientSession {
     onAttachment, onGroupCreated, onReadReceipt, onHistoryLoaded, onOnlineUsersChanged,
     onInboxUpdated, onMessageDelivered, onMessageQueued,
     onMessageEdited, onMessageDeleted, onReactionUpdated, onTypingIndicator,
-    onMessagePinned, onMessageUnpinned, onGroupLeft,
+    onMessagePinned, onMessageUnpinned, onGroupLeft, onDisplayNamesUpdated, onGroupEvent,
+    onSecureConnection, onGroupKeyInstalled,
     reconnectBaseDelayMs, reconnectMaxDelayMs, reconnectMaxAttempts,
   }) {
     this.gatewayUrl = gatewayUrl;
+    // The state of securing a direct connection after a request was approved: (peer, state, detail)
+    // with state "establishing" | "ready" | "failed". Only ever reports what actually happened.
+    this.onSecureConnection = onSecureConnection || (() => {});
+    // (conversationId): a group/session key was just installed -- the page can refresh what it shows.
+    this.onGroupKeyInstalled = onGroupKeyInstalled || (() => {});
+    // member handle -> Set of conversation ids whose key this client holds but did not send to
+    // that member because it had not verified them yet (or had not seen their identity). A key is
+    // only ever wrapped for a VERIFIED identity; the skip used to be forgotten, so a member added
+    // before verification never got the key even after being verified. Retried once they are.
+    this._skippedGroupKeys = new Map();
+    // A group membership event ("Alice added Bob") the server recorded: (conversationId, event,
+    // {historical}). event = {id, type, actor, subject, timestamp}. See _emitGroupEvent().
+    this.onGroupEvent = onGroupEvent || (() => {});
+    // Handle -> display name (not unique). Only for SHOWING names: every packet, key and
+    // verification stays keyed on the handle.
+    this.displayNames = new Map();
+    this.onDisplayNamesUpdated = onDisplayNamesUpdated || (() => {});
     this.onLog = onLog || (() => {});
     this.onSecurityWarning = onSecurityWarning || (() => {});
     this.onMessage = onMessage || (() => {});
@@ -161,7 +181,10 @@ export class WebClientSession {
     // Per-conversation AES session key + epoch, mirroring
     // crypto/key_manager.py::KeyManager.keys. Phase 17: also persisted,
     // same as this.peers above.
-    this.sessionKeys = new Map(); // conversationId -> { key, epoch }
+    this.sessionKeys = new Map(); // conversationId -> { key, epoch }  (the key new messages are SENT with)
+    // Every key ever installed for a conversation, by epoch, so messages from before a key
+    // rotation can still be read (mirrors ClientSession/KeyManager, which keep every epoch).
+    this.keyHistory = new Map(); // conversationId -> Map<epoch, Uint8Array>
     this.directConversationIds = new Map(); // peer username -> conversationId
     this._restoredDirectPeers = []; // Phase 19.23 -- Issue 1: set by loadConversations() at login
 
@@ -270,18 +293,39 @@ export class WebClientSession {
     });
   }
 
-  async _sendAndReceiveOnce(ws, packet) {
+  // Send one request and wait for its one reply. The wait ENDS when the socket closes or fails
+  // or when no reply comes in time -- it used to wait forever, so a server that was down (the
+  // gateway closes the socket at once when it cannot reach it) left every caller, and with it the
+  // automatic reconnect, hanging for good.
+  async _sendAndReceiveOnce(ws, packet, timeoutMs = REPLY_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
-      const handleMessage = (event) => {
-        ws.removeEventListener("message", handleMessage);
+      let timer = null;
+      const finish = () => {
+        clearTimeout(timer);
+        ws.removeEventListener("message", onMessage);
+        ws.removeEventListener("close", onClose);
+        ws.removeEventListener("error", onError);
+      };
+      const onMessage = (event) => {
+        finish();
         try {
           resolve(JSON.parse(event.data));
         } catch (error) {
           reject(error);
         }
       };
-      ws.addEventListener("message", handleMessage, { once: true });
-      ws.send(JSON.stringify(packet));
+      const onClose = () => { finish(); reject(new Error("The connection closed before the server replied.")); };
+      const onError = () => { finish(); reject(new Error("The connection to the server failed.")); };
+      ws.addEventListener("message", onMessage);
+      ws.addEventListener("close", onClose);
+      ws.addEventListener("error", onError);
+      timer = setTimeout(() => { finish(); reject(new Error("The server did not reply in time.")); }, timeoutMs);
+      try {
+        ws.send(JSON.stringify(packet));
+      } catch (error) {
+        finish();
+        reject(error);
+      }
     });
   }
 
@@ -344,8 +388,10 @@ export class WebClientSession {
 
     if (!response || response.type !== "register_result" || !response.success) {
       const errors = response && response.errors;
-      const detail = errors ? Object.values(errors).flat().join(" ") : null;
-      throw new Error((response && response.message) || detail || "Registration failed.");
+      // Each distinct reason once (an existing phone number is a single sentence), else
+      // the overall message.
+      const reasons = errors ? Array.from(new Set(Object.values(errors).flat().map((r) => String(r).trim()).filter(Boolean))) : [];
+      throw new Error(reasons.join(" ") || (response && response.message) || "Registration failed.");
     }
 
     return response;
@@ -567,6 +613,10 @@ export class WebClientSession {
         conversationId,
         { key: C.bytesToBase64(info.key), epoch: info.epoch },
       ]),
+      keyHistory: Array.from(this.keyHistory.entries()).map(([conversationId, byEpoch]) => [
+        conversationId,
+        Array.from(byEpoch.entries()).map(([epoch, key]) => [epoch, C.bytesToBase64(key)]),
+      ]),
       directConversationIds: Array.from(this.directConversationIds.entries()),
       groups: Array.from(this.groups.entries()),
       deviceId: this.deviceId,
@@ -604,6 +654,17 @@ export class WebClientSession {
         { key: C.base64ToBytes(info.key), epoch: info.epoch },
       ])
     );
+    // Absent in state saved before key history existed: then only the current key is known.
+    this.keyHistory = new Map(
+      (stateObject.keyHistory || []).map(([conversationId, entries]) => [
+        conversationId,
+        new Map(entries.map(([epoch, key]) => [epoch, C.base64ToBytes(key)])),
+      ])
+    );
+    for (const [conversationId, info] of this.sessionKeys) {
+      if (!this.keyHistory.has(conversationId)) this.keyHistory.set(conversationId, new Map());
+      if (Number.isInteger(info.epoch)) this.keyHistory.get(conversationId).set(info.epoch, info.key);
+    }
     this.directConversationIds = new Map(stateObject.directConversationIds || []);
     this.groups = new Map(stateObject.groups || []);
     this.deviceId = stateObject.deviceId || null;
@@ -675,6 +736,12 @@ export class WebClientSession {
     const requestId = crypto.randomUUID();
     packet.request_id = requestId;
     return new Promise((resolve, reject) => {
+      // Not connected (e.g. during a server outage): fail now instead of throwing a TypeError
+      // from a null socket and leaving the caller waiting.
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        reject(new Error("Not connected to the server."));
+        return;
+      }
       this._pendingRequests.set(requestId, { resolve, reject });
       this.ws.send(JSON.stringify(packet));
     });
@@ -731,6 +798,7 @@ export class WebClientSession {
       // packet types, same "go re-fetch the list" semantics).
       case "inbox_notification":
       case "inbox_response_result":
+        this._completeRequesterSideVerification(packet.notification).catch((error) => this.log(`ERROR: ${error.message}`));
         this.onInboxUpdated(packet.notification || {});
         break;
       // Phase 19.18 -- Group Info remove-member closure: mirrors
@@ -749,6 +817,7 @@ export class WebClientSession {
           this._handleSelfLeftGroup(packet.conversation_id);
         } else if (this.groups.has(packet.conversation_id)) {
           this.groups.get(packet.conversation_id).members = packet.members || [];
+          this._emitGroupEvent(packet.conversation_id, packet.event);
           this.onGroupCreated(); // reuses the existing "groups changed, re-render" signal
         }
         break;
@@ -804,7 +873,7 @@ export class WebClientSession {
           editor, conversationId, "text", ciphertext, packet.content_metadata, packet.epoch,
           packet.message_signature, C.EDIT_PAYLOAD_PURPOSE, "message edit",
         )) break;
-        const newText = this._decryptLifecycleEventContent(conversationId, ciphertext);
+        const newText = this._decryptLifecycleEventContent(conversationId, ciphertext, packet.epoch);
         this.onMessageEdited(
           conversationId, messageId, newText,
           editor, packet.edited_at || "", packet.edit_version || 0,
@@ -828,7 +897,7 @@ export class WebClientSession {
             actor, conversationId, "reaction", packet.ciphertext, null, packet.epoch,
             packet.message_signature, C.REACTION_PAYLOAD_PURPOSE, "reaction",
           )) break;
-          reaction = this._decryptLifecycleEventContent(conversationId, packet.ciphertext);
+          reaction = this._decryptLifecycleEventContent(conversationId, packet.ciphertext, packet.epoch);
         }
         this.onReactionUpdated(conversationId, messageId, actor, action, reaction);
         break;
@@ -881,6 +950,11 @@ export class WebClientSession {
     }
 
     const peer = await this._upsertPeerObservation(username, kemWire, signingKey);
+    // A member skipped only because their identity had not been seen, who is ALREADY verified
+    // (a stored verification of this same identity), can be sent the key now.
+    if (peer.state === "VERIFIED" && this._skippedGroupKeys.has(username)) {
+      this._retrySkippedGroupKeys(username).catch((error) => this.log(`ERROR: ${error.message}`));
+    }
     this.onPeerObserved(username, peer.fingerprint, peer.state);
   }
 
@@ -926,6 +1000,9 @@ export class WebClientSession {
     // human to re-verify (fire-and-forget, matches this file's
     // existing async-call-from-a-sync-method convention).
     this._persistState().catch((error) => this.log(`ERROR: ${error.message}`));
+    // Keys that were waiting on this verification (a person's OWN other devices are verified with
+    // the same call and have no groups, so this is a no-op for them).
+    this._afterPeerVerified(username).catch((error) => this.log(`ERROR: ${error.message}`));
   }
 
   isPeerVerified(username) {
@@ -1017,7 +1094,7 @@ export class WebClientSession {
     const epoch = reservation.epoch;
 
     const sessionKey = C.randomAesKey();
-    this.sessionKeys.set(conversationId, { key: sessionKey, epoch });
+    this._installSessionKey(conversationId, sessionKey, epoch);
 
     const peer = this.peers.get(peerUsername);
     const peerKemPublicKeyRaw = C.base64ToBytes(peer.kemWire);
@@ -1052,8 +1129,10 @@ export class WebClientSession {
   // encryption scheme.
   // -------------------------------------------------------------
 
-  async createGroup(name, memberUsernames) {
-    this.ws.send(JSON.stringify(P.createGroupCreatePacket(this.username, name, memberUsernames)));
+  // With `consentInvitations` the listed people are invited, not added: each becomes a member only by
+  // approving an Inbox item (see handle_group_create() on the server).
+  async createGroup(name, memberUsernames, consentInvitations = false) {
+    this.ws.send(JSON.stringify(P.createGroupCreatePacket(this.username, name, memberUsernames, consentInvitations)));
   }
 
   // Sent to every currently-connected member INCLUDING the creator
@@ -1082,7 +1161,7 @@ export class WebClientSession {
   async _createAndDistributeGroupKey(conversationId, participants) {
     const groupKey = C.randomAesKey();
     const epoch = 1;
-    this.sessionKeys.set(conversationId, { key: groupKey, epoch });
+    this._installSessionKey(conversationId, groupKey, epoch);
     await this._distributeGroupKey(conversationId, groupKey, epoch, participants);
   }
 
@@ -1097,10 +1176,12 @@ export class WebClientSession {
 
       if (!peer) {
         this.log(`No observed identity for ${member}; cannot distribute the group key yet.`);
+        this._noteSkippedGroupKey(member, conversationId);
         continue;
       }
       if (peer.state !== "VERIFIED") {
         this.log(`SECURITY: ${member} is not VERIFIED; skipping group key distribution for them.`);
+        this._noteSkippedGroupKey(member, conversationId);
         continue;
       }
 
@@ -1129,6 +1210,94 @@ export class WebClientSession {
   // for this exact epoch rather than minting a second, conflicting one, then
   // report completion so the server can advance. Only ever acts for a group
   // this account is currently a member of.
+  _noteSkippedGroupKey(member, conversationId) {
+    if (!this._skippedGroupKeys.has(member)) this._skippedGroupKeys.set(member, new Set());
+    this._skippedGroupKeys.get(member).add(conversationId);
+  }
+
+  // Send `member` the group keys that were skipped for them. Every condition _distributeGroupKey()
+  // applies is applied again, fresh: the key is still held, the group still lists them, and they
+  // are verified now. The key goes out at the epoch it is held at.
+  async _retrySkippedGroupKeys(member) {
+    const pending = this._skippedGroupKeys.get(member);
+    if (!pending || pending.size === 0) return;
+    this._skippedGroupKeys.delete(member);
+    for (const conversationId of pending) {
+      const group = this.groups.get(conversationId);
+      const held = this.sessionKeys.get(conversationId);
+      if (!group || !held || !(group.members || []).includes(member)) continue;
+      try {
+        await this._distributeGroupKey(conversationId, held.key, held.epoch, [member]);
+      } catch (error) {
+        this.log(`ERROR: could not send the group key for ${conversationId} to ${member}: ${error.message}`);
+      }
+    }
+  }
+
+  // What follows a genuine local verification of `username` (only ever called after the explicit,
+  // fingerprint-checked confirmPeerVerified()): send the group keys skipped for them, and ask for
+  // the current key of every group shared with them that this client cannot yet read -- they may
+  // hold it, and could not hand it over before this client had verified them. Best-effort and
+  // silent; neither can make anyone trusted -- keys are still only wrapped for, and accepted
+  // from, VERIFIED identities.
+  async _afterPeerVerified(username) {
+    await this._retrySkippedGroupKeys(username);
+    for (const [conversationId, group] of this.groups) {
+      if (!(group.members || []).includes(username) || this.sessionKeys.has(conversationId)) continue;
+      try {
+        this.ws.send(JSON.stringify(P.createGroupKeyRequestPacket(conversationId)));
+      } catch (error) {
+        this.log(`ERROR: could not ask for the key of ${conversationId}: ${error.message}`);
+      }
+    }
+  }
+
+  // The REQUESTER's half of an approved verification_request (mirrors ClientSession.
+  // _complete_requester_side_verification()): the approver already verified this account inside
+  // respondToInbox(); this account asked, so once they approve it verifies them back using the
+  // identity it has itself observed -- never a value taken from the notification, which carries no
+  // key material -- and, only then, secures the direct connection. Fails closed: an identity that
+  // has not been observed, or whose key has CHANGED, is left for the person to verify by hand.
+  async _completeRequesterSideVerification(notification) {
+    if (!notification || (notification.type !== "verification_request" && notification.type !== "group_invitation")) return;
+    if (notification.status !== "approved" || notification.requester_username !== this.username) return;
+    const approver = notification.recipient_username;
+    if (!approver) return;
+    const peer = this.peers.get(approver);
+    if (!peer || !peer.fingerprint) {
+      this.log(`${approver} approved, but their identity has not been observed yet; verify them by hand when they are online.`);
+      return;
+    }
+    if (peer.state === "KEY_CHANGED") {
+      this.log(`${approver} approved, but their identity changed; it must be verified again by hand.`);
+      return;
+    }
+    if (peer.state !== "VERIFIED") this.confirmPeerVerified(approver, peer.fingerprint);
+    // A request is about the two people, so their direct connection is secured too. An invitation is
+    // about the group: its key follows from the verification above (see _afterPeerVerified()).
+    if (notification.type === "verification_request") await this.secureDirectConnection(approver);
+  }
+
+  // Establish the direct session key with a VERIFIED peer and report what actually happened.
+  async secureDirectConnection(peerUsername) {
+    if (!this.isPeerVerified(peerUsername)) return false;
+    const conversationId = this.directConversationIds.get(peerUsername);
+    if (conversationId && this.sessionKeys.has(conversationId)) {
+      this.onSecureConnection(peerUsername, "ready", "");
+      return true;
+    }
+    this.onSecureConnection(peerUsername, "establishing", "");
+    try {
+      await this.establishSessionKey(peerUsername);
+      this.onSecureConnection(peerUsername, "ready", "");
+      return true;
+    } catch (error) {
+      this.log(`ERROR: could not secure the connection with ${peerUsername}: ${error.message}`);
+      this.onSecureConnection(peerUsername, "failed", error.message);
+      return false;
+    }
+  }
+
   async _handleGroupKeyRotationRequired(packet) {
     const conversationId = packet.conversation_id;
     const epoch = packet.epoch;
@@ -1143,7 +1312,7 @@ export class WebClientSession {
       groupKey = existing.key;
     } else {
       groupKey = C.randomAesKey();
-      this.sessionKeys.set(conversationId, { key: groupKey, epoch });
+      this._installSessionKey(conversationId, groupKey, epoch);
     }
 
     await this._distributeGroupKey(conversationId, groupKey, epoch, recipients);
@@ -1167,8 +1336,34 @@ export class WebClientSession {
       members,
       admin: previous?.admin || null,
     });
+    for (const event of packet.events || []) this._emitGroupEvent(conversationId, event);
     this.onGroupCreated(conversationId, packet.name, members);
     this._persistState().catch(() => {});
+  }
+
+  // A group membership event from the wire -> the page, validated. Only the known structured
+  // fields are kept (the page renders a fixed sentence from them); anything malformed is dropped.
+  _cleanGroupEvent(raw) {
+    const TYPES = ["member_added", "member_left", "member_removed"];
+    if (!raw || typeof raw !== "object" || !TYPES.includes(raw.event_type)) return null;
+    if (typeof raw.event_id !== "string" || !raw.event_id) return null;
+    if (typeof raw.subject !== "string" || !raw.subject) return null;
+    // The server stores naive UTC; make that explicit so the browser converts it to local time.
+    const stamp = typeof raw.timestamp === "string" && raw.timestamp
+      ? new Date(/(Z|[+-]\d\d:?\d\d)$/.test(raw.timestamp) ? raw.timestamp : `${raw.timestamp}Z`)
+      : new Date();
+    return {
+      id: raw.event_id,
+      type: raw.event_type,
+      actor: typeof raw.actor === "string" && raw.actor ? raw.actor : null,
+      subject: raw.subject,
+      timestamp: Number.isNaN(stamp.getTime()) ? new Date() : stamp,
+    };
+  }
+
+  _emitGroupEvent(conversationId, raw, options = {}) {
+    const event = this._cleanGroupEvent(raw);
+    if (event) this.onGroupEvent(conversationId, event, options);
   }
 
   // THIS account's own leave, confirmed by the server -- the only
@@ -1176,6 +1371,7 @@ export class WebClientSession {
   _handleSelfLeftGroup(conversationId) {
     this.groups.delete(conversationId);
     this.sessionKeys.delete(conversationId);
+    this.keyHistory.delete(conversationId);
     this._persistState().catch(() => {});
     this.onGroupLeft(conversationId);
     this.onGroupCreated();
@@ -1184,12 +1380,55 @@ export class WebClientSession {
   // Ask the server to add members. A group's admin adds directly; any other
   // member's request becomes an approval request in the admin's Inbox (decided
   // server-side -- nothing here can grant more than the server allows).
-  addGroupMembers(conversationId, memberUsernames) {
-    this.ws.send(JSON.stringify(P.createGroupAddMembersPacket(this.username, conversationId, memberUsernames)));
+  addGroupMembers(conversationId, memberUsernames, consentInvitations = false) {
+    this.ws.send(JSON.stringify(P.createGroupAddMembersPacket(this.username, conversationId, memberUsernames, consentInvitations)));
   }
 
   leaveGroup(conversationId) {
     this.ws.send(JSON.stringify(P.createGroupLeavePacket(this.username, conversationId)));
+  }
+
+  // The name to SHOW for a handle: its display name once known, else the handle itself.
+  displayNameFor(username) {
+    if (!username) return "";
+    return this.displayNames.get(username) || username;
+  }
+
+  // Ask the server for the display names of these handles; caches them and notifies the page.
+  async fetchDisplayNames(usernames) {
+    const handles = Array.from(new Set((usernames || []).filter((h) => typeof h === "string" && h))).slice(0, 200);
+    if (handles.length === 0) return {};
+    const response = await this._sendRequest(P.createDisplayNamesRequestPacket(handles));
+    const names = response.names || {};
+    let changed = false;
+    for (const [handle, name] of Object.entries(names)) {
+      if (typeof name === "string" && name && this.displayNames.get(handle) !== name) {
+        this.displayNames.set(handle, name);
+        changed = true;
+      }
+    }
+    if (changed) this.onDisplayNamesUpdated();
+    return names;
+  }
+
+  // Change THIS account's display name (not unique, 1-64 characters).
+  async changeDisplayName(displayName) {
+    const response = await this._sendRequest(P.createChangeDisplayNameRequestPacket(displayName));
+    if (response.success && this.username) {
+      this.displayNames.set(this.username, response.display_name || displayName);
+      this.onDisplayNamesUpdated();
+    }
+    return response;
+  }
+
+  // {user_id, username, display_name} for a registered phone number, or null.
+  async lookupUserByPhone(phoneNumber) {
+    const response = await this._sendRequest(P.createUserLookupByPhoneRequestPacket(phoneNumber));
+    if (!response.user_id) return null;
+    if (response.username && response.display_name) {
+      this.displayNames.set(response.username, response.display_name);
+    }
+    return { user_id: response.user_id, username: response.username, display_name: response.display_name };
   }
 
   async changeBio(bio) {
@@ -1201,6 +1440,17 @@ export class WebClientSession {
   async fetchBio(username) {
     const response = await this._sendRequest(P.createBioRequestPacket(username));
     return response.found ? (response.bio || "") : "";
+  }
+
+  // This account's own combined-identity safety number -- the value another
+  // person's client shows for us (same two public keys, same derivation as
+  // the peer fingerprints observed in _upsertPeerObservation()).
+  async ownFingerprint() {
+    if (!this.kemKeypair || !this.signingKeypair) return null;
+    return C.fingerprintCombinedIdentity(
+      C.bytesToBase64(this.kemKeypair.publicKey),
+      this.signingKeypair.publicKey,
+    );
   }
 
   async sendGroupMessage(conversationId, text, replyToMessageId, clientMessageId, contentMetadata = null) {
@@ -1226,6 +1476,36 @@ export class WebClientSession {
     )));
 
     return finalClientMessageId;
+  }
+
+  // Install a conversation key. Records it by epoch (so older messages stay readable) and makes it
+  // the sending key unless a NEWER epoch is already in place: a late-arriving older key must never
+  // replace the key new messages are sent with.
+  _installSessionKey(conversationId, key, epoch) {
+    let history = this.keyHistory.get(conversationId);
+    if (!history) {
+      history = new Map();
+      this.keyHistory.set(conversationId, history);
+    }
+    if (Number.isInteger(epoch)) history.set(epoch, key);
+
+    const current = this.sessionKeys.get(conversationId);
+    if (current && Number.isInteger(current.epoch) && Number.isInteger(epoch) && epoch < current.epoch) return;
+    this.sessionKeys.set(conversationId, { key, epoch });
+  }
+
+  // The key for a message of the given epoch, or null. The epoch is covered by the message's
+  // signature, which every caller verifies BEFORE asking for a key, so it cannot be chosen by an
+  // attacker. A message that carries no epoch can only use the current key.
+  _keyForEpoch(conversationId, epoch) {
+    if (Number.isInteger(epoch)) {
+      const past = this.keyHistory.get(conversationId);
+      if (past && past.has(epoch)) return past.get(epoch);
+    }
+    const current = this.sessionKeys.get(conversationId);
+    if (!current) return null;
+    if (!Number.isInteger(epoch) || current.epoch === epoch) return current.key;
+    return null;
   }
 
   // Mandatory order (mirrors ClientSession.handle_group_key_distribution()
@@ -1281,7 +1561,7 @@ export class WebClientSession {
       const sharedSecret = C.kemDecapsulate(C.base64ToBytes(encapsulation), this.kemKeypair.secretKey);
       const sessionKeyB64 = C.decryptFromWire(sharedSecret, wrappedKeyB64);
       const sessionKey = C.base64ToBytes(sessionKeyB64);
-      this.sessionKeys.set(conversationId, { key: sessionKey, epoch });
+      this._installSessionKey(conversationId, sessionKey, epoch);
       // Phase 18: a GROUP key delivery must never be recorded as "my
       // direct conversation with `sender`" -- `sender` here is the
       // group's key-distributing member, not necessarily someone this
@@ -1297,6 +1577,7 @@ export class WebClientSession {
       }
       this.log(`Installed a group/session key for ${sender} (epoch ${epoch}).`);
       await this._persistState();
+      this.onGroupKeyInstalled(conversationId);
     } catch {
       this._reportSecurityRejection("decryption_failure", sender, conversationId);
     }
@@ -1315,7 +1596,20 @@ export class WebClientSession {
   // Messaging (mirrors ClientSession.send_chat_message()/handle_chat()).
   // -------------------------------------------------------------
 
+  // A contact whose identity key changed since it was verified is not trusted any more: nothing is
+  // sent to them -- not even over a session key made before the change -- until the new identity
+  // has been explicitly re-verified (mirrors ClientSession's PeerNotVerifiedError for the same state).
+  _assertPeerIdentityUnchanged(peerUsername) {
+    if (this.peers.get(peerUsername)?.state === "KEY_CHANGED") {
+      throw new Error(
+        `${this.displayNameFor(peerUsername)}'s identity changed since you verified them. `
+        + "Verify the new identity before sending anything."
+      );
+    }
+  }
+
   async sendMessage(peerUsername, text, replyToMessageId, clientMessageId, contentMetadata = null) {
+    this._assertPeerIdentityUnchanged(peerUsername);
     const conversationId = await this.openDirectConversation(peerUsername);
     const sessionInfo = this.sessionKeys.get(conversationId);
     if (!sessionInfo) {
@@ -1428,11 +1722,11 @@ export class WebClientSession {
     return this.sendAttachment(target, fileBytes, filename, mimeType, { forwarded: true });
   }
 
-  _decryptLifecycleEventContent(conversationId, ciphertext) {
-    const sessionInfo = this.sessionKeys.get(conversationId);
-    if (!sessionInfo) return "Message unavailable (encrypted in a previous session)";
+  _decryptLifecycleEventContent(conversationId, ciphertext, epoch) {
+    const key = this._keyForEpoch(conversationId, epoch);
+    if (!key) return "Message unavailable (encrypted in a previous session)";
     try {
-      return C.decryptFromWire(sessionInfo.key, ciphertext);
+      return C.decryptFromWire(key, ciphertext);
     } catch {
       return "Message unavailable (encrypted in a previous session)";
     }
@@ -1520,6 +1814,7 @@ export class WebClientSession {
       conversationId = target.conversationId;
     } else {
       receiver = target.peerUsername;
+      this._assertPeerIdentityUnchanged(receiver);
       conversationId = await this.openDirectConversation(receiver);
     }
 
@@ -1590,8 +1885,8 @@ export class WebClientSession {
     // fallback, mirroring client/session.py::handle_chat()'s own
     // identity_key/key_conversation_id split exactly.
     const sessionConversationId = conversationId || packet.direct_conversation_id || this.directConversationIds.get(sender);
-    const sessionInfo = this.sessionKeys.get(sessionConversationId);
-    if (!sessionInfo) {
+    const messageKey = this._keyForEpoch(sessionConversationId, epoch);
+    if (!messageKey) {
       this._reportSecurityRejection("decryption_failure", sender, conversationId);
       return;
     }
@@ -1615,13 +1910,13 @@ export class WebClientSession {
     }
 
     try {
-      const decoded = C.decryptFromWire(sessionInfo.key, ciphertext);
+      const decoded = C.decryptFromWire(messageKey, ciphertext);
       // Phase 19.24 (continued) -- messageId/replyToMessageId are the
-      // one piece of lifecycle state a live "chat" packet can carry
-      // (server/client_handler.py's relay branch forwards the sender's
-      // original packet, reply_to_message_id included, unchanged,
-      // before merely adding message_id to it); a brand-new message
-      // cannot already be edited/deleted/reacted-to.
+      // one piece of lifecycle state a live "chat" packet can carry; the
+      // server stamps BOTH from the stored row before relaying (server/
+      // client_handler.py::_stamp_relayed_references()), so a reply
+      // reference is always one it accepted for this conversation. A
+      // brand-new message cannot already be edited/deleted/reacted-to.
       const options = {
         messageId: packet.message_id, replyToMessageId: packet.reply_to_message_id,
         isDeleted: false, editVersion: 0, reactions: [],
@@ -1677,10 +1972,35 @@ export class WebClientSession {
     let seen = this._renderedMessageIds.get(conversationId);
     if (!seen) { seen = new Set(); this._renderedMessageIds.set(conversationId, seen); }
 
+    // Membership events (groups) are shown in order among the messages: before each message, the
+    // events that happened before it; after the last one, the rest.
+    const pendingEvents = (isGroup ? (result.events || []) : [])
+      .map((raw) => this._cleanGroupEvent(raw))
+      .filter(Boolean)
+      .sort((a, b) => a.timestamp - b.timestamp);
+    const flushEventsUpTo = (limit) => {
+      while (pendingEvents.length && (limit === null || pendingEvents[0].timestamp <= limit)) {
+        this.onGroupEvent(conversationId, pendingEvents.shift(), { historical: true });
+      }
+    };
+
     for (const entry of messages) {
+      if (pendingEvents.length) {
+        const entryTime = entry.timestamp
+          ? new Date(/(Z|[+-]\d\d:?\d\d)$/.test(entry.timestamp) ? entry.timestamp : `${entry.timestamp}Z`)
+          : null;
+        flushEventsUpTo(entryTime && !Number.isNaN(entryTime.getTime()) ? entryTime : null);
+      }
       // Step 6 -- a message already rendered (live, or by an earlier
       // loadHistory() call) is never rendered a second time.
       if (entry.message_id && seen.has(entry.message_id)) continue;
+      // Claimed BEFORE any await below: a second loadHistory() running at the same time (a chat
+      // being opened while another load is in flight) then skips this message instead of
+      // rendering it a second time. Released if the entry turns out not to be renderable, so a
+      // later load can still try it.
+      const claimId = entry.message_id;
+      if (claimId) seen.add(claimId);
+      const release = () => { if (claimId) seen.delete(claimId); };
 
       // Phase 19.24 (continued) -- Message Lifecycle Events: a real
       // delete-for-everyone has ALREADY nulled ciphertext/blob_ref/
@@ -1714,12 +2034,13 @@ export class WebClientSession {
           // blob_ref, metadata pointing at it) -- fetched here, lazily,
           // on demand, exactly where ClientSession._load_blob_history_
           // content() fetches it.
-          if (!entry.blob_ref) continue; // no attachment actually stored -- nothing to recover
+          if (!entry.blob_ref) { release(); continue; } // no attachment actually stored -- nothing to recover
           try {
             const blobResult = await this._sendRequest(P.createBlobDownloadRequestPacket(entry.message_id));
-            if (blobResult.error || !blobResult.ciphertext) continue; // not recoverable -- never render a misleading placeholder
+            if (blobResult.error || !blobResult.ciphertext) { release(); continue; } // not recoverable -- never render a misleading placeholder
             ciphertext = blobResult.ciphertext;
           } catch {
+            release();
             continue;
           }
         }
@@ -1728,7 +2049,7 @@ export class WebClientSession {
           ? this.signingKeypair.publicKey
           : this.peers.get(entry.sender)?.signingKey;
 
-        if (!signingPublicKey || !entry.message_signature) continue; // cannot authenticate -- skip, never render unauthenticated
+        if (!signingPublicKey || !entry.message_signature) { release(); continue; } // cannot authenticate -- skip, never render unauthenticated
 
         // BUG FIX (continued Phase 19.24): mirrors client/session.py::
         // _verify_history_message_signature()'s / mobile/session.py::
@@ -1763,14 +2084,15 @@ export class WebClientSession {
         } catch {
           verified = false;
         }
-        if (!verified) continue;
+        if (!verified) { release(); continue; }
 
-        const sessionInfo = this.sessionKeys.get(conversationId);
-        if (!sessionInfo) continue; // stale/missing session key -- never guess, skip
+        const messageKey = this._keyForEpoch(conversationId, entry.epoch);
+        if (!messageKey) { release(); continue; } // no key for this epoch -- never guess, skip
 
         try {
-          decoded = C.decryptFromWire(sessionInfo.key, ciphertext);
+          decoded = C.decryptFromWire(messageKey, ciphertext);
         } catch {
+          release();
           continue; // undecryptable (stale epoch) -- skip, never guess
         }
       }
@@ -1806,10 +2128,10 @@ export class WebClientSession {
             reactionEntry.epoch, reactionEntry.message_signature,
             C.REACTION_PAYLOAD_PURPOSE, "reaction (history)"
           )) continue;
-          const sessionInfo = this.sessionKeys.get(conversationId);
-          if (!sessionInfo) continue;
+          const reactionKey = this._keyForEpoch(conversationId, reactionEntry.epoch);
+          if (!reactionKey) continue;
           try {
-            reactions.push({ user: reactor, reaction: C.decryptFromWire(sessionInfo.key, reactionCiphertext) });
+            reactions.push({ user: reactor, reaction: C.decryptFromWire(reactionKey, reactionCiphertext) });
           } catch {
             continue;
           }
@@ -1836,6 +2158,8 @@ export class WebClientSession {
       }
       loadedCount += 1;
     }
+
+    flushEventsUpTo(null);
 
     this.onHistoryLoaded(conversationId, loadedCount);
     this.log(`Loaded ${loadedCount} historical message(s) for ${conversationId}.`);
@@ -2089,8 +2413,11 @@ export class WebClientSession {
   // observed yet, this throws and MUST NOT send approve=true to the
   // server -- mirrors ClientSession.respond_to_inbox()'s own docstring
   // exactly, including that guarantee.
-  async respondToInbox(notification, approve) {
-    if (approve && notification.type === "verification_request") {
+  async respondToInbox(notification, approve, consentInvitations = false) {
+    // A group invitation is approved like a verification request: approving is the explicit act that
+    // lets the inviter and this account trust each other, which is what lets the group key reach this
+    // account. The inviter's identity must have been observed by THIS client.
+    if (approve && (notification.type === "verification_request" || notification.type === "group_invitation")) {
       const requesterUsername = notification.requester_username;
       const peer = this.peers.get(requesterUsername);
       if (!peer || !peer.fingerprint) {
@@ -2098,9 +2425,16 @@ export class WebClientSession {
           `No observed identity for ${requesterUsername} yet; cannot verify them until they are online and you have exchanged keys.`
         );
       }
+      if (peer.state === "KEY_CHANGED") {
+        // Approving would verify an identity that changed since it was verified and was never
+        // compared: refuse, and send nothing. They must be verified again by hand.
+        throw new Error(
+          `${requesterUsername}'s identity has changed since it was verified; verify them again with their safety number before approving.`
+        );
+      }
       this.confirmPeerVerified(requesterUsername, peer.fingerprint);
     }
-    this.ws.send(JSON.stringify(P.createInboxResponsePacket(notification.notification_id, approve)));
+    this.ws.send(JSON.stringify(P.createInboxResponsePacket(notification.notification_id, approve, consentInvitations)));
   }
 
   // Phase 19.18 -- L-Group-Info closure: mirrors ClientSession.
@@ -2333,7 +2667,7 @@ export class WebClientSession {
       const sharedSecret = C.kemDecapsulate(C.base64ToBytes(encapsulation), this.kemKeypair.secretKey);
       const sessionKeyB64 = C.decryptFromWire(sharedSecret, wrappedKeyB64);
       const sessionKey = C.base64ToBytes(sessionKeyB64);
-      this.sessionKeys.set(conversationId, { key: sessionKey, epoch });
+      this._installSessionKey(conversationId, sessionKey, epoch);
       this.log(`Installed a synced key for conversation ${conversationId} from device ${sourceDeviceId}.`);
       await this._persistState();
     } catch {

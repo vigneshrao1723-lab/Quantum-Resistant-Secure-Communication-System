@@ -209,14 +209,20 @@ async def handle_browser_connection(websocket):
     )
     reader_thread.start()
 
+    pump_to_browser = asyncio.ensure_future(_pump_tcp_to_websocket(websocket, queue))
+    pump_to_server = asyncio.ensure_future(_pump_websocket_to_tcp(websocket, tcp_socket, send_lock))
+
     try:
-        await asyncio.gather(
-            _pump_tcp_to_websocket(websocket, queue),
-            _pump_websocket_to_tcp(websocket, tcp_socket, send_lock),
-        )
-    except ConnectionClosed:
-        pass
+        # Whichever direction ends first ends the whole connection. Waiting for BOTH (as this used
+        # to) left the server-side connection open after a browser closed its WebSocket cleanly
+        # (Logout, closing the tab): the user stayed "online" and the server kept the connection
+        # until some unrelated packet made a send fail.
+        await asyncio.wait({pump_to_browser, pump_to_server}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        for pump in (pump_to_browser, pump_to_server):
+            pump.cancel()
+        await asyncio.gather(pump_to_browser, pump_to_server, return_exceptions=True)
+
         stop_event.set()
 
         try:

@@ -923,6 +923,23 @@ a { color: inherit; }
 
 .empty-hint { color: var(--text-muted); font-size: 13px; line-height: 1.5; text-align: center; padding: 28px 20px; }
 
+/* A person search result: separate from the conversation list, with an explicit action. */
+.search-result {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-2) 2px;
+  padding: var(--space-3);
+  border: 1px dashed var(--accent-border);
+  border-radius: var(--radius-lg);
+  background: var(--accent-softer);
+}
+.search-result-text { flex: 1; min-width: 0; }
+.search-result-title { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-result-sub { font-size: 12px; color: var(--text-muted); }
+.row-handle { font-weight: 400; font-size: 12px; color: var(--text-muted); }
+.profile-handle { font-size: 12.5px; color: var(--text-muted); margin-top: calc(-1 * var(--space-1)); }
+
 /* Groups (and any list) empty state */
 .empty-state {
   display: flex;
@@ -1560,6 +1577,8 @@ video.bubble-media { max-width: 300px; max-height: 340px; background: #000; }
 }
 .bubble-reply-preview::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
 .bubble-reply-preview.is-link { cursor: pointer; }
+.bubble-reply-preview.is-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.bubble-reply-preview.is-unavailable .reply-text { font-style: italic; opacity: .85; }
 .reply-author { font-size: 12px; font-weight: 600; line-height: 1.3; }
 .reply-text {
   font-size: 12.5px;
@@ -2361,6 +2380,7 @@ video.bubble-media { max-width: 300px; max-height: 340px; background: #000; }
 .settings-item-lead { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .settings-item-label { font-size: 14px; font-weight: 600; }
 .settings-item-hint { font-size: 12.5px; color: var(--text-muted); margin-top: 2px; }
+.own-safety-number { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 13px; font-weight: 600; letter-spacing: .02em; padding: 10px 12px; border-radius: 10px; background: var(--surface-alt); color: var(--text); overflow-wrap: anywhere; user-select: all; }
 .settings-form { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 0 0 14px; border-bottom: 1px solid var(--border); animation: slide-down var(--t-panel) var(--ease-out); }
 .settings-form .input { width: 100%; }
 
@@ -2954,3 +2974,133 @@ video.bubble-media { max-width: 300px; max-height: 340px; background: #000; }
 .profile-presence { font-size: 12.5px; color: var(--text-muted); min-height: 1em; }
 .profile-bio { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-secondary); }
 .settings-form textarea.input { height: auto; min-height: 76px; padding: 10px 12px; resize: vertical; font-family: inherit; line-height: 1.45; }
+
+/* ==================================================================
+   Chat settings, concise verification, profile picture, recorder
+   ================================================================== */
+
+/* The hidden home of the chat tools the Chat settings menu runs. */
+.tool-registry { display: none !important; }
+
+/* An avatar that is a button: same circle, a visible focus ring, no browser button chrome. */
+.avatar-btn {
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  overflow: hidden;
+}
+.avatar-btn:hover { filter: brightness(1.06); }
+.avatar-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.avatar.xl { width: 168px; height: 168px; font-size: 64px; }
+.avatar.lg.avatar-btn { width: 64px; height: 64px; font-size: 24px; }
+
+/* The enlarged picture viewer */
+.picture-viewer-card { align-items: center; text-align: center; gap: 8px; width: min(360px, 100%); }
+.picture-viewer-card .avatar.xl { margin-bottom: 6px; }
+.picture-viewer-card .confirm-modal-actions { justify-content: center; width: 100%; }
+.picture-caption { max-width: 280px; }
+.profile-handle { font-size: 12.5px; color: var(--text-muted); }
+
+/* Settings profile row */
+.profile-row { display: flex; align-items: center; gap: 16px; padding: 4px 2px; }
+.profile-row-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.profile-row-name { font-size: 17px; font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
+.profile-row-handle { font-size: 13px; color: var(--text-muted); }
+.profile-row-hint { font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-top: 2px; }
+
+/* Crop dialog */
+/* Who in a group can exchange keys with this account: verification state per member and a notice
+   when this account cannot read the group yet. */
+.group-key-notice { margin: 0 0 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-alt); font-size: 13px; color: var(--text-secondary); }
+.group-key-notice[hidden] { display: none; }
+.member-trust { font-size: 12px; margin-right: 8px; color: var(--text-muted); white-space: nowrap; }
+.member-trust.is-verified { color: var(--success-text, var(--accent-text)); }
+.member-trust.is-attention { color: var(--danger-text); }
+/* A person entered by phone number, shown by name before they are added to a group. */
+.member-lookup { display: flex; align-items: center; gap: 10px; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-alt); font-size: 13px; color: var(--text-secondary); }
+.member-lookup[hidden] { display: none; }
+.member-lookup.is-error { color: var(--danger-text); }
+.member-lookup-text { display: flex; flex-direction: column; min-width: 0; }
+.member-lookup-name { font-weight: 600; color: var(--text-primary, inherit); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-lookup-handle { font-size: 12px; color: var(--text-muted); }
+.member-lookup .btn { margin-left: auto; }
+.member-lookup .btn + .btn { margin-left: 0; }
+.crop-card { align-items: center; width: min(360px, 100%); }
+.crop-card .confirm-modal-title,
+.crop-card .confirm-modal-message { text-align: center; align-self: stretch; }
+.crop-canvas { width: 280px; height: 280px; max-width: 100%; border-radius: var(--radius-lg); background: var(--surface-alt); cursor: grab; touch-action: none; }
+.crop-canvas:active { cursor: grabbing; }
+.crop-canvas:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.crop-zoom { display: flex; align-items: center; gap: 12px; align-self: stretch; font-size: 13px; color: var(--text-secondary); }
+.crop-zoom input[type="range"] { flex: 1; accent-color: var(--accent); }
+.crop-error { align-self: stretch; color: var(--danger-text); font-size: 13px; text-align: center; }
+.crop-card .confirm-modal-actions { align-self: stretch; }
+
+/* Security bar: one concise line, details beneath */
+.security-bar { flex-wrap: nowrap; align-items: center; gap: 10px; padding: 8px 14px 8px 18px; }
+.security-bar-icon { align-self: center; flex: none; }
+.security-bar-body { flex: 1 1 auto; min-width: 0; order: 0; }
+.security-status-text { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.security-bar[data-state="VERIFIED"] .security-status-text { color: var(--online-text); }
+.security-bar[data-state="KEY_CHANGED"] .security-status-text { color: var(--danger-text); }
+.security-bar-actions { display: flex; flex: none; flex-wrap: nowrap; gap: 6px; margin: 0 0 0 auto; box-shadow: none; align-items: center; }
+.security-bar-actions .btn-xs,
+.security-bar-actions .btn-xs:first-child,
+.security-bar-actions .btn-xs:last-child { border-radius: var(--radius-sm); margin-left: 0; font-size: 12.5px; padding: 0 10px; height: var(--control-h-xs); background: var(--surface); }
+.security-bar-actions .btn-xs .icon { display: inline-block; width: 14px; height: 14px; }
+.security-bar-toggle { display: none; }
+.security-bar[data-state="VERIFIED"] .security-bar-toggle { display: inline-flex; flex: none; }
+.security-bar[data-state="VERIFIED"].is-expanded { background: var(--surface); }
+
+.safety-details {
+  flex: none;
+  padding: 10px 18px 12px;
+  background: var(--surface-sunken);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.safety-details[hidden] { display: none; }
+.safety-details-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.safety-details-actions .btn-xs { background: var(--surface); }
+.own-number-panel { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px dashed var(--border-strong); }
+.own-number-panel[hidden] { display: none; }
+.own-number-hint { font-size: 12.5px; color: var(--text-secondary); line-height: 1.45; }
+
+/* Login: connection settings, collapsed */
+.connection-settings { margin-top: 14px; font-size: 12px; color: var(--text-muted); }
+.connection-settings > summary { cursor: pointer; list-style: none; display: inline-flex; align-items: center; gap: 6px; padding: 4px 2px; }
+.connection-settings > summary::-webkit-details-marker { display: none; }
+.connection-settings > summary::before { content: "\25B8"; font-size: 10px; transition: transform var(--t-micro) ease; }
+.connection-settings[open] > summary::before { transform: rotate(90deg); }
+.connection-settings > summary:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-xs); }
+.connection-settings .gateway-field { margin-top: 6px; border-top: 0; }
+
+/* Voice / video recorder */
+.media-recorder-card { width: min(400px, 100%); gap: 14px; }
+.media-recorder-header { display: flex; align-items: center; gap: 12px; }
+.media-recorder-card .media-recorder-header .confirm-modal-title { text-align: left; }
+.media-recorder-badge { flex: none; width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-text); }
+.media-recorder-badge .icon { width: 20px; height: 20px; }
+.media-recorder-subtitle { font-size: 12.5px; color: var(--text-muted); margin-top: 1px; }
+.media-recorder-meter { display: flex; align-items: center; justify-content: center; gap: 3px; height: 40px; }
+.media-recorder-meter span { width: 4px; height: 100%; border-radius: 2px; background: var(--border-strong); transform: scaleY(.12); transform-origin: center; transition: transform 90ms linear, background-color var(--t-menu) ease; }
+.media-recorder-card.is-recording .media-recorder-meter span { background: var(--danger); }
+.media-recorder-card[data-state="recorded"] .media-recorder-meter { display: none; }
+.media-recorder-card .media-recorder-timer { font-size: 34px; }
+.media-recorder-card > .btn-primary,
+.media-recorder-card > .btn-ghost { height: 44px; width: 100%; justify-content: center; }
+.media-recorder-card > .btn-ghost { border: 1px solid var(--border-strong); }
+.media-recorder-actions { border-top: 1px solid var(--border); padding-top: 14px; margin-top: 2px; }
+.media-recorder-actions .btn { min-width: 96px; justify-content: center; }
+audio.media-recorder-preview { max-height: none; height: 44px; background: transparent; }
+.media-recorder-actions .btn { height: 40px; }
+
+/* A reply's quote fills the top of its bubble, so the hover actions sit just above the bubble there
+   instead of covering the quote (which is itself clickable). */
+.msg-row:has(> .bubble > .bubble-reply-preview) > .msg-actions { top: -30px; }

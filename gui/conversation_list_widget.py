@@ -31,6 +31,7 @@ from gui.avatar import AvatarWidget
 from gui.icons import toolbar_icon
 from gui.message_widget import to_local_time
 from gui.styles import (
+    COLOR_ON_ACCENT,
     COLOR_TEXT,
     COLOR_TEXT_MUTED,
     COLOR_UNREAD,
@@ -73,7 +74,7 @@ class ConversationRow(QWidget):
     none of that requires touching this class's structure.
     """
 
-    def __init__(self, summary):
+    def __init__(self, summary, name_for=None, show_handle=True):
         super().__init__()
 
         # Phase 19.24 -- Mute: kept so contextMenuEvent() below can
@@ -93,7 +94,14 @@ class ConversationRow(QWidget):
         # below (avatar, timestamp, badge, preview) is unchanged,
         # unbranched code, exactly as anticipated when this class was
         # written in Phase 2.
-        display_name = summary.group_name if summary.is_group else summary.username
+        # A person is SHOWN by their display name, which is not unique; summary.username (the
+        # account handle) stays the row's identity and is shown, muted, beside the name when it
+        # differs, so two people who chose the same name can still be told apart.
+        handle = None if summary.is_group else summary.username
+        display_name = summary.group_name if summary.is_group else ((name_for or str)(handle) or handle)
+        # The handle is shown beside the name only where it is needed to tell two people apart (the
+        # Website does the same); everywhere else the name gets the whole line.
+        handle_text = f"@{handle}" if handle and display_name != handle and show_handle else ""
 
         # Presence is a property of a person, not of a group.
         avatar = AvatarWidget(
@@ -111,6 +119,13 @@ class ConversationRow(QWidget):
         name.setStyleSheet(
             f"font-size: 10.5pt; font-weight: 600; color: {COLOR_TEXT}; background: transparent;"
         )
+
+        self.handle_label = QLabel(handle_text)
+        self.handle_label.setTextFormat(Qt.PlainText)
+        self.handle_label.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font-size: 8.5pt; background: transparent;"
+        )
+        self.handle_label.setVisible(bool(handle_text))
 
         # Phase 19.24 -- Mute: a small, always-present-but-hidden glyph,
         # same "zero-footprint until relevant" convention as the unread
@@ -148,7 +163,7 @@ class ConversationRow(QWidget):
         self.unread_badge.setMinimumWidth(20)
         self.unread_badge.setAlignment(Qt.AlignCenter)
         self.unread_badge.setStyleSheet(
-            f"background-color: {COLOR_UNREAD}; color: #FFFFFF; "
+            f"background-color: {COLOR_UNREAD}; color: {COLOR_ON_ACCENT}; "
             "border-radius: 10px; font-size: 8.5pt; font-weight: 700; "
             "padding: 0px 6px;"
         )
@@ -182,6 +197,11 @@ class ConversationRow(QWidget):
             else "No messages yet"
         )
 
+        self._accessible_name = ("Group " if summary.is_group else "") + display_name + (
+            f" ({handle_text})" if handle_text else ""
+        )
+        self._accessible_preview = preview_text
+
         preview = ElidedLabel(preview_text)
         preview.setTextFormat(Qt.PlainText)
         preview.setStyleSheet(
@@ -191,6 +211,7 @@ class ConversationRow(QWidget):
         title_row = QHBoxLayout()
         title_row.setSpacing(6)
         title_row.addWidget(name, stretch=1)
+        title_row.addWidget(self.handle_label)
         title_row.addWidget(self.mute_icon)
         title_row.addWidget(timestamp)
 
@@ -210,6 +231,17 @@ class ConversationRow(QWidget):
     # ==========================================================
     # Public Methods
     # ==========================================================
+
+    def accessible_summary(self):
+        """Plain-text description of this row for assistive technology: a row is a
+        setItemWidget() widget, which screen readers cannot look inside."""
+
+        parts = [self._accessible_name, self._accessible_preview]
+
+        if self._last_count > 0:
+            parts.append(f"{self._last_count} unread")
+
+        return ", ".join(part for part in parts if part)
 
     def set_unread_count(self, count):
         """
@@ -338,6 +370,9 @@ class ConversationListWidget(QListWidget):
 
         self.setSpacing(4)
 
+        # handle -> name to show; ChatWindow supplies the session's display-name cache.
+        self.name_for = None
+
         # Rows elide their own text; a row that is a few px wider than the
         # viewport must not summon a horizontal scrollbar.
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -347,6 +382,18 @@ class ConversationListWidget(QListWidget):
     # ==========================================================
     # Public Methods
     # ==========================================================
+
+    def _is_namesake(self, summary, summaries):
+        """True when another person in the list is shown under the same display name."""
+
+        if summary.is_group:
+            return False
+        lookup = self.name_for or str
+        shown = lookup(summary.username) or summary.username
+        return sum(
+            1 for other in summaries
+            if not other.is_group and (lookup(other.username) or other.username) == shown
+        ) > 1
 
     def render(self, summaries):
         """
@@ -382,7 +429,7 @@ class ConversationListWidget(QListWidget):
 
             self.addItem(item)
 
-            row = ConversationRow(summary)
+            row = ConversationRow(summary, self.name_for, show_handle=self._is_namesake(summary, summaries))
             row.on_context_action = self._on_row_context_action
 
             # gui/styles.py's global QListWidget::item margin carves
@@ -398,6 +445,7 @@ class ConversationListWidget(QListWidget):
             )
 
             self.setItemWidget(item, row)
+            item.setData(Qt.AccessibleTextRole, row.accessible_summary())
 
             if summary.key == current_key:
                 self.setCurrentItem(item)
@@ -421,6 +469,7 @@ class ConversationListWidget(QListWidget):
 
                 if row is not None:
                     row.set_unread_count(count)
+                    item.setData(Qt.AccessibleTextRole, row.accessible_summary())
 
                 break
 

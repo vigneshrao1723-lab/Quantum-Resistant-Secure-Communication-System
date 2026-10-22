@@ -89,6 +89,70 @@ function initialOf(name) {
   return (name || "?").trim().charAt(0).toUpperCase() || "?";
 }
 
+// The open direct chat's account handle. The search box is ONLY a search box: what is typed
+// there never decides who a message, verification or key is for.
+function currentPeer() {
+  return activeDirectPeer || "";
+}
+
+// The name to SHOW for an account handle. Display names are not unique (two people may both be
+// "Vignesh"); everything that addresses, verifies or authorizes keeps using the handle.
+function nameOf(handle) {
+  return (session && session.displayNameFor(handle)) || handle || "";
+}
+
+// Display name plus, when it differs, the muted @handle: two people may share a display name,
+// and the handle is what tells them apart on screen.
+function nameWithHandleHtml(handle) {
+  const name = nameOf(handle);
+  return name === handle
+    ? escapeHtml(name)
+    : `${escapeHtml(name)} <span class="row-handle">@${escapeHtml(handle)}</span>`;
+}
+
+// Handles seen on screen whose display names are not known yet are fetched in one batch.
+const pendingNameLookups = new Set();
+const requestedNameLookups = new Set();
+let nameLookupTimer = null;
+function requestDisplayNames(handles) {
+  if (!session) return;
+  for (const handle of handles || []) {
+    if (handle && !session.displayNames.has(handle) && !requestedNameLookups.has(handle)) {
+      pendingNameLookups.add(handle);
+    }
+  }
+  if (pendingNameLookups.size === 0 || nameLookupTimer) return;
+  nameLookupTimer = setTimeout(async () => {
+    nameLookupTimer = null;
+    const batch = Array.from(pendingNameLookups);
+    pendingNameLookups.clear();
+    batch.forEach((handle) => requestedNameLookups.add(handle));
+    try { await session.fetchDisplayNames(batch); } catch { /* names fall back to handles */ }
+  }, 60);
+}
+
+// Re-label everything that shows a person after display names arrived.
+function refreshShownNames() {
+  renderChatList();
+  if (session) renderGroupList();
+  if (activeDirectPeer) {
+    chatTitleEl.querySelector(".chat-header-name").textContent = nameOf(activeDirectPeer);
+  }
+  for (const label of document.querySelectorAll(".bubble-sender[data-handle]")) {
+    label.textContent = nameOf(label.dataset.handle);
+  }
+  for (const row of document.querySelectorAll(".group-event")) {
+    if (row._event) row.querySelector(".bubble").textContent = groupEventText(row._event);
+  }
+  if (typeof groupInfoViewEl !== "undefined" && !groupInfoViewEl.hidden) renderGroupInfo();
+  const ownName = document.getElementById("ownDisplayName");
+  if (ownName && session) ownName.textContent = nameOf(session.username);
+}
+
+function looksLikePhoneNumber(text) {
+  return /^\+?[\d\s().-]{6,}$/.test(text || "");
+}
+
 // ------------------------------------------------------------------
 // Phase 1 UI polish -- small presentation helpers. None of these read
 // or write session state; they only build DOM / format values that
@@ -385,6 +449,24 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
   });
 });
 
+// The number of requests waiting for THIS account's decision, on the Inbox tab.
+function updateInboxBadge(count) {
+  const badge = document.getElementById("inboxBadge");
+  if (!badge) return;
+  badge.textContent = String(count);
+  badge.hidden = !count;
+}
+
+async function refreshInboxBadge() {
+  if (!session) return;
+  try {
+    const notifications = await session.loadInbox();
+    updateInboxBadge(notifications.filter((n) => n.status === "pending" && n.requester_username !== session.username).length);
+  } catch {
+    // The badge is a convenience; the Inbox itself reports a failed load.
+  }
+}
+
 function isInboxTabActive() {
   const btn = document.querySelector('.tab-btn[data-tab="inbox"]');
   return !!btn && btn.classList.contains("is-active");
@@ -400,12 +482,30 @@ document.getElementById("settingsBackBtn").addEventListener("click", () => setMa
 document.getElementById("settingsToggleBtn").addEventListener("click", () => {
   setMainView("settings");
   loadMyBio();
-  if (session) loadPeerAvatar(document.getElementById("myProfilePicAvatar"), session.username, initialOf(session.username));
+  renderOwnProfile();
 });
+
+// The Settings profile row: your picture (a button -- it opens the enlarged viewer, the one place
+// the picture can be changed), your display name and your handle.
+function renderOwnProfile() {
+  if (!session) return;
+  requestDisplayNames([session.username]);
+  document.getElementById("ownDisplayName").textContent = nameOf(session.username);
+  document.getElementById("ownHandle").textContent = `@${session.username}`;
+  loadPeerAvatar(document.getElementById("myProfilePicAvatar"), session.username, initialOf(nameOf(session.username)));
+}
 
 // Bio: view/edit this account's own bio (the same bio_request/
 // change_bio_request round trips Desktop and Android use; the server caps it
 // at 256 characters and returns an error for more).
+async function loadOwnSafetyNumber() {
+  const el = document.getElementById("ownSafetyNumber");
+  if (!session || !el) return;
+  try {
+    const value = await session.ownFingerprint();
+    if (value) el.textContent = value;
+  } catch { /* leave the placeholder */ }
+}
 const NO_BIO_HINT = "No bio set. It is shown on your profile.";
 async function loadMyBio() {
   if (!session) return;
@@ -445,12 +545,12 @@ document.getElementById("changeUsernameToggleBtn").addEventListener("click", () 
 });
 document.getElementById("changeUsernameSubmitBtn").addEventListener("click", async () => {
   const hintEl = document.getElementById("changeUsernameHint");
-  const newUsername = document.getElementById("newUsernameInput").value.trim();
-  if (!newUsername || !session) return;
+  const newName = document.getElementById("newUsernameInput").value.trim();
+  if (!newName || !session) return;
   try {
-    const result = await session.changeUsername(newUsername);
-    if (!result.success) throw new Error(result.error || "Could not change username.");
-    hintEl.textContent = "Username changed.";
+    const result = await session.changeDisplayName(newName);
+    if (!result.success) throw new Error(result.error || "Could not change your name.");
+    hintEl.textContent = "Name updated.";
     document.getElementById("newUsernameInput").value = "";
   } catch (error) {
     hintEl.textContent = error.message;
@@ -479,26 +579,246 @@ document.getElementById("changePasswordSubmitBtn").addEventListener("click", asy
   }
 });
 
-document.getElementById("profilePicChangeBtn").addEventListener("click", () => {
-  document.getElementById("profilePicInput").click();
-});
+// Choosing a picture does not upload it: the file is checked, then shown in a crop dialog where the
+// person positions and zooms it, and only the square they leave visible is uploaded (as a PNG).
+const PROFILE_PICTURE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+const PROFILE_PICTURE_MAX_INPUT_BYTES = 10 * 1024 * 1024;
+const PROFILE_PICTURE_MIN_SIDE = 64;
+const PROFILE_PICTURE_MAX_SIDE = 8192;
+const PROFILE_PICTURE_OUTPUT_SIDE = 256;
+
+// Returns {bitmap} or {error} -- never throws.
+async function checkProfilePictureFile(file) {
+  if (!PROFILE_PICTURE_TYPES.includes(file.type)) {
+    return { error: "Choose a PNG, JPEG, WebP or GIF image." };
+  }
+  if (file.size > PROFILE_PICTURE_MAX_INPUT_BYTES) {
+    return { error: `That image is too large (${formatBytes(file.size)}). Choose one under ${formatBytes(PROFILE_PICTURE_MAX_INPUT_BYTES)}.` };
+  }
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return { error: "That file couldn't be read as an image." };
+  }
+  if (bitmap.width < PROFILE_PICTURE_MIN_SIDE || bitmap.height < PROFILE_PICTURE_MIN_SIDE) {
+    bitmap.close?.();
+    return { error: `That image is too small. Use one at least ${PROFILE_PICTURE_MIN_SIDE} \u00D7 ${PROFILE_PICTURE_MIN_SIDE} pixels.` };
+  }
+  if (bitmap.width > PROFILE_PICTURE_MAX_SIDE || bitmap.height > PROFILE_PICTURE_MAX_SIDE) {
+    bitmap.close?.();
+    return { error: `That image is too large. Use one no bigger than ${PROFILE_PICTURE_MAX_SIDE} \u00D7 ${PROFILE_PICTURE_MAX_SIDE} pixels.` };
+  }
+  return { bitmap };
+}
+
+function openProfilePictureCropper(bitmap, onUploaded) {
+  const VIEW = 280;
+  const overlay = document.createElement("div");
+  overlay.className = "confirm-modal crop-modal";
+  const card = document.createElement("div");
+  card.className = "confirm-modal-card crop-card";
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-modal", "true");
+  card.setAttribute("aria-labelledby", "cropTitle");
+  overlay.appendChild(card);
+
+  const title = document.createElement("div");
+  title.className = "confirm-modal-title";
+  title.id = "cropTitle";
+  title.textContent = "Adjust your picture";
+  card.appendChild(title);
+
+  const hint = document.createElement("div");
+  hint.className = "confirm-modal-message";
+  hint.textContent = "Drag to position it, and use the slider to zoom. The circle is what people will see.";
+  card.appendChild(hint);
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "crop-canvas";
+  canvas.width = VIEW;
+  canvas.height = VIEW;
+  canvas.tabIndex = 0;
+  canvas.setAttribute("aria-label", "Picture position. Use the arrow keys to move it, plus and minus to zoom.");
+  card.appendChild(canvas);
+
+  const zoomRow = document.createElement("label");
+  zoomRow.className = "crop-zoom";
+  const zoomLabel = document.createElement("span");
+  zoomLabel.textContent = "Zoom";
+  const zoom = document.createElement("input");
+  zoom.type = "range";
+  zoom.min = "1";
+  zoom.max = "4";
+  zoom.step = "0.01";
+  zoom.value = "1";
+  zoom.id = "cropZoom";
+  zoom.setAttribute("aria-label", "Zoom");
+  zoomRow.append(zoomLabel, zoom);
+  card.appendChild(zoomRow);
+
+  const errorEl = document.createElement("div");
+  errorEl.className = "crop-error";
+  errorEl.setAttribute("role", "alert");
+  errorEl.hidden = true;
+  card.appendChild(errorEl);
+
+  const actions = document.createElement("div");
+  actions.className = "confirm-modal-actions";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "btn btn-ghost btn-sm";
+  cancelBtn.textContent = "Cancel";
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "btn btn-primary btn-sm";
+  saveBtn.id = "cropSaveBtn";
+  saveBtn.textContent = "Save picture";
+  actions.append(cancelBtn, saveBtn);
+  card.appendChild(actions);
+
+  // The image is scaled so it always COVERS the square (never leaves an empty edge), then zoomed
+  // and shifted; the shift is clamped so the square stays inside the image.
+  const base = Math.max(VIEW / bitmap.width, VIEW / bitmap.height);
+  let zoomLevel = 1;
+  let offsetX = (VIEW - bitmap.width * base) / 2;
+  let offsetY = (VIEW - bitmap.height * base) / 2;
+  const scale = () => base * zoomLevel;
+  function clamp() {
+    const w = bitmap.width * scale();
+    const h = bitmap.height * scale();
+    offsetX = Math.min(0, Math.max(VIEW - w, offsetX));
+    offsetY = Math.min(0, Math.max(VIEW - h, offsetY));
+  }
+  function setZoom(next, anchorX = VIEW / 2, anchorY = VIEW / 2) {
+    const clamped = Math.min(4, Math.max(1, next));
+    const ratio = clamped / zoomLevel;
+    offsetX = anchorX - (anchorX - offsetX) * ratio;
+    offsetY = anchorY - (anchorY - offsetY) * ratio;
+    zoomLevel = clamped;
+    zoom.value = String(zoomLevel);
+    clamp();
+    draw();
+  }
+  const ctx = canvas.getContext("2d");
+  function draw() {
+    ctx.clearRect(0, 0, VIEW, VIEW);
+    ctx.drawImage(bitmap, offsetX, offsetY, bitmap.width * scale(), bitmap.height * scale());
+    // Dim everything outside the circle.
+    ctx.save();
+    ctx.fillStyle = "rgba(15, 16, 22, 0.55)";
+    ctx.beginPath();
+    ctx.rect(0, 0, VIEW, VIEW);
+    ctx.arc(VIEW / 2, VIEW / 2, VIEW / 2 - 2, 0, Math.PI * 2, true);
+    ctx.fill("evenodd");
+    ctx.restore();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(VIEW / 2, VIEW / 2, VIEW / 2 - 2, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  draw();
+
+  let drag = null;
+  canvas.addEventListener("pointerdown", (event) => {
+    canvas.setPointerCapture(event.pointerId);
+    drag = { x: event.clientX, y: event.clientY, ox: offsetX, oy: offsetY };
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    offsetX = drag.ox + (event.clientX - drag.x);
+    offsetY = drag.oy + (event.clientY - drag.y);
+    clamp();
+    draw();
+  });
+  const endDrag = () => { drag = null; };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    setZoom(zoomLevel * (event.deltaY < 0 ? 1.08 : 1 / 1.08));
+  }, { passive: false });
+  canvas.addEventListener("keydown", (event) => {
+    const step = 12;
+    const moves = { ArrowLeft: [step, 0], ArrowRight: [-step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] };
+    if (moves[event.key]) {
+      event.preventDefault();
+      offsetX += moves[event.key][0];
+      offsetY += moves[event.key][1];
+      clamp();
+      draw();
+    } else if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      setZoom(zoomLevel + 0.1);
+    } else if (event.key === "-" || event.key === "_") {
+      event.preventDefault();
+      setZoom(zoomLevel - 0.1);
+    }
+  });
+  zoom.addEventListener("input", () => setZoom(Number(zoom.value)));
+
+  function close() {
+    bitmap.close?.();
+    dismissOverlay(overlay);
+  }
+  cancelBtn.addEventListener("click", close);
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.stopPropagation(); close(); }
+  });
+
+  saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    cancelBtn.disabled = true;
+    errorEl.hidden = true;
+    try {
+      // The visible square, in source pixels -> a fixed-size square PNG.
+      const out = document.createElement("canvas");
+      out.width = PROFILE_PICTURE_OUTPUT_SIDE;
+      out.height = PROFILE_PICTURE_OUTPUT_SIDE;
+      const sourceSide = VIEW / scale();
+      out.getContext("2d").drawImage(
+        bitmap, -offsetX / scale(), -offsetY / scale(), sourceSide, sourceSide,
+        0, 0, PROFILE_PICTURE_OUTPUT_SIDE, PROFILE_PICTURE_OUTPUT_SIDE
+      );
+      const blob = await new Promise((resolve, reject) => {
+        out.toBlob((b) => (b ? resolve(b) : reject(new Error("Could not prepare the picture."))), "image/png");
+      });
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const result = await session.uploadProfilePicture(bytes, "image/png");
+      if (result && result.success === false) throw new Error(result.error || "The server refused the picture.");
+      close();
+      toast("Profile picture updated", "success");
+      onUploaded(bytes);
+    } catch (error) {
+      errorEl.textContent = `Upload failed: ${error.message}`;
+      errorEl.hidden = false;
+      saveBtn.disabled = false;
+      cancelBtn.disabled = false;
+    }
+  });
+
+  mountOverlay(overlay, canvas);
+}
+
 document.getElementById("profilePicInput").addEventListener("change", async () => {
   const input = document.getElementById("profilePicInput");
   const file = input.files && input.files[0];
+  input.value = "";
   if (!file || !session) return;
   const hintEl = document.getElementById("myProfilePicHint");
-  const originalHint = hintEl.textContent;
-  hintEl.textContent = "Uploading...";
-  try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    await session.uploadProfilePicture(bytes, file.type || "image/png");
-    setAvatarImage(document.getElementById("myProfilePicAvatar"), bytes, file.type || "image/png");
-    hintEl.textContent = "Visible to anyone who looks your account up.";
-  } catch (error) {
-    hintEl.textContent = `Upload failed: ${error.message}`;
-  } finally {
-    input.value = "";
+  const checked = await checkProfilePictureFile(file);
+  if (checked.error) {
+    hintEl.textContent = checked.error;
+    toast(checked.error, "error");
+    return;
   }
+  hintEl.textContent = "Select your picture to view or change it. It is visible to anyone who looks your account up.";
+  openProfilePictureCropper(checked.bitmap, (bytes) => {
+    setAvatarImage(document.getElementById("myProfilePicAvatar"), bytes, "image/png");
+    document.getElementById("myProfilePicAvatar").onclick = () => showProfilePictureViewer(session.username);
+    document.dispatchEvent(new CustomEvent("own-picture-updated", { detail: { bytes } }));
+  });
 });
 
 document.getElementById("settingsLogoutBtn").addEventListener("click", () => {
@@ -510,7 +830,38 @@ document.getElementById("settingsLogoutBtn").addEventListener("click", () => {
 // mirrors gui/input_bar.py's/mobile/app.py's own identical three
 // choices, so the feature looks and behaves like the same app across
 // all three clients.
-document.getElementById("attachBtn").addEventListener("click", (event) => {
+// Where an attachment goes: the OPEN chat -- a direct peer or a group. Captured when the picker or
+// recorder is opened, so switching views mid-way can never redirect it.
+function activeAttachmentTarget() {
+  if (!groupChatViewEl.hidden) {
+    const conversationId = activeGroupIdEl.value;
+    return { kind: "group", conversationId, container: groupMessagesEl, target: { conversationId } };
+  }
+  const peerUsername = currentPeer();
+  return { kind: "direct", peerUsername, container: messagesEl, target: { peerUsername } };
+}
+
+// Sends bytes to ``where`` through the one encrypted attachment pipeline and shows them in that
+// chat's transcript. A group message is one stored copy delivered to every member.
+async function sendAttachmentTo(where, bytes, filename, mimeType, renderType) {
+  await session.sendAttachment(where.target, bytes, filename, mimeType);
+  if (where.kind === "direct") {
+    knownDirectPeers.add(where.peerUsername);
+    renderChatList();
+  }
+  // Only into the transcript that is still open: the person may have moved on while it uploaded.
+  const stillOpen = where.kind === "group"
+    ? !groupChatViewEl.hidden && activeGroupIdEl.value === where.conversationId
+    : !chatViewEl.hidden && currentPeer() === where.peerUsername;
+  if (stillOpen) {
+    renderAttachment(where.container, "me", renderType, bytes, {
+      filename, mime_type: mimeType, size_bytes: bytes.length,
+    });
+  }
+}
+
+for (const [buttonId, isGroup] of [["attachBtn", false], ["groupAttachBtn", true]]) {
+document.getElementById(buttonId).addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
   closeAnyOpenPopup();
@@ -526,7 +877,7 @@ document.getElementById("attachBtn").addEventListener("click", (event) => {
       clickEvent.stopPropagation();
       closeAnyOpenPopup();
       if (choice === "file") {
-        document.getElementById("attachmentInput").click();
+        document.getElementById(isGroup ? "groupAttachmentInput" : "attachmentInput").click();
       } else {
         openMediaRecorderModal(choice);
       }
@@ -535,17 +886,20 @@ document.getElementById("attachBtn").addEventListener("click", (event) => {
   }
   openPopup(menu, event, event.currentTarget);
 });
-document.getElementById("attachmentInput").addEventListener("change", () => {
-  const input = document.getElementById("attachmentInput");
-  const hasFile = input.files.length > 0;
-  const btn = document.getElementById("sendAttachmentBtn");
-  btn.hidden = !hasFile;
-  // Name the picked file on the button itself, so it's clear what
-  // "Send" will send.
-  const file = hasFile ? input.files[0] : null;
-  btn.querySelector(".composer-file-label").textContent = file ? `Send ${file.name}` : "Send file";
-  btn.title = file ? `Send ${file.name} (${formatBytes(file.size)})` : "";
-});
+}
+for (const [inputId, sendId] of [["attachmentInput", "sendAttachmentBtn"], ["groupAttachmentInput", "sendGroupAttachmentBtn"]]) {
+  document.getElementById(inputId).addEventListener("change", () => {
+    const input = document.getElementById(inputId);
+    const hasFile = input.files.length > 0;
+    const btn = document.getElementById(sendId);
+    btn.hidden = !hasFile;
+    // Name the picked file on the button itself, so it's clear what
+    // "Send" will send.
+    const file = hasFile ? input.files[0] : null;
+    btn.querySelector(".composer-file-label").textContent = file ? `Send ${file.name}` : "Send file";
+    btn.title = file ? `Send ${file.name} (${formatBytes(file.size)})` : "";
+  });
+}
 
 // ------------------------------------------------------------------
 // Phase 19.24 -- Voice/Video Messages: a REAL recording, via the
@@ -561,32 +915,75 @@ document.getElementById("attachmentInput").addEventListener("change", () => {
 const MAX_VOICE_SECONDS = 120;
 const MAX_VIDEO_SECONDS = 60;
 
+function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.round(totalSeconds || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// A human reason for a failed getUserMedia(), so the person knows what to do.
+function recorderAccessMessage(error, mode) {
+  const device = mode === "video" ? "camera and microphone" : "microphone";
+  switch (error && error.name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return `Access to the ${device} was blocked. Allow it in your browser's site settings, then try again.`;
+    case "NotFoundError":
+    case "OverconstrainedError":
+      return `No ${device} was found. Connect one and try again.`;
+    case "NotReadableError":
+    case "AbortError":
+      return `The ${device} is being used by another app. Close it and try again.`;
+    default:
+      return `Couldn't use the ${device}${error && error.message ? `: ${error.message}` : "."}`;
+  }
+}
+
 function openMediaRecorderModal(mode) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    toast("Recording isn't available here. Open this page over HTTPS or on localhost.", "error");
+    return;
+  }
   const constraints = mode === "video" ? { audio: true, video: true } : { audio: true };
+  const where = activeAttachmentTarget();
   navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
-    _buildMediaRecorderModal(mode, stream);
+    _buildMediaRecorderModal(mode, stream, where);
   }).catch((error) => {
     appendLog(
       `ERROR: could not access the ${mode === "video" ? "camera/microphone" : "microphone"}: ${error.message}`
     );
-    toast(`Couldn't access the ${mode === "video" ? "camera or microphone" : "microphone"}.`, "error");
+    toast(recorderAccessMessage(error, mode), "error");
   });
 }
 
-function _buildMediaRecorderModal(mode, stream) {
+function _buildMediaRecorderModal(mode, stream, where) {
+  const maxSeconds = mode === "video" ? MAX_VIDEO_SECONDS : MAX_VOICE_SECONDS;
   const overlay = document.createElement("div");
   overlay.className = "media-recorder-modal";
   const card = document.createElement("div");
   card.className = "media-recorder-card";
+  card.dataset.state = "idle";
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-modal", "true");
-  card.setAttribute("aria-label", mode === "video" ? "Record a video message" : "Record a voice message");
+  card.setAttribute("aria-labelledby", "recorderTitle");
   overlay.appendChild(card);
 
+  const header = document.createElement("div");
+  header.className = "media-recorder-header";
+  const badge = document.createElement("span");
+  badge.className = "media-recorder-badge";
+  badge.setAttribute("aria-hidden", "true");
+  badge.appendChild(icon(mode === "video" ? "video" : "mic"));
+  const headerText = document.createElement("div");
   const titleEl = document.createElement("div");
   titleEl.className = "confirm-modal-title";
+  titleEl.id = "recorderTitle";
   titleEl.textContent = mode === "video" ? "Video message" : "Voice message";
-  card.appendChild(titleEl);
+  const subtitleEl = document.createElement("div");
+  subtitleEl.className = "media-recorder-subtitle";
+  subtitleEl.textContent = `Up to ${formatClock(maxSeconds)}. Sent end-to-end encrypted.`;
+  headerText.append(titleEl, subtitleEl);
+  header.append(badge, headerText);
+  card.appendChild(header);
 
   let previewEl = null;
   if (mode === "video") {
@@ -594,25 +991,42 @@ function _buildMediaRecorderModal(mode, stream) {
     previewEl.className = "media-recorder-preview";
     previewEl.autoplay = true;
     previewEl.muted = true;
+    previewEl.playsInline = true;
     previewEl.srcObject = stream;
+    previewEl.setAttribute("aria-label", "Camera preview");
     card.appendChild(previewEl);
   }
 
-  const statusEl = document.createElement("div");
-  statusEl.className = "media-recorder-status";
-  statusEl.textContent = "Ready to record.";
-  card.appendChild(statusEl);
+  // Live input level while recording (voice and video alike): proof the microphone is working.
+  const meter = document.createElement("div");
+  meter.className = "media-recorder-meter";
+  meter.setAttribute("aria-hidden", "true");
+  const bars = Array.from({ length: 24 }, () => {
+    const bar = document.createElement("span");
+    meter.appendChild(bar);
+    return bar;
+  });
+  card.appendChild(meter);
 
   const timerEl = document.createElement("div");
   timerEl.className = "media-recorder-timer";
-  timerEl.textContent = "00:00";
+  timerEl.setAttribute("role", "timer");
+  timerEl.setAttribute("aria-label", "Recording time");
+  timerEl.textContent = "0:00";
   card.appendChild(timerEl);
+
+  const statusEl = document.createElement("div");
+  statusEl.className = "media-recorder-status";
+  statusEl.setAttribute("aria-live", "polite");
+  statusEl.textContent = "Press Record when you are ready.";
+  card.appendChild(statusEl);
 
   const recordBtn = document.createElement("button");
   recordBtn.type = "button";
+  recordBtn.dataset.role = "record";
   recordBtn.className = "btn btn-primary btn-sm";
-  // Icon + word instead of the old ⏺/⏹ glyphs (which render at a
-  // different size and colour on every platform).
+  // Icon + word instead of the old glyphs (which render at a different size and colour on
+  // every platform).
   const setRecordLabel = (label, iconName) => {
     recordBtn.replaceChildren(icon(iconName), document.createTextNode(label));
   };
@@ -634,14 +1048,48 @@ function _buildMediaRecorderModal(mode, stream) {
   actionsRow.appendChild(sendBtn);
   card.appendChild(actionsRow);
 
+  overlay._returnFocus = document.activeElement;
   document.body.appendChild(overlay);
+  recordBtn.focus({ preventScroll: true });
 
   let recorder = null;
   let chunks = [];
   let recordedBlob = null;
+  let recordedUrl = null;
   let elapsedSeconds = 0;
   let tickInterval = null;
-  const maxSeconds = mode === "video" ? MAX_VIDEO_SECONDS : MAX_VOICE_SECONDS;
+  let audioContext = null;
+  let levelFrame = null;
+
+  function setState(state) {
+    card.dataset.state = state;
+    card.classList.toggle("is-recording", state === "recording");
+  }
+
+  function stopMeter() {
+    if (levelFrame) cancelAnimationFrame(levelFrame);
+    levelFrame = null;
+    bars.forEach((bar) => { bar.style.transform = "scaleY(0.12)"; });
+  }
+
+  function startMeter() {
+    try {
+      audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 64;
+      audioContext.createMediaStreamSource(stream).connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const paint = () => {
+        analyser.getByteFrequencyData(data);
+        bars.forEach((bar, i) => {
+          const level = (data[i % data.length] || 0) / 255;
+          bar.style.transform = `scaleY(${Math.max(0.12, Math.min(1, level * 1.4))})`;
+        });
+        levelFrame = requestAnimationFrame(paint);
+      };
+      paint();
+    } catch { /* the meter is cosmetic */ }
+  }
 
   function stopAllTracks() {
     stream.getTracks().forEach((track) => track.stop());
@@ -649,50 +1097,88 @@ function _buildMediaRecorderModal(mode, stream) {
 
   function cleanupAndClose() {
     if (tickInterval) clearInterval(tickInterval);
+    stopMeter();
+    if (recorder && recorder.state !== "inactive") {
+      recorder.onstop = null;
+      try { recorder.stop(); } catch { /* already stopped */ }
+    }
     stopAllTracks();
-    overlay.remove();
+    if (audioContext) audioContext.close().catch(() => {});
+    if (recordedUrl) URL.revokeObjectURL(recordedUrl);
+    dismissOverlay(overlay);
   }
 
   function startRecording() {
+    // Record again: the previous take is discarded.
+    if (recordedUrl) { URL.revokeObjectURL(recordedUrl); recordedUrl = null; }
+    recordedBlob = null;
     chunks = [];
     elapsedSeconds = 0;
-    timerEl.textContent = "00:00";
-    recorder = new MediaRecorder(stream);
+    timerEl.textContent = "0:00";
+    if (mode === "voice" && previewEl) { previewEl.remove(); previewEl = null; }
+    if (mode === "video" && previewEl) {
+      previewEl.controls = false;
+      previewEl.removeAttribute("src");
+      previewEl.muted = true;
+      previewEl.srcObject = stream;
+      previewEl.play().catch(() => {});
+    }
+    try {
+      recorder = new MediaRecorder(stream);
+    } catch (error) {
+      statusEl.textContent = `Recording isn't supported here: ${error.message}`;
+      return;
+    }
     recorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) chunks.push(event.data);
     };
+    recorder.onerror = (event) => {
+      statusEl.textContent = `Recording failed: ${event.error?.message || "the recorder reported an error."}`;
+      setState("idle");
+      stopMeter();
+    };
     recorder.onstop = () => {
+      stopMeter();
       recordedBlob = new Blob(
         chunks, { type: recorder.mimeType || (mode === "video" ? "video/webm" : "audio/webm") }
       );
-      statusEl.textContent = "Recording ready to send.";
+      if (recordedBlob.size === 0) {
+        statusEl.textContent = "Nothing was recorded. Check your microphone and try again.";
+        setState("idle");
+        setRecordLabel("Record", "mic");
+        return;
+      }
+      setState("recorded");
+      statusEl.textContent = mode === "video" ? "Watch your recording, then send it." : "Listen to your recording, then send it.";
       sendBtn.disabled = false;
+      recordBtn.className = "btn btn-ghost btn-sm";
       setRecordLabel("Record again", "mic");
-      card.classList.remove("is-recording");
+      recordedUrl = URL.createObjectURL(recordedBlob);
       if (mode === "video" && previewEl) {
         previewEl.srcObject = null;
         previewEl.muted = false;
         previewEl.controls = true;
-        previewEl.src = URL.createObjectURL(recordedBlob);
+        previewEl.src = recordedUrl;
+        previewEl.setAttribute("aria-label", "Your recording");
       } else if (mode === "voice") {
-        if (!previewEl) {
-          previewEl = document.createElement("audio");
-          previewEl.className = "media-recorder-preview";
-          card.insertBefore(previewEl, statusEl);
-        }
+        previewEl = document.createElement("audio");
+        previewEl.className = "media-recorder-preview";
         previewEl.controls = true;
-        previewEl.src = URL.createObjectURL(recordedBlob);
+        previewEl.src = recordedUrl;
+        previewEl.setAttribute("aria-label", "Your recording");
+        card.insertBefore(previewEl, statusEl);
       }
     };
     recorder.start();
+    setState("recording");
     statusEl.textContent = "Recording…";
+    recordBtn.className = "btn btn-primary btn-sm";
     setRecordLabel("Stop", "stop");
-    card.classList.add("is-recording");
     sendBtn.disabled = true;
+    startMeter();
     tickInterval = setInterval(() => {
       elapsedSeconds += 1;
-      timerEl.textContent =
-        `${String(Math.floor(elapsedSeconds / 60)).padStart(2, "0")}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+      timerEl.textContent = formatClock(elapsedSeconds);
       if (elapsedSeconds >= maxSeconds) stopRecording();
     }, 1000);
   }
@@ -711,21 +1197,22 @@ function _buildMediaRecorderModal(mode, stream) {
   });
 
   cancelBtn.addEventListener("click", cleanupAndClose);
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.stopPropagation(); cleanupAndClose(); }
+  });
 
   sendBtn.addEventListener("click", async () => {
     if (!recordedBlob) return;
     sendBtn.disabled = true;
-    const peerUsername = document.getElementById("peerUsername").value;
+    statusEl.textContent = "Sending…";
     const filename = mode === "video" ? "video-message.webm" : "voice-message.webm";
     try {
       const bytes = new Uint8Array(await recordedBlob.arrayBuffer());
-      await session.sendAttachment({ peerUsername }, bytes, filename, recordedBlob.type);
-      renderAttachment(messagesEl, "me", mode, bytes, {
-        filename, mime_type: recordedBlob.type, size_bytes: bytes.length,
-      });
+      await sendAttachmentTo(where, bytes, filename, recordedBlob.type, mode);
       cleanupAndClose();
     } catch (error) {
       reportActionError(error);
+      statusEl.textContent = `Couldn't send: ${error.message}`;
       sendBtn.disabled = false;
     }
   });
@@ -787,6 +1274,8 @@ function registerBubbleMessageId(bubble, messageId) {
   if (!bubble || !messageId) return;
   bubble.dataset.messageId = messageId;
   bubblesByMessageId.set(messageId, bubble);
+  // A reply rendered before its original (e.g. the original's id only arrived now) resolves now.
+  refreshRepliesTo(messageId);
 }
 
 function resolveOldestPendingSentBubble(key, messageId) {
@@ -1381,15 +1870,21 @@ async function showPeerProfile(username) {
   const avatar = document.createElement("div");
   avatar.className = "avatar lg";
   avatar.dataset.tone = avatarTone(username);
-  avatar.textContent = initialOf(username);
+  avatar.textContent = initialOf(nameOf(username));
   card.appendChild(avatar);
 
   const nameEl = document.createElement("div");
   nameEl.className = "confirm-modal-title";
   nameEl.id = `profile-title-${Date.now()}`;
-  nameEl.textContent = username;
+  nameEl.textContent = nameOf(username);
   card.setAttribute("aria-labelledby", nameEl.id);
   card.appendChild(nameEl);
+
+  // The handle tells apart two people who chose the same display name.
+  const handleEl = document.createElement("div");
+  handleEl.className = "profile-handle";
+  handleEl.textContent = `@${username}`;
+  card.appendChild(handleEl);
 
   const presenceEl = document.createElement("div");
   presenceEl.className = "profile-presence";
@@ -1426,13 +1921,39 @@ document.getElementById("peerProfileBtn").addEventListener("click", () => showPe
 // Group Info: add members / leave. Both only send the request -- the server
 // decides (admin adds directly, others go to the admin's Inbox) and the
 // result comes back as the group_members_added / group_member_left events.
-document.getElementById("groupAddMemberBtn").addEventListener("click", () => {
+let groupAddLookup = null;  // a phone number shown by name, waiting for "Add"
+const groupAddLookupEl = document.getElementById("groupAddLookup");
+function clearGroupAddLookup() {
+  groupAddLookup = null;
+  groupAddLookupEl.hidden = true;
+  groupAddLookupEl.replaceChildren();
+}
+document.getElementById("groupAddMemberInput").addEventListener("input", () => {
+  const value = document.getElementById("groupAddMemberInput").value.trim();
+  if (!groupAddLookup || groupAddLookup.phone !== value) clearGroupAddLookup();
+});
+document.getElementById("groupAddMemberBtn").addEventListener("click", async () => {
   const conversationId = activeGroupIdEl.value;
   const group = session?.groups.get(conversationId);
   if (!group) return;
   const input = document.getElementById("groupAddMemberInput");
   const hint = document.getElementById("groupAddHint");
-  const names = input.value.split(/[\s,;]+/).map((n) => n.trim()).filter(Boolean);
+  const typed = input.value.trim();
+  let names;
+  if (looksLikePhoneNumber(typed)) {
+    if (!(groupAddLookup && groupAddLookup.phone === typed)) {
+      // First look the person up and show them by name; the second press (or the Add beside the
+      // name) adds them.
+      groupAddLookup = null;
+      const found = await previewMemberByPhone(typed, groupAddLookupEl, () => document.getElementById("groupAddMemberBtn").click());
+      if (found && input.value.trim() === typed) groupAddLookup = { phone: typed, found };
+      return;
+    }
+    names = [groupAddLookup.found.username];
+    clearGroupAddLookup();
+  } else {
+    names = input.value.split(/[\s,;]+/).map((n) => n.trim()).filter(Boolean);
+  }
   if (names.length === 0) {
     hint.textContent = "Enter a username to add.";
     return;
@@ -1442,11 +1963,12 @@ document.getElementById("groupAddMemberBtn").addEventListener("click", () => {
     hint.textContent = "Everyone you entered is already in this group.";
     return;
   }
-  session.addGroupMembers(conversationId, fresh);
+  session.addGroupMembers(conversationId, fresh, true);
   input.value = "";
   hint.textContent = !group.admin || group.admin === session.username
-    ? "Adding... new members appear here once the server confirms."
-    : "Request sent. The group admin will see it in their Inbox.";
+    ? "Invitation sent. They join when they approve it in their Inbox."
+    : "Request sent. The group admin will see it in their Inbox; the person is then invited and joins only if they approve.";
+  setTimeout(() => renderGroupInfo(), 600);
 });
 document.getElementById("groupAddMemberInput").addEventListener("keydown", (event) => {
   if (event.key === "Enter") { event.preventDefault(); document.getElementById("groupAddMemberBtn").click(); }
@@ -1508,6 +2030,73 @@ function showMuteMenu(key, event, refresh, isGroup = false) {
   }
   openPopup(menu, event, event.currentTarget);
 }
+
+// ------------------------------------------------------------------
+// Chat settings: the tools for the OPEN chat in one menu. The tools themselves (search, pinned
+// messages, media, wallpaper, mark as read, load history, contact info) are the existing controls
+// -- same ids, same handlers -- kept in the header's hidden .tool-registry; a menu item runs
+// the one it stands for, positioned at the Chat settings button. Verification status and a group's
+// members stay visible in the header.
+// ------------------------------------------------------------------
+
+const DIRECT_CHAT_TOOLS = [
+  ["peerProfileBtn", "Contact info", "info"],
+  ["searchBtn", "Search in conversation", "search"],
+  ["pinnedBtn", "Pinned messages", "pin"],
+  ["galleryBtn", "Media gallery", "image"],
+  ["wallpaperBtn", "Chat wallpaper", "palette"],
+  ["markReadBtn", "Mark as read", "check-check"],
+  ["loadHistoryBtn", "Load history", "history"],
+];
+const GROUP_CHAT_TOOLS = [
+  ["groupSearchBtn", "Search in conversation", "search"],
+  ["groupPinnedBtn", "Pinned messages", "pin"],
+  ["groupGalleryBtn", "Media gallery", "image"],
+  ["groupWallpaperBtn", "Chat wallpaper", "palette"],
+  ["loadGroupHistoryBtn", "Load history", "history"],
+];
+
+function showChatSettingsMenu(event, isGroup) {
+  event.preventDefault();
+  event.stopPropagation();
+  closeAnyOpenPopup();
+  const anchor = event.currentTarget;
+  const rect = anchor.getBoundingClientRect();
+  // Where a tool's own popup/panel should open from: just under the Chat settings button.
+  const origin = { clientX: Math.round(rect.right - 8), clientY: Math.round(rect.bottom + 6) };
+  const menu = createMenu("Chat settings");
+  for (const [toolId, label, iconName] of (isGroup ? GROUP_CHAT_TOOLS : DIRECT_CHAT_TOOLS)) {
+    const item = createMenuItem(label, iconName);
+    item.dataset.tool = toolId;
+    item.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      closeAnyOpenPopup();
+      document.getElementById(toolId).dispatchEvent(new MouseEvent("click", { ...origin, bubbles: false, cancelable: true }));
+    });
+    menu.appendChild(item);
+  }
+  const key = isGroup ? activeGroupIdEl.value : activeDirectPeer;
+  if (key) {
+    const separator = document.createElement("div");
+    separator.className = "menu-separator";
+    separator.setAttribute("role", "separator");
+    menu.appendChild(separator);
+    const options = createMenuItem(isGroup ? "Mute or archive…" : "Mute, archive or block…", "bell-off");
+    options.dataset.tool = "conversationOptions";
+    options.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      closeAnyOpenPopup();
+      const fakeEvent = {
+        preventDefault() {}, stopPropagation() {}, ...origin, currentTarget: anchor, target: anchor,
+      };
+      showMuteMenu(key, fakeEvent, isGroup ? renderGroupList : renderChatList, isGroup);
+    });
+    menu.appendChild(options);
+  }
+  openPopup(menu, event, anchor);
+}
+document.getElementById("chatSettingsBtn").addEventListener("click", (event) => showChatSettingsMenu(event, false));
+document.getElementById("groupSettingsBtn").addEventListener("click", (event) => showChatSettingsMenu(event, true));
 
 // ------------------------------------------------------------------
 // Phase 19.24 -- Chat Wallpaper: local-only, per-conversation --
@@ -2080,6 +2669,7 @@ function markBubbleDeleted(bubble) {
   bubble.insertBefore(textEl, bubble.querySelector(".bubble-footer"));
   updateBubbleReactions(bubble, []);
   setBubblePinned(bubble, false);
+  refreshRepliesTo(bubble.dataset.messageId);
 }
 
 function applyBubbleEdit(bubble, newText, editVersion) {
@@ -2088,6 +2678,7 @@ function applyBubbleEdit(bubble, newText, editVersion) {
   bubble.dataset.editVersion = String(editVersion);
   const textEl = bubble.querySelector(".bubble-text");
   if (textEl) textEl.textContent = newText;
+  refreshRepliesTo(bubble.dataset.messageId);
   // Phase 1.5: the edited state lives in the footer, ahead of the time
   // ("edited · 6:53 PM ✓ ✓") -- visible, but quieter than the text.
   const footer = bubble.querySelector(".bubble-footer");
@@ -2128,7 +2719,8 @@ function updateBubbleReactions(bubble, reactions) {
   for (const entry of bubble._reactions) {
     if (!entry.reaction) continue;
     if (!groups.has(entry.reaction)) groups.set(entry.reaction, []);
-    groups.get(entry.reaction).push(entry.user);
+    // One person counts once per emoji, however many times the same reaction is replayed.
+    if (!groups.get(entry.reaction).includes(entry.user)) groups.get(entry.reaction).push(entry.user);
   }
   if (!groups.size) {
     reactionsEl.replaceChildren();
@@ -2178,7 +2770,7 @@ function updateBubbleReactions(bubble, reactions) {
       "aria-label",
       `${name}: ${count} ${count === 1 ? "reaction" : "reactions"}${mine ? ", including yours" : ""}`
     );
-    chip.title = users.map((user) => (user === session?.username ? "You" : user)).join(", ");
+    chip.title = users.map((user) => (user === session?.username ? "You" : nameOf(user))).join(", ");
     if (previous) previous.after(chip);
     else reactionsEl.prepend(chip);
     previous = chip;
@@ -2206,7 +2798,7 @@ function setBubblePinned(bubble, pinned, pinnedBy) {
     pinnedEl.className = "bubble-pinned";
     bubble.insertBefore(pinnedEl, bubble.firstChild);
   }
-  pinnedEl.textContent = pinnedBy ? `\u{1F4CC} Pinned by ${pinnedBy}` : "\u{1F4CC} Pinned";
+  pinnedEl.textContent = pinnedBy ? `\u{1F4CC} Pinned by ${pinnedBy === session?.username ? "you" : nameOf(pinnedBy)}` : "\u{1F4CC} Pinned";
 }
 
 // Display name for a rendered bubble's author ("You" for your own).
@@ -2218,31 +2810,83 @@ function bubbleAuthor(bubble) {
   return activeDirectPeer || "";
 }
 
+// What a reply quotes, for the message it points at: its text, or a label for media (never the
+// media itself), or "Message deleted".
+const MEDIA_REPLY_LABELS = {
+  image: "\u{1F4F7} Photo", voice: "\u{1F3A4} Voice message", video: "\u{1F3AC} Video message",
+};
+function replyExcerptFor(referenced) {
+  if (referenced.dataset.deleted === "1") return "Message deleted";
+  const type = referenced.dataset.payloadType;
+  if (type && type !== "text") {
+    return MEDIA_REPLY_LABELS[type] || `\u{1F4C4} ${referenced._attachmentFilename || "File"}`;
+  }
+  return referenced.dataset.text || "Message";
+}
+
+// Resolve a reply by the original's stable message id -- never by matching text -- and only
+// within the same conversation. An original that is not loaded (or not visible to this account)
+// is shown as unavailable rather than guessed at.
+function applyReplyReference(bubble, replyToMessageId) {
+  if (!bubble || !replyToMessageId || bubble.dataset.deleted === "1") return;
+  bubble.dataset.replyTo = replyToMessageId;
+  let referenced = bubblesByMessageId.get(replyToMessageId) || null;
+  if (referenced && (referenced.dataset.conversationId || "") !== (bubble.dataset.conversationId || "")) {
+    referenced = null;
+  }
+  if (referenced) setBubbleReplyPreview(bubble, replyExcerptFor(referenced), referenced);
+  else setBubbleReplyPreview(bubble, "Original message unavailable", null, { unavailable: true });
+}
+
+function refreshRepliesTo(messageId) {
+  if (!messageId) return;
+  for (const reply of document.querySelectorAll(`.bubble[data-reply-to="${CSS.escape(messageId)}"]`)) {
+    applyReplyReference(reply, messageId);
+  }
+}
+
 // Phase 1.5: the quoted block names who is being replied to, and
 // clicking it jumps to (and briefly highlights) that original message.
-function setBubbleReplyPreview(bubble, previewText, referenced = null) {
+function setBubbleReplyPreview(bubble, previewText, referenced = null, { unavailable = false } = {}) {
   if (!previewText) return;
   let replyEl = bubble.querySelector(".bubble-reply-preview");
   if (!replyEl) {
     replyEl = document.createElement("div");
     replyEl.className = "bubble-reply-preview";
-    bubble.insertBefore(replyEl, bubble.firstChild);
+    // After the sender name / pin marker, before the content.
+    const anchor = bubble.querySelector(".bubble-text, .msg-meta, .bubble-image, .bubble-media, .bubble-file");
+    bubble.insertBefore(replyEl, anchor || bubble.firstChild);
   }
+  replyEl.classList.toggle("is-unavailable", unavailable);
   const author = document.createElement("span");
   author.className = "reply-author";
-  author.textContent = bubbleAuthor(referenced) || "Reply";
+  author.textContent = unavailable ? "Reply" : (bubbleAuthor(referenced) || "Reply");
   const text = document.createElement("span");
   text.className = "reply-text";
   text.textContent = previewText.length > 120 ? previewText.slice(0, 117) + "…" : previewText;
   replyEl.replaceChildren(author, text);
+  replyEl.classList.remove("is-link");
+  replyEl.removeAttribute("title");
+  replyEl.removeAttribute("role");
+  replyEl.removeAttribute("tabindex");
+  replyEl.onclick = null;
+  replyEl.onkeydown = null;
   if (referenced) {
     replyEl.classList.add("is-link");
     replyEl.title = "Show the original message";
+    replyEl.setAttribute("role", "button");
+    replyEl.tabIndex = 0;
     replyEl.onclick = (event) => {
       event.stopPropagation();
       if (!referenced.isConnected) return;
       const container = referenced.closest(".message-scroll");
       if (container) flashBubble(container, referenced);
+    };
+    replyEl.onkeydown = (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        replyEl.onclick(event);
+      }
     };
   }
 }
@@ -2495,7 +3139,9 @@ function bubbleShell(container, sender, options, extraClass) {
   if (!mine) {
     const senderLabel = document.createElement("div");
     senderLabel.className = "bubble-sender";
-    senderLabel.textContent = sender;
+    senderLabel.dataset.handle = sender;
+    senderLabel.textContent = nameOf(sender);
+    requestDisplayNames([sender]);
     bubble.appendChild(senderLabel);
   }
   row.appendChild(bubble);
@@ -2555,10 +3201,7 @@ function renderTextMessage(container, sender, text, options = {}) {
     return;
   }
   if (options.editVersion) applyBubbleEdit(bubble, text, options.editVersion);
-  if (options.replyToMessageId) {
-    const referenced = bubblesByMessageId.get(options.replyToMessageId);
-    if (referenced && referenced.dataset.text) setBubbleReplyPreview(bubble, referenced.dataset.text, referenced);
-  }
+  if (options.replyToMessageId) applyReplyReference(bubble, options.replyToMessageId);
   if (options.reactions && options.reactions.length) updateBubbleReactions(bubble, options.reactions);
   if (options.isPinned) setBubblePinned(bubble, true, options.pinnedBy);
 }
@@ -2802,6 +3445,7 @@ function renderAttachment(container, sender, payloadType, bytes, contentMetadata
 
   const mine = sender === "me" || sender === session?.username;
   if (mine) appendSentTick(footer, container, options.status);
+  if (options.replyToMessageId) applyReplyReference(bubble, options.replyToMessageId);
 }
 
 // Full-screen image viewer: visible close button (focused on open),
@@ -2858,16 +3502,110 @@ function resetAvatarInitial(el, initial) {
   el.onclick = null;
 }
 
+// The enlarged picture viewer: the real picture, or a polished placeholder when there is none.
+// For this account's own picture it is also the one place "Change picture" lives.
+async function showProfilePictureViewer(username) {
+  if (!session || !username) return;
+  const isOwn = username === session.username;
+  const overlay = document.createElement("div");
+  overlay.className = "confirm-modal picture-viewer";
+  const card = document.createElement("div");
+  card.className = "confirm-modal-card picture-viewer-card";
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-modal", "true");
+  overlay.appendChild(card);
+
+  const big = document.createElement("div");
+  big.className = "avatar xl";
+  big.dataset.tone = avatarTone(username);
+  big.textContent = initialOf(nameOf(username));
+  big.setAttribute("aria-hidden", "true");
+  card.appendChild(big);
+
+  const nameEl = document.createElement("div");
+  nameEl.className = "confirm-modal-title";
+  nameEl.id = `picture-title-${Date.now()}`;
+  nameEl.textContent = isOwn ? "Your profile picture" : nameOf(username);
+  card.setAttribute("aria-labelledby", nameEl.id);
+  card.appendChild(nameEl);
+
+  const handleEl = document.createElement("div");
+  handleEl.className = "profile-handle";
+  handleEl.textContent = `@${username}`;
+  card.appendChild(handleEl);
+
+  const captionEl = document.createElement("div");
+  captionEl.className = "confirm-modal-message picture-caption";
+  captionEl.textContent = "Loading...";
+  card.appendChild(captionEl);
+
+  const actionsRow = document.createElement("div");
+  actionsRow.className = "confirm-modal-actions";
+  let changeBtn = null;
+  if (isOwn) {
+    changeBtn = document.createElement("button");
+    changeBtn.type = "button";
+    changeBtn.id = "pictureChangeBtn";
+    changeBtn.className = "btn btn-primary btn-sm";
+    changeBtn.textContent = "Change picture";
+    changeBtn.addEventListener("click", () => {
+      dismissOverlay(overlay);
+      document.getElementById("profilePicInput").click();
+    });
+    actionsRow.appendChild(changeBtn);
+  }
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "btn btn-ghost btn-sm";
+  closeBtn.textContent = "Close";
+  closeBtn.addEventListener("click", () => dismissOverlay(overlay));
+  actionsRow.appendChild(closeBtn);
+  card.appendChild(actionsRow);
+
+  mountOverlay(overlay, closeBtn);
+
+  const refresh = async () => {
+    let picture = null;
+    try { picture = await session.fetchProfilePicture(username); } catch { picture = null; }
+    if (!overlay.isConnected) return;
+    if (picture) {
+      const url = URL.createObjectURL(new Blob([picture.bytes], { type: picture.contentType || "image/png" }));
+      big.replaceChildren();
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = "";
+      big.appendChild(img);
+      captionEl.textContent = "";
+      captionEl.hidden = true;
+      if (changeBtn) changeBtn.textContent = "Change picture";
+    } else {
+      captionEl.hidden = false;
+      captionEl.textContent = isOwn
+        ? "You haven't added a profile picture yet."
+        : `${nameOf(username)} hasn't added a profile picture.`;
+      if (changeBtn) changeBtn.textContent = "Add a picture";
+    }
+  };
+  await refresh();
+}
+
 // Best-effort: a peer with no uploaded picture, or a fetch failure
 // (offline peer, transient error), silently keeps the initial-letter
 // fallback that's already showing -- never blocks or errors the chat
 // screen itself over a missing/failed avatar.
 async function loadPeerAvatar(el, username, initial) {
   resetAvatarInitial(el, initial);
+  // Whether or not there is a picture, selecting the avatar opens the viewer (a placeholder says
+  // so plainly) -- there is no separate "profile picture" control.
+  el.style.cursor = "pointer";
+  el.onclick = () => showProfilePictureViewer(username);
   if (!session) return;
   try {
     const picture = await session.fetchProfilePicture(username);
-    if (picture) setAvatarImage(el, picture.bytes, picture.contentType);
+    if (picture && el.isConnected) {
+      setAvatarImage(el, picture.bytes, picture.contentType);
+      el.onclick = () => showProfilePictureViewer(username);
+    }
   } catch { /* keep the initial-letter fallback */ }
 }
 
@@ -2891,9 +3629,14 @@ let showArchivedGroups = false;
 // least one existing conversation. Typing a brand-new username therefore never
 // empties the list, and an open chat never filters the Groups tab away.
 let sidebarUnreadOnly = false;
+function searchText() {
+  return (document.getElementById("peerUsername")?.value || "").trim().toLowerCase();
+}
+// Groups: a search that matches no group (e.g. a phone number being looked up) leaves the
+// Groups tab as it is rather than emptying it.
 function effectiveFilterText(labels) {
-  const value = (document.getElementById("peerUsername")?.value || "").trim().toLowerCase();
-  if (!value || value === String(activeDirectPeer || "").toLowerCase()) return "";
+  const value = searchText();
+  if (!value) return "";
   return labels.some((label) => String(label).toLowerCase().includes(value)) ? value : "";
 }
 function passesSidebarFilter(label, activity, filterText) {
@@ -2906,14 +3649,20 @@ function renderChatList() {
   const allPeers = Array.from(knownDirectPeers).filter(
     (peer) => Boolean(session?.isConversationArchived(peer)) === showArchivedChats
   );
-  const filterText = effectiveFilterText(allPeers);
-  const peers = allPeers.filter((peer) => passesSidebarFilter(peer, conversationActivity.get(activityKey(false, peer)), filterText));
+  requestDisplayNames(allPeers);
+  const filterText = searchText();
+  const peers = allPeers.filter((peer) => passesSidebarFilter(
+    `${nameOf(peer)} ${peer}`, conversationActivity.get(activityKey(false, peer)), filterText
+  ));
   if (peers.length === 0) {
     chatListEl.innerHTML = sidebarUnreadOnly && allPeers.length > 0
       ? '<div class="empty-hint">No unread chats.</div>'
       : showArchivedChats
         ? '<div class="empty-hint">No archived chats.</div>'
-        : '<div class="empty-hint">Type a username above and press Enter to open a direct chat.</div>';
+        : filterText
+          ? '<div class="empty-hint">No chats match. Press Enter to look this person up and start a chat.</div>'
+          : '<div class="empty-hint">Search a phone number or username, then press Enter to start a chat.</div>';
+    renderStartChatSuggestion(filterText);
     return;
   }
   const onlineUsers = session?.onlineUsers || new Set();
@@ -2927,9 +3676,9 @@ function renderChatList() {
     const subtitle = activity?.preview || (online ? "Online" : "Direct message");
     if (activity?.unread) row.classList.add("has-unread");
     row.innerHTML = `
-      <div class="avatar" data-tone="${avatarTone(peer)}">${escapeHtml(initialOf(peer))}<span class="presence-dot${online ? " is-online" : ""}"></span></div>
+      <div class="avatar" data-tone="${avatarTone(peer)}">${escapeHtml(initialOf(nameOf(peer)))}<span class="presence-dot${online ? " is-online" : ""}"></span></div>
       <div class="row-main">
-        <div class="row-title">${escapeHtml(peer)}</div>
+        <div class="row-title">${nameWithHandleHtml(peer)}</div>
         <div class="row-sub${!activity?.preview && online ? " is-online" : ""}">${escapeHtml(subtitle)}</div>
       </div>${rowMetaHtml(activity, muted, peer)}`;
     // Keyboard-operable row: focusable, Enter/Space opens it.
@@ -2947,19 +3696,80 @@ function renderChatList() {
     });
     chatListEl.appendChild(row);
   }
+  renderStartChatSuggestion(filterText);
   updateTabBadges();
+}
+
+// Search results are separate from the conversation list: a "Start chat" action, never a new row.
+function renderStartChatSuggestion(filterText) {
+  const query = (document.getElementById("peerUsername")?.value || "").trim();
+  if (!filterText || !query || showArchivedChats) return;
+  const known = Array.from(knownDirectPeers).some(
+    (peer) => peer.toLowerCase() === query.toLowerCase() || nameOf(peer).toLowerCase() === query.toLowerCase()
+  );
+  if (known) return;
+  const suggestion = document.createElement("div");
+  suggestion.className = "search-result";
+  suggestion.innerHTML = `
+    <div class="search-result-text">
+      <div class="search-result-title">${escapeHtml(query)}</div>
+      <div class="search-result-sub">${looksLikePhoneNumber(query) ? "Look up this phone number" : "Look up this username"}</div>
+    </div>`;
+  const startBtn = document.createElement("button");
+  startBtn.type = "button";
+  startBtn.className = "btn btn-primary btn-xs";
+  startBtn.id = "startChatBtn";
+  startBtn.textContent = "Start chat";
+  startBtn.addEventListener("click", () => startChatFromSearch(query));
+  suggestion.appendChild(startBtn);
+  chatListEl.appendChild(suggestion);
+}
+
+// The ONLY way a search turns into a chat: an explicit Enter or "Start chat".
+async function startChatFromSearch(query) {
+  const text = (query || "").trim();
+  if (!text || !session) return;
+  let handle = text;
+  if (looksLikePhoneNumber(text)) {
+    try {
+      const found = await session.lookupUserByPhone(text);
+      if (!found) { toast("No account uses that phone number.", "error"); return; }
+      handle = found.username;
+    } catch (error) {
+      toast(error.message, "error");
+      return;
+    }
+  }
+  document.getElementById("peerUsername").value = "";
+  openDirectChat(handle);
 }
 
 document.getElementById("peerUsername").addEventListener("input", () => {
   renderChatList();
   if (session) renderGroupList();
 });
-// Narrow screens show an already-verified peer's safety number on one line;
-// this expands the full number and the labelled actions (CSS does the rest).
-document.getElementById("securityBarToggle").addEventListener("click", (event) => {
-  const open = document.getElementById("securityBar").classList.toggle("is-expanded");
+// A verified contact shows one concise line ("Verified" + Re-verify). The safety-number comparison
+// lives in the details below it: always open while the contact is NOT verified (that is when the
+// comparison is needed), and opened on demand -- by Re-verify or the chevron -- once they are.
+let safetyDetailsRequested = false;
+function setSafetyDetailsRequested(open) {
+  safetyDetailsRequested = open;
+  renderPeerIdentity(activeDirectPeer);
+  if (open) document.getElementById("confirmVerifiedBtn").focus({ preventScroll: true });
+}
+document.getElementById("securityBarToggle").addEventListener("click", () => setSafetyDetailsRequested(!safetyDetailsRequested));
+document.getElementById("reverifyBtn").addEventListener("click", () => setSafetyDetailsRequested(true));
+
+// Your own number is not on display all the time: it appears, next to the number you are comparing,
+// only when asked for.
+document.getElementById("showOwnNumberBtn").addEventListener("click", (event) => {
+  const panel = document.getElementById("ownNumberPanel");
+  const open = panel.hidden;
+  panel.hidden = !open;
   event.currentTarget.setAttribute("aria-expanded", String(open));
-  event.currentTarget.setAttribute("aria-label", open ? "Hide full safety number" : "Show full safety number");
+  event.currentTarget.textContent = open ? "Hide my safety number" : "Show my safety number";
+  document.getElementById("ownNumberPeer").textContent = nameOf(activeDirectPeer);
+  if (open) loadOwnSafetyNumber();
 });
 
 document.getElementById("unreadFilterToggle").addEventListener("click", (event) => {
@@ -3047,7 +3857,7 @@ async function refreshPeerPresence(peerUsername) {
     // The round trip is async -- the open chat may already be a
     // DIFFERENT peer by the time it resolves; never apply a stale
     // result to it.
-    if (document.getElementById("peerUsername").value !== peerUsername) return;
+    if (currentPeer() !== peerUsername) return;
     if (lastSeen) peerPresenceEl.textContent = _formatLastSeen(lastSeen);
   } catch (error) {
     appendLog(`ERROR: could not fetch last seen: ${error.message}`);
@@ -3067,6 +3877,17 @@ const PEER_STATE_UI = {
   KEY_CHANGED: { label: "Key changed", icon: "shield-alert" },
 };
 
+const SECURITY_STATUS_TEXT = {
+  VERIFIED: "Verified",
+  UNVERIFIED: "Not verified",
+  KEY_CHANGED: "Key changed \u2014 verify again",
+};
+
+// What is actually happening while a direct connection is being secured after an approved request:
+// "establishing" or "failed" only (once it is ready the Establish key button is simply gone and a
+// toast said so). Never invented: it is set only by the session's own onSecureConnection reports.
+const secureConnectionStatus = new Map(); // peer handle -> { state, detail }
+
 function renderPeerIdentity(peerUsername) {
   const known = peerUsername ? session?.peers.get(peerUsername) : null;
   const state = known ? known.state : "UNVERIFIED";
@@ -3080,6 +3901,26 @@ function renderPeerIdentity(peerUsername) {
   const bar = document.getElementById("securityBar");
   bar.dataset.state = state;
   bar.querySelector(".security-bar-icon use").setAttribute("href", `#i-${ui.icon}`);
+  let statusText = SECURITY_STATUS_TEXT[state] || ui.label;
+  const secure = state === "VERIFIED" ? secureConnectionStatus.get(peerUsername) : null;
+  if (secure && secure.state === "establishing") statusText += " \u00B7 Establishing secure session\u2026";
+  if (secure && secure.state === "failed") statusText += " \u00B7 Secure session failed \u2014 press Establish key to retry";
+  document.getElementById("securityStatusText").textContent = statusText;
+
+  const verified = state === "VERIFIED";
+  const detailsOpen = !verified || safetyDetailsRequested;
+  const details = document.getElementById("safetyDetails");
+  details.hidden = !detailsOpen;
+  const toggle = document.getElementById("securityBarToggle");
+  toggle.setAttribute("aria-expanded", String(detailsOpen));
+  toggle.setAttribute("aria-label", detailsOpen ? "Hide safety numbers" : "Show safety numbers");
+  bar.classList.toggle("is-expanded", detailsOpen && verified);
+  document.getElementById("reverifyBtn").hidden = !verified || detailsOpen;
+  if (!detailsOpen) document.getElementById("ownNumberPanel").hidden = true;
+
+  // "Establish key" is only an action while there is no secure session with this person yet.
+  const conversationId = peerUsername ? session?.directConversationIds?.get(peerUsername) : null;
+  document.getElementById("establishKeyBtn").hidden = Boolean(conversationId && session.sessionKeys.has(conversationId));
 
   if (!known) {
     // Left empty until the identity is actually observed -- the
@@ -3091,7 +3932,7 @@ function renderPeerIdentity(peerUsername) {
   const label = document.createElement("span");
   label.className = "fp-label";
   const peerName = document.createElement("b");
-  peerName.textContent = peerUsername;
+  peerName.textContent = nameOf(peerUsername);
   const stateText = document.createElement("span");
   stateText.className = "sr-only";
   stateText.textContent = ` [${state}]`;
@@ -3112,18 +3953,21 @@ function renderPeerIdentity(peerUsername) {
   fingerprintEl.replaceChildren(label, value);
 }
 
+let directOpenGeneration = 0;
 function openDirectChat(peerUsername) {
   if (!peerUsername) return;
+  const openGeneration = ++directOpenGeneration;
+  if (peerUsername !== activeDirectPeer) safetyDetailsRequested = false;
   saveCurrentDraftIfAny();
   stopTypingImmediately();
   resetTypingStatusDisplay();
-  knownDirectPeers.add(peerUsername);
   activeDirectPeer = peerUsername;
-  document.getElementById("peerUsername").value = peerUsername;
-  chatTitleEl.querySelector(".chat-header-name").textContent = peerUsername;
+  requestDisplayNames([peerUsername]);
+  chatTitleEl.querySelector(".chat-header-name").textContent = nameOf(peerUsername);
+  chatTitleEl.querySelector(".chat-header-name").title = `@${peerUsername}`;
   chatAvatarEl.dataset.tone = avatarTone(peerUsername);
   clearConversationUnread(false, peerUsername);
-  loadPeerAvatar(chatAvatarEl, peerUsername, initialOf(peerUsername));
+  loadPeerAvatar(chatAvatarEl, peerUsername, initialOf(nameOf(peerUsername)));
 
   // This peer's identity may already have been observed (e.g. the
   // network announcement arrived before the user searched for them) --
@@ -3152,6 +3996,10 @@ function openDirectChat(peerUsername) {
   // non-fatal (e.g. no session key yet for a brand-new contact) --
   // appendLog() already reports them.
   messagesEl.innerHTML = "";
+  // Forget what was rendered at the same moment the DOM is cleared (not after the next network
+  // round trip), so a history load already in flight cannot be undone and rendered twice.
+  const knownConversationId = session?.directConversationIds?.get(peerUsername);
+  if (knownConversationId) session.forgetRenderedHistory(knownConversationId);
   refreshPinnedBar(messagesEl);
   // Phase 19.23 -- Issue 3: this peer's tick registry points at <span>
   // elements the innerHTML clear above just detached -- without this,
@@ -3184,17 +4032,27 @@ function openDirectChat(peerUsername) {
   if (session) {
     session.openDirectConversation(peerUsername)
       .then((conversationId) => {
-        session.forgetRenderedHistory(conversationId);
+        if (openGeneration !== directOpenGeneration) return 0; // another chat was opened since
+        if (!knownConversationId) session.forgetRenderedHistory(conversationId);
         return session.loadHistory(conversationId, false);
       })
-      .catch((error) => appendLog(`ERROR: ${error.message}`));
+      .catch((error) => {
+        appendLog(`ERROR: ${error.message}`);
+        // No such account: close the view rather than leave a phantom chat behind.
+        if (activeDirectPeer === peerUsername && !knownDirectPeers.has(peerUsername) && /not found|no such|unknown|does not exist/i.test(error.message)) {
+          activeDirectPeer = null;
+          setMainView("empty");
+          renderChatList();
+          toast(`No account named "${peerUsername}".`, "error");
+        }
+      });
   }
 }
 
 document.getElementById("peerUsername").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
-    openDirectChat(event.target.value.trim());
+    startChatFromSearch(event.target.value.trim());
   }
 });
 // A completed entry opens the chat too -- not just Enter. "input" fires
@@ -3217,15 +4075,8 @@ document.getElementById("peerUsername").addEventListener("keydown", (event) => {
 // is already open, so a late-firing no-op debounce was silently
 // destroying in-progress UI state (search results, a highlighted
 // match) with no code change and no visible user action responsible.
-let peerUsernameDebounce = null;
-document.getElementById("peerUsername").addEventListener("input", (event) => {
-  clearTimeout(peerUsernameDebounce);
-  const value = event.target.value.trim();
-  peerUsernameDebounce = setTimeout(() => {
-    if (value && value === activeDirectPeer) return;
-    openDirectChat(value);
-  }, 300);
-});
+// (Typing used to open a chat 300 ms after every keystroke, so a half-typed phone number such
+// as "+91" became a conversation in the list. Typing now only filters; see startChatFromSearch().)
 
 // ------------------------------------------------------------------
 // Sidebar: groups
@@ -3297,13 +4148,64 @@ document.getElementById("archivedGroupsToggle").addEventListener("click", () => 
   renderGroupList();
 });
 
+// Group membership events (see WebClientSession.onGroupEvent): one fixed sentence per event, built
+// from the server-recorded fields and the display names -- never from text a peer sent. An event
+// is shown once, whether it arrived live or in history.
+const renderedGroupEventIds = new Set();
+
+function groupEventText(event) {
+  const me = session?.username;
+  // Display names are not unique: when two people in this group share a name, the handle tells
+  // them apart ("Sam (@sam_7f3a) added Sam (@sam)").
+  const members = session?.groups.get(event.conversationId)?.members || [];
+  const who = (handle) => {
+    if (!handle) return "Someone";
+    const name = nameOf(handle);
+    const namesake = [...new Set([event.actor, event.subject, ...members])]
+      .some((other) => other && other !== handle && nameOf(other) === name);
+    return namesake ? `${name} (@${handle})` : name;
+  };
+  if (event.type === "member_added") {
+    if (!event.actor) return `${who(event.subject)} was added to the group`;
+    if (event.actor === me) return `You added ${who(event.subject)}`;
+    if (event.subject === me) return `${who(event.actor)} added you`;
+    return `${who(event.actor)} added ${who(event.subject)}`;
+  }
+  if (event.type === "member_removed") {
+    if (event.actor === me) return `You removed ${who(event.subject)}`;
+    if (event.subject === me) return `${who(event.actor)} removed you`;
+    return `${who(event.actor)} removed ${who(event.subject)}`;
+  }
+  return event.subject === me ? "You left the group" : `${who(event.subject)} left the group`;
+}
+
+function renderGroupEvent(container, event) {
+  if (renderedGroupEventIds.has(event.id)) return;
+  renderedGroupEventIds.add(event.id);
+  requestDisplayNames([event.actor, event.subject].filter(Boolean));
+  insertDateSeparatorIfNeeded(container, event.timestamp);
+  const row = document.createElement("div");
+  row.className = "msg-row is-system group-event";
+  row.dataset.eventId = event.id;
+  row.dataset.eventType = event.type;
+  row._event = event;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.setAttribute("role", "status");
+  bubble.textContent = groupEventText(event);
+  row.appendChild(bubble);
+  container.appendChild(row);
+  container.scrollTop = container.scrollHeight;
+}
+
 function openGroupChat(conversationId, group) {
   saveCurrentDraftIfAny();
   stopTypingImmediately();
   resetTypingStatusDisplay();
   activeGroupIdEl.value = conversationId;
   groupTitleEl.textContent = group.name;
-  groupSubEl.textContent = `${group.members.length} members • ${group.members.join(", ")}`;
+  requestDisplayNames(group.members);
+  groupSubEl.textContent = `${group.members.length} members • ${group.members.map(nameOf).join(", ")}`;
   groupAvatarEl.textContent = initialOf(group.name);
   groupAvatarEl.dataset.tone = avatarTone(group.name);
   clearConversationUnread(true, conversationId);
@@ -3312,6 +4214,7 @@ function openGroupChat(conversationId, group) {
 
   // See openDirectChat()'s own comment -- identical fix, group side.
   groupMessagesEl.innerHTML = "";
+  renderedGroupEventIds.clear();
   refreshPinnedBar(groupMessagesEl);
   clearMessageLifecycleState();
 
@@ -3338,6 +4241,32 @@ function openGroupChat(conversationId, group) {
 // session.groups (already populated by _handleGroupCreateResult()) and
 // session.onlineUsers (already populated by the user_list handler) -- no
 // new network calls, no new protocol logic.
+async function renderPendingInvitations(conversationId) {
+  let holder = document.getElementById("groupPendingInvitations");
+  if (!holder) {
+    holder = document.createElement("div");
+    holder.id = "groupPendingInvitations";
+    holder.className = "group-key-notice";
+    holder.hidden = true;
+    groupInfoMembersEl.before(holder);
+  }
+  let waiting = [];
+  try {
+    const notifications = await session.loadInbox();
+    waiting = notifications.filter(
+      (n) => n.type === "group_invitation" && n.status === "pending" && n.conversation_id === conversationId
+        && n.requester_username === session.username
+    );
+  } catch {
+    // Shown only when it loads; the member list itself does not depend on it.
+  }
+  if (activeGroupIdEl.value !== conversationId) return;
+  holder.hidden = waiting.length === 0;
+  holder.textContent = waiting.length
+    ? `Waiting for approval: ${waiting.map((n) => nameOf(n.recipient_username || n.candidate_username)).join(", ")}. They join the group only if they approve the invitation in their Inbox.`
+    : "";
+}
+
 function renderGroupInfo() {
   const conversationId = activeGroupIdEl.value;
   const group = session?.groups.get(conversationId);
@@ -3360,6 +4289,18 @@ function renderGroupInfo() {
   // else, so this can never grant anything the server would refuse).
   const isSelfAdmin = group.admin && group.admin === session.username;
 
+  // Invitations this account sent for this group that are still waiting for the person's decision.
+  renderPendingInvitations(conversationId);
+
+  // This account cannot read the group yet: say why and what finishes it, never a bare silence.
+  const keyNotice = document.getElementById("groupKeyNotice");
+  const holdsKey = session.sessionKeys.has(conversationId);
+  keyNotice.hidden = holdsKey;
+  keyNotice.textContent = holdsKey ? "" : (
+    "You do not have this group's key yet, so you cannot read or send messages in it. It arrives once "
+    + "you and the member who holds it (usually the admin) have verified each other \u2014 use Verify next to their name."
+  );
+
   groupInfoMembersEl.innerHTML = "";
   for (const username of group.members) {
     const isAdmin = group.admin && username === group.admin;
@@ -3370,9 +4311,33 @@ function renderGroupInfo() {
     const row = document.createElement("div");
     row.className = "member-row";
     row.innerHTML = `
-      <div class="avatar sm" data-tone="${avatarTone(username)}">${escapeHtml(initialOf(username))}<span class="presence-dot${isOnline ? " is-online" : ""}"></span></div>
-      <div class="row-title">${escapeHtml(username)}${username === session.username ? ' <span class="member-you">(you)</span>' : ""}</div>
+      <div class="avatar sm" data-tone="${avatarTone(username)}">${escapeHtml(initialOf(nameOf(username)))}<span class="presence-dot${isOnline ? " is-online" : ""}"></span></div>
+      <div class="row-title">${nameWithHandleHtml(username)}${username === session.username ? ' <span class="member-you">(you)</span>' : ""}</div>
       <div class="member-role ${roleClass}">${roleText}</div>`;
+
+    // Whether this account and that member have verified each other decides whether a group key can
+    // move between them (it is only ever wrapped for, and accepted from, a verified identity).
+    if (username !== session.username) {
+      const known = session.peers.get(username);
+      const state = known ? known.state : "UNSEEN";
+      const label = { VERIFIED: "\u2713 Verified", UNVERIFIED: "Not verified", KEY_CHANGED: "Key changed", UNSEEN: "Not seen yet" }[state];
+      const trust = document.createElement("span");
+      trust.className = `member-trust ${state === "VERIFIED" ? "is-verified" : state === "KEY_CHANGED" ? "is-attention" : ""}`;
+      trust.textContent = label;
+      row.appendChild(trust);
+      if (state !== "VERIFIED") {
+        const verifyBtn = document.createElement("button");
+        verifyBtn.className = "btn btn-ghost btn-xs";
+        verifyBtn.type = "button";
+        verifyBtn.textContent = "Verify";
+        verifyBtn.setAttribute("aria-label", `Verify ${nameOf(username)} to share group keys`);
+        verifyBtn.addEventListener("click", () => {
+          document.querySelector('.tab-btn[data-tab="chats"]').click();
+          openDirectChat(username);
+        });
+        row.appendChild(verifyBtn);
+      }
+    }
 
     if (isSelfAdmin && username !== session.username && !isAdmin) {
       const removeBtn = document.createElement("button");
@@ -3404,10 +4369,10 @@ function renderGroupInfo() {
   }
 }
 
-// Mirrors the #peerUsername input listener above (see its comment for
-// why "input" + debounce, not "change"): a completed conversation_id
-// opens that group's chat view if it's already known, same as clicking
-// its row-card.
+// "input" + debounce, not "change": a completed conversation_id opens that
+// group's chat view if it's already known, same as clicking its row-card.
+// (Unlike the person search, this only ever opens a group the user is
+// already a member of; it never creates anything.)
 let activeGroupIdDebounce = null;
 document.getElementById("activeGroupId").addEventListener("input", (event) => {
   clearTimeout(activeGroupIdDebounce);
@@ -3435,19 +4400,30 @@ document.getElementById("groupInfoBackBtn").addEventListener("click", () => setM
 
 function renderInboxCard(notification) {
   const isGroupRequest = notification.type === "group_add_request";
+  const isInvitation = notification.type === "group_invitation";
   const requester = notification.requester_username || "Someone";
-  const bodyText = isGroupRequest
-    ? `${requester} wants to add ${notification.candidate_username || "a member"} to ${notification.group_name || "the group"}`
-    : `${requester} wants to verify their identity`;
+  const isMine = requester === session.username;
+  const groupName = notification.group_name || "the group";
+  let title = "VERIFICATION REQUEST";
+  let bodyText = `${requester} wants to verify their identity`;
+  if (isGroupRequest) {
+    title = "GROUP MEMBER REQUEST";
+    bodyText = `${nameOf(requester)} wants to add ${nameOf(notification.candidate_username) || "a member"} to ${groupName}`;
+  } else if (isInvitation && isMine) {
+    title = "GROUP INVITATION SENT";
+    bodyText = `You invited ${nameOf(notification.recipient_username || notification.candidate_username)} to ${groupName}`;
+  } else if (isInvitation) {
+    title = "GROUP INVITATION";
+    bodyText = `${nameOf(requester)} wants to add you to the group \u201C${groupName}\u201D. You join only if you approve.`;
+  }
 
   const card = document.createElement("div");
   card.className = "card notif-card";
   card.innerHTML = `
-    <div class="notif-title">${isGroupRequest ? "GROUP MEMBER REQUEST" : "VERIFICATION REQUEST"}</div>
+    <div class="notif-title"></div>
     <div class="notif-body"></div>`;
+  card.querySelector(".notif-title").textContent = title;
   card.querySelector(".notif-body").textContent = bodyText;
-
-  const isMine = requester === session.username;
 
   if (notification.status === "pending" && !isMine) {
     const actions = document.createElement("div");
@@ -3465,7 +4441,9 @@ function renderInboxCard(notification) {
       approveBtn.disabled = true;
       denyBtn.disabled = true;
       try {
-        await session.respondToInbox(notification, approve);
+        // An admin approving someone's request to add a person INVITES that person (who must then
+        // approve too); an approved invitation adds the invitee.
+        await session.respondToInbox(notification, approve, isGroupRequest);
         // Phase 19.23 -- Issue 1: approving a verification_request
         // marks the requester VERIFIED on this browser -- add them to
         // the sidebar immediately, mirroring the direct Verify button's
@@ -3491,9 +4469,15 @@ function renderInboxCard(notification) {
   } else {
     const resolvedEl = document.createElement("div");
     resolvedEl.className = "notif-resolved";
-    resolvedEl.textContent = {
-      approved: "Approved", denied: "Denied", pending: "Waiting for a response...",
-    }[notification.status] || notification.status || "";
+    const who = nameOf(notification.recipient_username || notification.candidate_username);
+    resolvedEl.textContent = (isInvitation && isMine ? {
+      approved: `${who} approved and joined`,
+      denied: `${who} declined`,
+      pending: `Waiting for ${who} to approve`,
+      expired: "Expired \u2014 no longer valid",
+    } : {
+      approved: "Approved", denied: "Denied", pending: "Waiting for a response...", expired: "Expired",
+    })[notification.status] || notification.status || "";
     card.appendChild(resolvedEl);
   }
 
@@ -3522,7 +4506,10 @@ async function renderInboxList() {
   // recipient, since loadInbox() is already scoped to "one of the two
   // parties".
   const actionable = notifications.filter((n) => n.status === "pending" && n.requester_username !== myUsername);
-  const sent = notifications.filter((n) => n.requester_username === myUsername && n.status !== "pending");
+  const sent = notifications.filter(
+    (n) => n.requester_username === myUsername && (n.status !== "pending" || n.type === "group_invitation")
+  );
+  updateInboxBadge(actionable.length);
 
   inboxListEl.innerHTML = "";
   if (!actionable.length && !sent.length) {
@@ -3556,8 +4543,21 @@ document.getElementById("toggleModeBtn").addEventListener("click", () => {
   authStatusEl.classList.remove("is-error");
 });
 
+// The gateway address: this page's own host by default (the common case), overridable with
+// ?gateway=ws://host:port or, in "Connection settings", by hand.
+(function initGatewayAddress() {
+  const input = document.getElementById("gatewayUrl");
+  const fromQuery = new URLSearchParams(location.search).get("gateway");
+  if (fromQuery && /^wss?:\/\//.test(fromQuery)) {
+    input.value = fromQuery;
+  } else if (location.hostname && !["127.0.0.1", "localhost"].includes(location.hostname)
+             && input.value === "ws://127.0.0.1:8765") {
+    input.value = `${location.protocol === "https:" ? "wss" : "ws"}://${location.hostname}:8765`;
+  }
+})();
+
 document.getElementById("connectBtn").addEventListener("click", async () => {
-  const gatewayUrl = document.getElementById("gatewayUrl").value;
+  const gatewayUrl = document.getElementById("gatewayUrl").value.trim();
   const phoneNumber = document.getElementById("phoneNumber").value;
   const password = document.getElementById("password").value;
   const connectBtn = document.getElementById("connectBtn");
@@ -3672,6 +4672,12 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
       if (!groupInfoViewEl.hidden) renderGroupInfo();
     },
     // THIS account left a group (server-confirmed): close it if it was open.
+    onDisplayNamesUpdated: () => refreshShownNames(),
+    // A membership change in the OPEN group (live, or from history while it loads).
+    onGroupEvent: (conversationId, event) => {
+      if (activeGroupIdEl.value !== conversationId || groupChatViewEl.hidden) return;
+      renderGroupEvent(groupMessagesEl, { ...event, conversationId });
+    },
     onGroupLeft: (conversationId) => {
       if (activeGroupIdEl.value === conversationId) {
         activeGroupIdEl.value = "";
@@ -3735,14 +4741,34 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
       // event every other presence indicator in this file already
       // uses -- no polling added.
       if (!chatViewEl.hidden) {
-        refreshPeerPresence(document.getElementById("peerUsername").value);
+        refreshPeerPresence(currentPeer());
       }
     },
     // Phase 19.18 -- only re-renders if the Inbox tab is actually the
     // one on screen right now -- a live update must not yank the user
     // away from whatever else they're doing (same reasoning as
     // mobile/app.py's own _inbox_open-gated refresh).
+    onGroupKeyInstalled: () => {
+      if (typeof groupInfoViewEl !== "undefined" && !groupInfoViewEl.hidden) renderGroupInfo();
+    },
+    onSecureConnection: (peer, state, detail) => {
+      if (state === "ready") secureConnectionStatus.delete(peer);
+      else secureConnectionStatus.set(peer, { state, detail });
+      if (!chatViewEl.hidden && currentPeer() === peer) renderPeerIdentity(peer);
+      if (state === "ready") toast(`Secure session established with ${nameOf(peer)}`, "success");
+      else if (state === "failed") toast(`Could not secure the connection with ${nameOf(peer)}: ${detail}`, "error");
+    },
     onInboxUpdated: (notification) => {
+      if (notification && notification.type === "group_invitation") {
+        if (notification.status === "pending" && notification.requester_username !== session?.username) {
+          toast(`${nameOf(notification.requester_username)} invited you to \u201C${notification.group_name || "a group"}\u201D \u2014 open your Inbox to approve`, "success");
+        } else if (notification.requester_username === session?.username) {
+          const who = nameOf(notification.recipient_username || notification.candidate_username);
+          if (notification.status === "approved") toast(`${who} approved and joined \u201C${notification.group_name || "the group"}\u201D`, "success");
+          else if (notification.status === "denied") toast(`${who} declined to join \u201C${notification.group_name || "the group"}\u201D`, "error");
+        }
+      }
+      refreshInboxBadge();
       // Phase 19.23 -- Issue 1: this is the ORIGINAL REQUESTER's own
       // notification that their earlier verification_request was just
       // approved -- add the approver to the sidebar immediately,
@@ -3756,6 +4782,16 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
       ) {
         knownDirectPeers.add(notification.recipient_username);
         renderChatList();
+        toast(`${nameOf(notification.recipient_username)} approved your request`, "success");
+        if (!chatViewEl.hidden && currentPeer() === notification.recipient_username) {
+          renderPeerIdentity(notification.recipient_username);
+        }
+      } else if (
+        notification && notification.type === "verification_request"
+        && notification.status === "denied"
+        && notification.requester_username === session?.username
+      ) {
+        toast("Your verification request was declined. Nothing was verified.", "error");
       }
       if (isInboxTabActive()) renderInboxList();
     },
@@ -3822,7 +4858,7 @@ document.getElementById("logoutBtn").addEventListener("click", () => {
 });
 
 document.getElementById("confirmVerifiedBtn").addEventListener("click", () => {
-  const peerUsername = document.getElementById("peerUsername").value;
+  const peerUsername = currentPeer();
   // BUG FIX (Phase 19.24, continued): observedFingerprint is a single,
   // module-level slot overwritten by whichever peer's identity was
   // MOST RECENTLY (re-)observed over the wire (onPeerObserved fires
@@ -3839,7 +4875,11 @@ document.getElementById("confirmVerifiedBtn").addEventListener("click", () => {
   try {
     session.confirmPeerVerified(peerUsername, observedPeer && observedPeer.fingerprint);
     appendLog(`${peerUsername} marked VERIFIED.`);
-    toast(`${peerUsername} marked as verified`, "success");
+    toast(`${nameOf(peerUsername)} marked as verified`, "success");
+    safetyDetailsRequested = false;
+    document.getElementById("ownNumberPanel").hidden = true;
+    document.getElementById("showOwnNumberBtn").textContent = "Show my safety number";
+    document.getElementById("showOwnNumberBtn").setAttribute("aria-expanded", "false");
     renderPeerIdentity(peerUsername);
     // Phase 19.23 -- Issue 1: add this newly-verified peer to the
     // sidebar immediately, not just at this browser's next login.
@@ -3851,29 +4891,30 @@ document.getElementById("confirmVerifiedBtn").addEventListener("click", () => {
 });
 
 document.getElementById("requestVerificationBtn").addEventListener("click", async () => {
-  const peerUsername = document.getElementById("peerUsername").value;
+  const peerUsername = currentPeer();
   try {
     await session.requestVerification(peerUsername);
     appendLog(`Verification requested from ${peerUsername}.`);
-    toast(`Verification request sent to ${peerUsername}`, "success");
+    toast(`Verification request sent to ${nameOf(peerUsername)}`, "success");
   } catch (error) {
     reportActionError(error);
   }
 });
 
 document.getElementById("establishKeyBtn").addEventListener("click", async () => {
-  const peerUsername = document.getElementById("peerUsername").value;
+  const peerUsername = currentPeer();
   try {
     await session.establishSessionKey(peerUsername);
     appendLog(`Session key established with ${peerUsername}.`);
-    toast(`Secure session established with ${peerUsername}`, "success");
+    toast(`Secure session established with ${nameOf(peerUsername)}`, "success");
+    renderPeerIdentity(peerUsername);
   } catch (error) {
     reportActionError(error);
   }
 });
 
 document.getElementById("sendBtn").addEventListener("click", async () => {
-  const peerUsername = document.getElementById("peerUsername").value;
+  const peerUsername = currentPeer();
   const text = document.getElementById("messageText").value;
   if (!text.trim()) return;
   stopTypingImmediately();
@@ -3907,6 +4948,7 @@ document.getElementById("sendBtn").addEventListener("click", async () => {
   const clientMessageId = crypto.randomUUID();
   try {
     await session.sendMessage(peerUsername, text, replyToMessageId, clientMessageId);
+    knownDirectPeers.add(peerUsername);
     renderTextMessage(messagesEl, "me", text, { replyToMessageId });
     noteConversationActivity(false, peerUsername, "me", text);
   } catch (error) {
@@ -3957,7 +4999,7 @@ for (const id of ["messageText", "groupMessageText"]) {
 }
 
 document.getElementById("markReadBtn")?.addEventListener("click", async () => {
-  const peerUsername = document.getElementById("peerUsername").value;
+  const peerUsername = currentPeer();
   try {
     const conversationId = await session.openDirectConversation(peerUsername);
     session.markRead(conversationId);
@@ -3969,7 +5011,7 @@ document.getElementById("markReadBtn")?.addEventListener("click", async () => {
 });
 
 document.getElementById("loadHistoryBtn").addEventListener("click", async () => {
-  const peerUsername = document.getElementById("peerUsername").value;
+  const peerUsername = currentPeer();
   try {
     const conversationId = await session.openDirectConversation(peerUsername);
     await session.loadHistory(conversationId, false);
@@ -3979,7 +5021,7 @@ document.getElementById("loadHistoryBtn").addEventListener("click", async () => 
 });
 
 document.getElementById("wallpaperBtn").addEventListener("click", (event) => {
-  const peerUsername = document.getElementById("peerUsername").value;
+  const peerUsername = currentPeer();
   showWallpaperPicker(messagesEl, peerUsername, event);
 });
 
@@ -4052,27 +5094,40 @@ document.getElementById("groupGalleryBtn").addEventListener("click", (event) => 
   showMediaGallery(groupMessagesEl, event);
 });
 
-document.getElementById("sendAttachmentBtn").addEventListener("click", async () => {
-  const peerUsername = document.getElementById("peerUsername").value;
-  const fileInput = document.getElementById("attachmentInput");
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) {
-    appendLog("ERROR: no file selected.");
-    toast("Choose a file to send first.", "error");
-    return;
-  }
-  try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    await session.sendAttachment({ peerUsername }, bytes, file.name, file.type || "application/octet-stream");
-    renderAttachment(messagesEl, "me", bytes.length && file.type.startsWith("image/") ? "image" : "file", bytes, {
-      filename: file.name, mime_type: file.type, size_bytes: bytes.length,
-    });
-    fileInput.value = "";
-    document.getElementById("sendAttachmentBtn").hidden = true;
-  } catch (error) {
-    reportActionError(error);
-  }
-});
+for (const [inputId, sendId, isGroup] of [
+  ["attachmentInput", "sendAttachmentBtn", false], ["groupAttachmentInput", "sendGroupAttachmentBtn", true],
+]) {
+  document.getElementById(sendId).addEventListener("click", async () => {
+    const where = activeAttachmentTarget();
+    const fileInput = document.getElementById(inputId);
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      appendLog("ERROR: no file selected.");
+      toast("Choose a file to send first.", "error");
+      return;
+    }
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const mimeType = file.type || "application/octet-stream";
+      // Rendered as what the pipeline classifies it as (voice/video/image/file) -- the same type
+      // every other member's client will show.
+      const renderType = classifyForRender(file.name, mimeType);
+      await sendAttachmentTo(where, bytes, file.name, mimeType, renderType);
+      fileInput.value = "";
+      document.getElementById(sendId).hidden = true;
+    } catch (error) {
+      reportActionError(error);
+    }
+  });
+}
+
+// The type the encrypted pipeline gives an attachment (mirrors classifyAttachment() in app.js).
+function classifyForRender(filename, mimeType) {
+  if (mimeType.startsWith("audio/")) return "voice";
+  if (mimeType.startsWith("video/")) return "video";
+  if (mimeType.startsWith("image/")) return "image";
+  return "file";
+}
 
 // ------------------------------------------------------------------
 // Phase 1.5 -- Create group modal. The request is unchanged:
@@ -4088,6 +5143,89 @@ let selectedGroupMembers = [];
 
 function memberTokens(text) {
   return String(text || "").split(",").map((m) => m.trim()).filter(Boolean);
+}
+
+// A person entered by phone number is looked up first and shown by name (and @handle) in `lookupEl`;
+// the Add button there calls `onAdd`. Resolves to {username, display_name} when someone was found.
+async function previewMemberByPhone(phone, lookupEl, onAdd) {
+  const say = (message, isError) => {
+    lookupEl.hidden = false;
+    lookupEl.classList.toggle("is-error", Boolean(isError));
+    lookupEl.textContent = message;
+  };
+  say("Looking up\u2026", false);
+  let found;
+  try {
+    found = await session.lookupUserByPhone(phone);
+  } catch (error) {
+    say(error.message || "Could not look that number up.", true);
+    return null;
+  }
+  if (!found) {
+    say("No account uses that phone number.", true);
+    return null;
+  }
+  if (found.username === session.username) {
+    say("That is your own number. You are added automatically.", false);
+    return null;
+  }
+  const name = found.display_name || found.username;
+  lookupEl.hidden = false;
+  lookupEl.classList.remove("is-error");
+  lookupEl.replaceChildren();
+  const avatar = document.createElement("span");
+  avatar.className = "avatar xs";
+  avatar.dataset.tone = avatarTone(found.username);
+  avatar.textContent = initialOf(name);
+  const text = document.createElement("span");
+  text.className = "member-lookup-text";
+  const nameEl = document.createElement("span");
+  nameEl.className = "member-lookup-name";
+  nameEl.textContent = name;
+  const handleEl = document.createElement("span");
+  handleEl.className = "member-lookup-handle";
+  handleEl.textContent = `@${found.username}`;
+  text.append(nameEl, handleEl);
+  // Where this person stands with this account decides whether a group key can reach them: a key
+  // is only ever wrapped for, and accepted from, a VERIFIED identity.
+  const known = session.peers.get(found.username);
+  const verified = known && known.state === "VERIFIED";
+  const stateEl = document.createElement("span");
+  stateEl.className = "member-lookup-handle";
+  stateEl.textContent = verified
+    ? "Verified — they will receive the group key"
+    : known
+      ? "Not verified yet — they get the group key once you have verified each other"
+      : "Not online — they get the group key once they are online and you have verified each other";
+  text.append(stateEl);
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "btn btn-primary btn-xs";
+  add.textContent = "Add";
+  add.setAttribute("aria-label", `Add ${name}`);
+  add.addEventListener("click", onAdd);
+  lookupEl.append(avatar, text, add);
+  if (!verified) {
+    // A contact request without opening a conversation: it only asks; nothing is verified until
+    // they approve.
+    const ask = document.createElement("button");
+    ask.type = "button";
+    ask.className = "btn btn-ghost btn-xs";
+    ask.textContent = "Ask to verify";
+    ask.setAttribute("aria-label", `Ask ${name} to verify you`);
+    ask.addEventListener("click", async () => {
+      ask.disabled = true;
+      try {
+        await session.requestVerification(found.username);
+        toast(`Verification request sent to ${name}`, "success");
+      } catch (error) {
+        reportActionError(error);
+        ask.disabled = false;
+      }
+    });
+    lookupEl.append(ask);
+  }
+  return found;
 }
 
 function addGroupMembers(names) {
@@ -4111,7 +5249,8 @@ function renderGroupMemberChips() {
     avatar.dataset.tone = avatarTone(name);
     avatar.textContent = initialOf(name);
     const label = document.createElement("span");
-    label.textContent = name;
+    label.textContent = nameOf(name);
+    if (nameOf(name) !== name) label.title = `@${name}`;
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "member-chip-remove";
@@ -4181,7 +5320,37 @@ function resetGroupCreateForm() {
   document.getElementById("groupName").value = "";
   groupMembersInputEl.value = "";
   selectedGroupMembers = [];
+  clearGroupLookup();
   renderGroupMemberChips();
+}
+
+// A phone number typed into the member box: looked up, shown by name, and only added on "Add"
+// (or Enter again). `groupLookup` is that person while they wait.
+let groupLookup = null;
+const groupLookupEl = document.getElementById("groupMemberLookup");
+
+function clearGroupLookup() {
+  groupLookup = null;
+  groupLookupEl.hidden = true;
+  groupLookupEl.replaceChildren();
+}
+
+function confirmGroupLookup() {
+  if (!groupLookup) return;
+  const { phone, found } = groupLookup;
+  const remaining = memberTokens(groupMembersInputEl.value).filter((token) => token !== phone);
+  addGroupMembers([found.username]);
+  groupMembersInputEl.value = remaining.join(", ");
+  clearGroupLookup();
+  renderGroupMemberSuggestions();
+  groupMembersInputEl.focus();
+}
+
+async function lookupGroupPhone(phone) {
+  groupLookup = null;
+  const found = await previewMemberByPhone(phone, groupLookupEl, confirmGroupLookup);
+  // Only if the box still holds what was looked up (the person may have kept typing).
+  if (found && memberTokens(groupMembersInputEl.value).includes(phone)) groupLookup = { phone, found };
 }
 
 document.getElementById("openCreateGroupBtn").addEventListener("click", openGroupCreateModal);
@@ -4196,9 +5365,21 @@ document.getElementById("groupMemberPicker").addEventListener("click", (event) =
 groupMembersInputEl.addEventListener("keydown", (event) => {
   if ((event.key === "Enter" || event.key === ",") && groupMembersInputEl.value.trim()) {
     event.preventDefault();
-    addGroupMembers(memberTokens(groupMembersInputEl.value));
-    groupMembersInputEl.value = "";
-    renderGroupMemberSuggestions();
+    const tokens = memberTokens(groupMembersInputEl.value);
+    const phones = tokens.filter(looksLikePhoneNumber);
+    if (phones.length === 0) {
+      addGroupMembers(tokens);
+      groupMembersInputEl.value = "";
+      renderGroupMemberSuggestions();
+    } else if (event.key === "Enter" && groupLookup && groupLookup.phone === phones[0]) {
+      confirmGroupLookup();  // Enter again on a person already shown by name adds them
+    } else {
+      // Usernames are added now; the first phone number is looked up and shown before it is added.
+      addGroupMembers(tokens.filter((token) => !looksLikePhoneNumber(token)));
+      groupMembersInputEl.value = phones.join(", ");
+      lookupGroupPhone(phones[0]);
+      renderGroupMemberSuggestions();
+    }
   } else if (event.key === "Backspace" && !groupMembersInputEl.value && selectedGroupMembers.length) {
     selectedGroupMembers.pop();
     renderGroupMemberChips();
@@ -4206,6 +5387,7 @@ groupMembersInputEl.addEventListener("keydown", (event) => {
 });
 groupMembersInputEl.addEventListener("input", () => {
   const value = groupMembersInputEl.value;
+  if (!groupLookup || !memberTokens(value).includes(groupLookup.phone)) clearGroupLookup();
   if (value.includes(",")) {
     const parts = value.split(",");
     const remainder = parts.pop();
@@ -4220,11 +5402,22 @@ document.getElementById("groupName").addEventListener("keydown", (event) => {
 
 document.getElementById("createGroupBtn").addEventListener("click", async () => {
   const name = document.getElementById("groupName").value;
-  const members = [...new Set([...selectedGroupMembers, ...memberTokens(groupMembersInputEl.value)])];
+  const leftover = memberTokens(groupMembersInputEl.value);
+  if (leftover.some(looksLikePhoneNumber)) {
+    // A phone number is never sent as if it were a username: look the person up and add them first.
+    toast("Press Enter to look up that phone number and add the person, or clear it.", "error");
+    groupMembersInputEl.focus();
+    return;
+  }
+  const members = [...new Set([...selectedGroupMembers, ...leftover])];
   try {
-    await session.createGroup(name, members);
+    await session.createGroup(name, members, true);
     appendLog(`Requested group '${name}' with members: ${members.join(", ")}`);
-    toast(`Creating group “${name}”…`);
+    toast(
+      members.length
+        ? `Creating group \u201C${name}\u201D \u2014 ${members.length} invitation${members.length === 1 ? "" : "s"} sent. They join when they approve in their Inbox.`
+        : `Creating group \u201C${name}\u201D\u2026`
+    );
     resetGroupCreateForm();
     closeGroupCreateModal();
   } catch (error) {

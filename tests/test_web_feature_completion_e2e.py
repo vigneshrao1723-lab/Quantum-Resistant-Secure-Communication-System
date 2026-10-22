@@ -86,6 +86,7 @@ def _verify_desktop_observes_browser(desktop_session, page, browser_username):
 
 def _verify_browser_observes_desktop(desktop_session, page):
     page.fill("#peerUsername", desktop_session.username)
+    page.press("#peerUsername", "Enter")
     assert _wait_for(lambda: desktop_session.username in page.inner_text("#fingerprintDisplay"))
     page.click("#confirmVerifiedBtn")
     assert _wait_for(lambda: "marked VERIFIED" in page.inner_text("#log"))
@@ -210,6 +211,7 @@ def test_file_transfer_desktop_to_web_exact_integrity(
         _verify_desktop_observes_browser(alice, page, bob_username)
 
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         alice.set_current_chat(
             ConversationSummary(conversation_id=None, username=bob_username, is_online=True, latest_message=None)
         )
@@ -268,6 +270,7 @@ def test_image_transfer_web_to_desktop_renders_and_matches(
         _verify_desktop_observes_browser(alice, page, bob_username)
 
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.click("#establishKeyBtn")
         assert _wait_for(lambda: "Session key established" in page.inner_text("#log"))
         conversation_id = page.evaluate("Array.from(window.__session.sessionKeys.keys())[0]")
@@ -393,6 +396,7 @@ def test_offline_history_recovery_no_duplicates_correct_order(
         assert "Restored this browser's persisted identity" in page.inner_text("#log")
 
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
 
         # loadHistory() is invoked directly on the real, already-loaded
         # window.__session object rather than via the #loadHistoryBtn
@@ -413,7 +417,10 @@ def test_offline_history_recovery_no_duplicates_correct_order(
             }})()
             """
         )
-        assert first_result["n"] >= 2  # at least the two missed messages recovered
+        # Opening the chat (Enter) loads its history itself, concurrently with the explicit call
+        # above, so which of the two renders the recovered messages is a race; that they are
+        # recovered, in order, exactly once each, is what is asserted below.
+        assert first_result["cid"]
 
         assert _wait_for(
             lambda: "missed message two" in page.inner_text("#messages"),
@@ -434,13 +441,10 @@ def test_offline_history_recovery_no_duplicates_correct_order(
         )
         time.sleep(1.0)
         second_count = page.inner_text("#messages").count("missed message one")
-        # History reload legitimately re-renders (this client does not
-        # dedupe DOM rendering across repeated loadHistory() calls --
-        # see this test file's own module docstring / docs' Phase 18
-        # "Remaining limitations"); what must NOT happen is the
-        # UNDERLYING recovered set changing or growing unboundedly on
-        # its own between two loads of the SAME, unchanged history.
-        assert second_count >= first_count
+        # Two concurrent loads (the chat's own and the explicit one above) and a third one
+        # here never render a recovered message more than once.
+        assert first_count == 1
+        assert second_count == 1
     finally:
         _delete(bob_payload["username"])
 
@@ -620,6 +624,7 @@ def test_web_multi_device_enrollment_authorization_and_key_sync(
         # either of this test's DOM-level #messages assertions below mean
         # anything -- not just have the underlying session/key state ready.
         page.fill("#peerUsername", dave.username)
+        page.press("#peerUsername", "Enter")
 
         # --- Proof of usefulness, part 1: a SECOND message, sent AFTER
         #     the sync, now arrives LIVE on Carol's browser -- Phase
@@ -737,6 +742,7 @@ def test_offline_file_history_recovery_byte_exact(
         # what matters, and is asserted below, is that it ends up visible.
         cid = page.evaluate(f"(async () => window.__session.openDirectConversation({alice.username!r}))()")
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         page.evaluate(f"(async () => window.__session.loadHistory({cid!r}, false))()")
 
         assert _wait_for(

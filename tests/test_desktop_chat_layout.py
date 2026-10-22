@@ -157,7 +157,8 @@ def test_navigation_rail_destinations_are_real_buttons_with_labels(tmp_path, con
         button = getattr(window, attribute)
         assert isinstance(button, QToolButton)
         assert button.text().startswith(label.split()[0])
-        assert button.toolButtonStyle() == Qt.ToolButtonIconOnly
+        # (2026-10-22) the rail now draws each destination's name under its icon, like the Website's.
+        assert button.toolButtonStyle() == Qt.ToolButtonTextUnderIcon
         assert button.accessibleName() == label
         assert not button.icon().isNull()
 
@@ -289,3 +290,60 @@ def test_inbox_badge_failure_leaves_the_window_usable(tmp_path, connect, account
     window.refresh_inbox_badge()  # must not raise
 
     assert window.isEnabled()
+
+
+# ------------------------------------------------------ connection loss
+
+
+def test_losing_the_connection_offers_a_way_back_and_regaining_it_hides_the_offer(connect, accounts, tmp_path):
+    window, _bob, _ap, _bp = _two_windows(connect, accounts, tmp_path)
+
+    assert not window.connection_banner.isVisible()
+
+    window.session.connection_changed.emit(False)
+    assert window.connection_banner.isVisible()
+    assert "lost" in window.findChild(QLabel, "ConnectionBannerText").text()
+    assert window.status.connection_label.text() == "● Disconnected"
+
+    window.session.connection_changed.emit(True)
+    assert not window.connection_banner.isVisible()
+
+
+def test_the_connection_banner_button_signs_the_user_out_so_they_can_log_in_again(connect, accounts, tmp_path):
+    window, _bob, _ap, _bp = _two_windows(connect, accounts, tmp_path)
+    spy = QSignalSpy(window.logout_requested)
+    window.session.connection_changed.emit(False)
+
+    QTest.mouseClick(window.connection_banner_button, Qt.LeftButton)
+
+    assert spy.count() == 1
+
+
+# ------------------------------------------------------ header fits the default window
+
+
+def test_the_header_for_an_unverified_contact_stays_compact_enough_to_fit(connect, accounts, tmp_path):
+    """At the default window width the unverified-contact header (badge + two actions + four icons)
+    used to overflow: buttons and the badge were clipped mid-letter and the name cut. It now keeps
+    only the status and its one action as text, shows the name with an ellipsis, and the other chat
+    tools live behind one Chat settings icon (the header avatar opens the contact's picture)."""
+    window, _bob, _ap, _bp = _two_windows(connect, accounts, tmp_path)
+
+    badge = window.verification_status_label.text()
+    assert badge in ("Not verified", "✓ Verified", "⚠ Identity changed"), badge
+    assert len(badge) <= 20
+
+    # One Chat settings icon replaces the four tool icons and the separate profile icon.
+    assert window.chat_settings_button.text() == ""
+    assert window.chat_settings_button.accessibleName() == "Chat settings"
+    assert not window.chat_settings_button.icon().isNull()
+    for removed in ("view_profile_button", "search_button", "pinned_messages_button", "gallery_button",
+                    "wallpaper_button", "request_verification_button", "leave_group_button"):
+        assert not hasattr(window, removed), removed
+    # The avatar is the picture viewer, and is keyboard-reachable.
+    assert window.header_avatar.accessibleName()
+    assert window.header_avatar.focusPolicy() != Qt.NoFocus
+
+    # The name gives way (with an ellipsis) instead of pushing the buttons out of the row.
+    assert window.chat_partner_label.minimumSizeHint().width() == 0
+    assert window.chat_partner_label.text()  # the full name is still what text() reports

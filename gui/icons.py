@@ -177,6 +177,15 @@ def _draw_group(p):
     p.drawPath(path)
 
 
+def _draw_profile(p):
+    p.drawEllipse(QRectF(8.0, 4.0, 8.0, 8.0))
+    path = QPainterPath()
+    path.moveTo(4.5, 20.0)
+    path.cubicTo(4.5, 15.8, 7.8, 14.0, 12.0, 14.0)
+    path.cubicTo(16.2, 14.0, 19.5, 15.8, 19.5, 20.0)
+    p.drawPath(path)
+
+
 def _draw_filter(p):
     p.drawLine(QPointF(4.0, 7.0), QPointF(20.0, 7.0))
     p.drawLine(QPointF(7.0, 12.0), QPointF(17.0, 12.0))
@@ -261,6 +270,135 @@ def _draw_close(p):
     p.drawLine(QPointF(18.0, 6.0), QPointF(6.0, 18.0))
 
 
+def _filled(p):
+    p.setBrush(p.pen().color())
+
+
+def _draw_play(p):
+    _filled(p)
+    path = QPainterPath()
+    path.moveTo(8.0, 5.5)
+    path.lineTo(18.5, 12.0)
+    path.lineTo(8.0, 18.5)
+    path.closeSubpath()
+    p.drawPath(path)
+
+
+def _draw_pause(p):
+    _filled(p)
+    p.drawRoundedRect(QRectF(7.0, 5.5, 3.2, 13.0), 1.0, 1.0)
+    p.drawRoundedRect(QRectF(13.8, 5.5, 3.2, 13.0), 1.0, 1.0)
+
+
+def _draw_download(p):
+    p.drawLine(QPointF(12.0, 4.0), QPointF(12.0, 15.0))
+    path = QPainterPath()
+    path.moveTo(7.5, 10.5)
+    path.lineTo(12.0, 15.0)
+    path.lineTo(16.5, 10.5)
+    p.drawPath(path)
+    p.drawLine(QPointF(5.0, 19.5), QPointF(19.0, 19.5))
+
+
+def _draw_logout(p):
+    path = QPainterPath()
+    path.moveTo(10.0, 4.5)
+    path.lineTo(5.5, 4.5)
+    path.lineTo(5.5, 19.5)
+    path.lineTo(10.0, 19.5)
+    p.drawPath(path)
+    p.drawLine(QPointF(9.5, 12.0), QPointF(19.5, 12.0))
+    arrow = QPainterPath()
+    arrow.moveTo(15.5, 8.0)
+    arrow.lineTo(19.5, 12.0)
+    arrow.lineTo(15.5, 16.0)
+    p.drawPath(arrow)
+
+
+def _draw_speaker(p):
+    path = QPainterPath()
+    path.moveTo(4.0, 9.5)
+    path.lineTo(8.0, 9.5)
+    path.lineTo(13.0, 5.0)
+    path.lineTo(13.0, 19.0)
+    path.lineTo(8.0, 14.5)
+    path.lineTo(4.0, 14.5)
+    path.closeSubpath()
+    p.drawPath(path)
+
+
+def _draw_volume(p):
+    _draw_speaker(p)
+    for radius in (4.0, 7.5):
+        arc = QPainterPath()
+        arc.arcMoveTo(QRectF(13.0 - radius, 12.0 - radius, radius * 2, radius * 2), 40)
+        arc.arcTo(QRectF(13.0 - radius, 12.0 - radius, radius * 2, radius * 2), 40, -80)
+        p.drawPath(arc)
+
+
+def _draw_volume_off(p):
+    _draw_speaker(p)
+    p.drawLine(QPointF(16.5, 9.5), QPointF(21.5, 14.5))
+    p.drawLine(QPointF(21.5, 9.5), QPointF(16.5, 14.5))
+
+
+def _draw_expand(p):
+    for a, b, c in (((4.5, 9.5), (4.5, 4.5), (9.5, 4.5)), ((14.5, 4.5), (19.5, 4.5), (19.5, 9.5)),
+                    ((19.5, 14.5), (19.5, 19.5), (14.5, 19.5)), ((9.5, 19.5), (4.5, 19.5), (4.5, 14.5))):
+        path = QPainterPath()
+        path.moveTo(*a)
+        path.lineTo(*b)
+        path.lineTo(*c)
+        p.drawPath(path)
+
+
+def _draw_file(p):
+    path = QPainterPath()
+    path.moveTo(6.0, 3.5)
+    path.lineTo(14.0, 3.5)
+    path.lineTo(18.5, 8.0)
+    path.lineTo(18.5, 20.5)
+    path.lineTo(6.0, 20.5)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.drawLine(QPointF(14.0, 3.5), QPointF(14.0, 8.0))
+    p.drawLine(QPointF(14.0, 8.0), QPointF(18.5, 8.0))
+
+
+def _draw_info(p):
+    p.drawEllipse(QRectF(3.5, 3.5, 17.0, 17.0))
+    p.drawLine(QPointF(12.0, 11.0), QPointF(12.0, 16.5))
+    p.drawPoint(QPointF(12.0, 7.8))
+
+
+def _draw_shield(p):
+    path = QPainterPath()
+    path.moveTo(12.0, 3.0)
+    path.lineTo(19.0, 6.0)
+    path.lineTo(19.0, 11.5)
+    path.cubicTo(19.0, 16.0, 16.0, 19.2, 12.0, 21.0)
+    path.cubicTo(8.0, 19.2, 5.0, 16.0, 5.0, 11.5)
+    path.lineTo(5.0, 6.0)
+    path.closeSubpath()
+    p.drawPath(path)
+    check = QPainterPath()
+    check.moveTo(8.8, 12.0)
+    check.lineTo(11.2, 14.4)
+    check.lineTo(15.4, 9.6)
+    p.drawPath(check)
+
+
+def _draw_camera(p):
+    p.drawRoundedRect(QRectF(3.0, 7.0, 18.0, 13.0), 2.5, 2.5)
+    path = QPainterPath()
+    path.moveTo(8.5, 7.0)
+    path.lineTo(10.0, 4.5)
+    path.lineTo(14.0, 4.5)
+    path.lineTo(15.5, 7.0)
+    p.drawPath(path)
+    p.drawEllipse(QRectF(8.5, 9.5, 7.0, 7.0))
+
+
 _DRAWERS = {
     "search": _draw_search,
     "pin": _draw_pin,
@@ -273,6 +411,7 @@ _DRAWERS = {
     "settings": _draw_settings,
     "compose": _draw_compose,
     "group": _draw_group,
+    "profile": _draw_profile,
     "filter": _draw_filter,
     "attach": _draw_attach,
     "send": _draw_send,
@@ -282,6 +421,17 @@ _DRAWERS = {
     "mic": _draw_mic,
     "mute": _draw_mute,
     "video": _draw_video,
+    "play": _draw_play,
+    "pause": _draw_pause,
+    "download": _draw_download,
+    "expand": _draw_expand,
+    "logout": _draw_logout,
+    "volume": _draw_volume,
+    "volume-off": _draw_volume_off,
+    "file": _draw_file,
+    "info": _draw_info,
+    "shield": _draw_shield,
+    "camera": _draw_camera,
 }
 
 
@@ -324,3 +474,51 @@ def toolbar_icon(name, color=COLOR_TEXT_MUTED, active_color=COLOR_ACCENT, disabl
     icon.addPixmap(disabled, QIcon.Disabled, QIcon.Off)
     icon.addPixmap(disabled, QIcon.Disabled, QIcon.On)
     return icon
+
+
+def brand_pixmap(size=48):
+    """The application's brand mark: a white padlock on a rounded accent square.
+
+    The Website's brand mark is the same padlock on the same accent colour. It is drawn rather than
+    loaded from a file so the Desktop login screen, the window and the executable's icon always
+    exist and always match the palette.
+    """
+
+    scale = 4  # rasterised large, then scaled, so every size stays crisp
+    side = size * scale
+    pixmap = QPixmap(side, side)
+    pixmap.fill(Qt.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(COLOR_ACCENT))
+    painter.drawRoundedRect(QRectF(0, 0, side, side), side * 0.24, side * 0.24)
+
+    # Padlock on a 24-unit grid centred in the square.
+    unit = side / 24.0
+    painter.translate(0, 0)
+    pen = QPen(QColor("#FFFFFF"), 1.9 * unit)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    shackle = QPainterPath()
+    shackle.moveTo(8.2 * unit, 11 * unit)
+    shackle.lineTo(8.2 * unit, 8.4 * unit)
+    shackle.arcTo(QRectF(8.2 * unit, 4.4 * unit, 7.6 * unit, 8.0 * unit), 180, -180)
+    shackle.lineTo(15.8 * unit, 11 * unit)
+    painter.drawPath(shackle)
+
+    painter.setBrush(QColor("#FFFFFF"))
+    painter.drawRoundedRect(QRectF(6.2 * unit, 11 * unit, 11.6 * unit, 8.2 * unit), 2.0 * unit, 2.0 * unit)
+
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(COLOR_ACCENT))
+    painter.drawEllipse(QPointF(12 * unit, 14.4 * unit), 1.1 * unit, 1.1 * unit)
+    painter.drawRoundedRect(QRectF(11.4 * unit, 14.8 * unit, 1.2 * unit, 2.2 * unit), 0.5 * unit, 0.5 * unit)
+    painter.end()
+
+    return pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)

@@ -76,7 +76,11 @@ def test_choosing_and_cropping_a_picture_uploads_a_square_png_other_users_can_fe
     alice_payload, bob_payload = accounts("alice_"), accounts("bob_")
     alice, bob = connect(alice_payload), connect(bob_payload)
     dialog = _dialog(alice)
-    assert dialog.preview_label.text() == "No picture set"
+    # No picture yet: a polished placeholder (the coloured initial) and a plain caption, not an
+    # empty box.
+    assert dialog.is_placeholder
+    assert dialog.caption_label.text() == "You haven't added a profile picture yet."
+    assert dialog.preview_label.pixmap() is not None and not dialog.preview_label.pixmap().isNull()
 
     pick(_image_file(tmp_path, 640, 360))  # deliberately NOT square
     dialog._handle_change()
@@ -86,6 +90,7 @@ def test_choosing_and_cropping_a_picture_uploads_a_square_png_other_users_can_fe
     image = _decode(stored)
     assert image.width() == image.height() == OUTPUT_SIZE  # the crop made it square
     assert dialog.status_label.text() == ""
+    assert not dialog.is_placeholder and dialog.caption_label.text() == ""
     assert dialog.preview_label.pixmap() is not None and not dialog.preview_label.pixmap().isNull()
     # What the dialog shows is what was stored.
     assert alice.fetch_profile_picture(alice_payload["username"]) == stored
@@ -100,7 +105,7 @@ def test_cancelling_the_file_picker_changes_nothing(tmp_path, connect, accounts,
     dialog._handle_change()
 
     assert alice.fetch_profile_picture(payload["username"]) is None
-    assert dialog.preview_label.text() == "No picture set"
+    assert dialog.is_placeholder
 
 
 def test_cancelling_the_crop_uploads_nothing(tmp_path, connect, accounts, pick, monkeypatch):
@@ -113,7 +118,7 @@ def test_cancelling_the_crop_uploads_nothing(tmp_path, connect, accounts, pick, 
     dialog._handle_change()
 
     assert alice.fetch_profile_picture(payload["username"]) is None
-    assert dialog.preview_label.text() == "No picture set"
+    assert dialog.is_placeholder
 
 
 def test_an_unreadable_file_is_reported_and_nothing_is_uploaded(tmp_path, connect, accounts, pick, crop_accepts):
@@ -164,5 +169,6 @@ def test_a_peers_picture_dialog_offers_no_change_button(tmp_path, connect, accou
     _KEEP_ALIVE.append(viewer)
 
     assert not viewer.is_own
-    assert "Change" not in [b.text() for b in viewer.findChildren(QPushButton)]
+    assert not any("Change" in b.text() or "Add a picture" in b.text() for b in viewer.findChildren(QPushButton))
+    assert not viewer.is_placeholder
     assert viewer.preview_label.pixmap() is not None and not viewer.preview_label.pixmap().isNull()

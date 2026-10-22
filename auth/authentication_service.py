@@ -2,6 +2,7 @@
 Authentication service foundation.
 """
 
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -45,6 +46,18 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# Shown when someone tries to register a phone number that already has an account. One plain
+# sentence the person can act on -- never the internal list of colliding fields.
+ACCOUNT_EXISTS_MESSAGE = "An account with this phone number already exists. Please log in."
+
+# Accounts are identified internally by a unique handle (users.username), which the wire protocol
+# routes on; the name a person chooses and sees is users.display_name, which need NOT be unique.
+# When a chosen name is already somebody's handle, the new account gets this name plus a short
+# random suffix as its handle (it stays an internal routing key; people see the display name).
+_HANDLE_MAX_LENGTH = 32
+_SYNTHETIC_EMAIL_DOMAIN = "@users.invalid"
+
+
 class SessionInvalidError(TokenValidationError):
     """Raised when a token is cryptographically valid but its underlying
     session is missing, revoked, inactive, or expired."""
@@ -81,11 +94,20 @@ class AuthenticationService:
         if registration_data.password != registration_data.confirm_password:
             errors["confirm_password"] = "Password and confirmation do not match."
 
-        if self.user_repo.get_by_username(registration_data.username):
-            errors["username"] = "Username already exists."
+        requested_name = (registration_data.username or "").strip()
+        display_name = (registration_data.full_name or "").strip() or requested_name
 
-        if self.user_repo.get_by_email(registration_data.email):
-            errors["email"] = "Email already exists."
+        if not requested_name:
+            errors["username"] = "Please enter a username."
+
+        email = (registration_data.email or "").strip()
+        synthetic_email = email.lower().endswith(_SYNTHETIC_EMAIL_DOMAIN)
+
+        # A real e-mail address is still one account's alone. The clients synthesise
+        # "<name>@users.invalid" (no e-mail is collected); that address is derived again
+        # from the final handle below, so two people choosing the same name never collide on it.
+        if email and not synthetic_email and self.user_repo.get_by_email(email):
+            errors["email"] = "An account with this e-mail address already exists. Please log in."
 
         # BUG 7 -- phone number is mandatory and unique, because it is
         # the identifier other users search by. Normalising BEFORE the
@@ -104,7 +126,18 @@ class AuthenticationService:
             errors["phone_number"] = str(error)
         else:
             if self.user_repo.get_by_phone_number(normalized_phone_number):
-                errors["phone_number"] = "Phone number already exists."
+                # The phone number IS the account (it is how people log in), so this is the
+                # one duplicate that means "you already have an account" -- said once, plainly.
+                self._log_auth_event(
+                    "registration_failed",
+                    username=registration_data.username,
+                    detail="phone_number_exists",
+                )
+                return RegistrationResult(
+                    success=False,
+                    message=ACCOUNT_EXISTS_MESSAGE,
+                    errors={"phone_number": ACCOUNT_EXISTS_MESSAGE},
+                )
 
         if errors:
             self._log_auth_event(
@@ -122,10 +155,13 @@ class AuthenticationService:
             password_hash = self.password_handler.hash_password(
                 registration_data.password
             )
+            username = self._available_handle(requested_name)
+            if not email or (synthetic_email and self.user_repo.get_by_email(email)):
+                email = self._available_synthetic_email(username)
             user = self.user_repo.create(
-                username=registration_data.username,
-                email=registration_data.email,
-                display_name=registration_data.full_name,
+                username=username,
+                email=email,
+                display_name=display_name[:64],
                 password_hash=password_hash,
                 phone_number=normalized_phone_number,
             )
@@ -140,12 +176,12 @@ class AuthenticationService:
                 username=registration_data.username,
                 detail="unique constraint violated",
             )
+            # Two registrations raced for the same phone number (the only collision that
+            # can still reach the database: handles and synthetic e-mails were made unique above).
             return RegistrationResult(
                 success=False,
-                message="Username, email, or phone number is already in use.",
-                errors={
-                    "username": "Username, email, or phone number already exists."
-                },
+                message=ACCOUNT_EXISTS_MESSAGE,
+                errors={"phone_number": ACCOUNT_EXISTS_MESSAGE},
             )
         except SQLAlchemyError:
             self.user_repo.rollback()
@@ -167,6 +203,27 @@ class AuthenticationService:
             message="Registration completed successfully.",
             user_id=str(user.id),
         )
+
+    def _available_handle(self, requested: str) -> str:
+        """The chosen name if no account uses it as its handle yet, else the name plus a short
+        random suffix. Never reveals which account holds the name."""
+
+        base = requested[:_HANDLE_MAX_LENGTH]
+        if not self.user_repo.get_by_username(base):
+            return base
+        stem = base[: _HANDLE_MAX_LENGTH - 7]
+        for _ in range(50):
+            candidate = f"{stem}_{secrets.token_hex(3)}"
+            if not self.user_repo.get_by_username(candidate):
+                return candidate
+        raise RuntimeError("could not allocate a unique account handle")
+
+    def _available_synthetic_email(self, handle: str) -> str:
+        local = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in handle) or "user"
+        candidate = f"{local}{_SYNTHETIC_EMAIL_DOMAIN}"
+        while self.user_repo.get_by_email(candidate):
+            candidate = f"{local}_{secrets.token_hex(3)}{_SYNTHETIC_EMAIL_DOMAIN}"
+        return candidate
 
     def authenticate_user(self, login_data: LoginRequest) -> AuthenticationResult:
         """Authenticate an existing user and issue tokens.

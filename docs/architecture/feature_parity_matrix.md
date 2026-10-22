@@ -33,6 +33,7 @@ unvalidated on hardware) — see "Remaining gaps".
 | Peer profile view | PASS | PASS | **PASS (new)** | as above | |
 | Find user by phone number | PASS | PASS | PASS | `test_phone_number_discovery.py`, `test_find_user_dialog_gui.py` | |
 | Peer identity verification (safety number) | PASS | PASS | PASS | `test_first_contact_verification.py`, `test_peer_key_verification.py`, `test_mobile_peer_verification_persistence.py`, `test_web_browser_e2e.py` | fail-closed on key change on all three |
+| **View own safety number** | MISSING (paused) | **PASS (new)** | **PASS (new)** | `test_own_safety_number.py` (4): the number each client shows for the user equals what the other client observed for them | Moved 2026-10-21: no longer a standing panel in Settings. Desktop: Verify Identity window → "Show my safety number"; Website: verification details → "Show my safety number". Before this, verification asked people to read their number to the other side but neither client could show it. Android not changed (paused) |
 | Inbox + verification requests | PASS | PASS | PASS | `test_group_admin_and_inbox.py`, `test_web_settings_and_inbox.py` | Desktop shows a pending-request badge on the rail (new) |
 | Device list / enroll / authorize / revoke | PASS | PASS | PASS | `test_device_identity.py`, `test_device_management.py`, `test_web_feature_completion_e2e.py` | revoked devices fail closed (`test_device_security` batch) |
 | Cross-device key sync | PASS | PASS | PASS | `test_device_key_sync*.py`, `test_mobile_device_key_sync.py` | |
@@ -97,6 +98,52 @@ unvalidated on hardware) — see "Remaining gaps".
 | Keyboard focus | n/a | focus styles on rail/header/composer | focus-visible throughout | |
 | Contrast | n/a | n/a | placeholders, bubble timestamps and dark-mode accent text raised to ≥ 4.5:1 | |
 
+## Desktop executable and accessibility (added 2026-10-21)
+
+| Capability | Desktop | Website | Evidence | Notes |
+|---|---|---|---|---|
+| Windows executable | **PASS (built, launched, exercised)** | n/a | `scripts/build_desktop_exe.py`; `tests/acceptance/test_desktop_exe_roundtrip.py`, `test_pairs.py`, `test_population.py`; `tests/test_desktop_exe_build.py` | One-folder PyInstaller build, no secrets or server code bundled. Exercised on this machine only; not yet code-signed, not tried on a clean machine |
+| Screen-reader / automation access to message rows | **PASS (new)** | PASS (DOM) | `test_desktop_message_accessibility.py` (5) | Message and conversation rows are `setItemWidget()` widgets that assistive technology could not read; each row now carries "who, text, time" / "name, preview, N unread". Edits and deletions update it |
+| Named login fields | **PASS (new)** | PASS | `test_login_window_phone_identifier.py`, acceptance suite | |
+| First request after connect is always answered | PASS | **PASS (fixed)** | `test_web_gateway_first_request.py` (2) | A TLS 1.3 session-ticket race lost ~0.5% of first requests (browser registration/login timeouts). Server now issues no tickets; see the 2026-10-21 security-matrix addendum |
+| Logout / closing the page ends the server connection | PASS | **PASS (fixed)** | `test_web_gateway_teardown.py` (2); acceptance `test_social.py::test_presence_...` | The gateway used to keep the server-side connection (and so the user's "online" state) after a clean browser close |
+| Connection-loss behaviour | **PASS (new banner)** | **PASS (fixed)** | Desktop: `test_desktop_chat_layout.py` (2); Website: `test_web_reconnect_after_outage.py`; both: acceptance `test_reconnect.py` | Desktop shows a banner "Connection to the server was lost…" with **Sign in again** (previously only the word "Disconnected"); it does not reconnect by itself (it does not keep the password). Website reconnects by itself with back-off for about two minutes; before the fix a failed attempt hung forever and it never recovered |
+| Repeated send (same `client_message_id`) delivers once | PASS | PASS | `test_message_replay_idempotency.py` (3) | The server used to deliver it twice (direct) or break the sender's connection (group) |
+| Login does not reveal whether a phone number exists | PASS | PASS | `test_login_logout_integration.py::test_a_wrong_password_and_an_unknown_phone_number_look_identical` | Wire-level fix; Android shares the server and benefits unchanged. Locked/inactive accounts and login timing are not covered |
+| Group history across key rotations | PASS | **PASS (new)** | `test_web_group_key_history.py` (3) | The Web client keeps every epoch and persists them; a newly linked browser device still only receives the current key |
+| Desktop header fits the default window (unverified contact, groups) | **PASS (fixed)** | n/a | `test_desktop_chat_layout.py` | Found from a real screenshot: buttons and the badge were clipped; the profile action is now an icon and the name elides |
+| Desktop Settings reachable on a small screen | **PASS (fixed)** | n/a | `test_own_safety_number.py` | Sections scroll; Logout/Close stay pinned |
+
+## Desktop / Website UI parity, chat media and group events (added 2026-10-21, Phase 19.24 cycle)
+
+The per-requirement map (20 items, files, tests) is `ui_parity_requirement_map.md`. Rows here are the user-visible behaviours.
+All are covered by automated tests; none has had manual acceptance yet.
+
+| Capability | Android | Desktop | Website | Evidence | Notes |
+|---|---|---|---|---|---|
+| Display names need not be unique; the phone number is | unchanged (shares the server) | PASS | PASS | `test_duplicate_display_names.py`, `test_desktop_display_names.py` | Routing, keys and authorization use the internal handle/user id, never the display name. Namesakes are told apart by `@handle`. Android keeps showing handles |
+| Registration with an existing phone number: one clear message | unchanged | PASS | PASS | `test_registration_integration.py`, `test_web_registration_and_login_ui.py` | Login replies stay generic |
+| Chat settings (header icon): contact info, search, pins, media, wallpaper, mute/archive/block, group members | — | PASS | PASS | `test_desktop_chat_settings.py`, `test_web_chat_settings_and_recorder.py` | Verification status and the group Members control stay in the header |
+| Header avatar opens an enlarged picture (placeholder if none) | — | PASS | PASS | `test_desktop_chat_settings.py`, `test_web_messenger_layout_and_parity.py` | |
+| Own profile row opens the enlarged picture; "Change picture" only there | — | PASS | PASS | `test_desktop_profile_picture_dialog.py`, `test_web_messenger_layout_and_parity.py` | |
+| Website profile-picture upload with crop/zoom; server validates type, size, dimensions | — | views it | PASS | `test_profile_picture_validation.py`, `test_web_messenger_layout_and_parity.py` | Server check applies to every client |
+| Concise "Verified" + Re-verify; key change ends "verified" at once | unchanged | PASS | PASS (also refuses to send until re-verified) | `test_web_messenger_layout_and_parity.py`, `test_desktop_chat_settings.py` | |
+| Search never creates a conversation | — | n/a | PASS | `test_web_messenger_layout_and_parity.py` | Enter / "Start chat" opens the person; a row appears after the first message |
+| Replies: right author, safe excerpt or media label, jump to original, deleted/unavailable | unchanged | PASS | PASS | `test_reply_reference_integrity.py`, `test_desktop_reply_reactions.py`, `test_web_reply_and_reactions.py` | Resolved by stable message id inside the same conversation; the server drops cross-conversation references |
+| Reactions on every message kind, one pill per emoji, survive reload | PASS (pre-existing) | PASS | PASS | `test_desktop_reply_reactions.py`, `test_web_reply_and_reactions.py` | |
+| Desktop voice/video cards (play, progress, duration, size, Save, time, receipts) | — | PASS | PASS (reference) | `test_phase19_24_desktop_voice_video.py`, `test_media_playback_interop.py` | Real Chrome clips decoded by Qt and real Qt clips decoded by Chrome, across the server; undecodable media fails gracefully |
+| Website voice recorder modal (timer, preview, Record again / Cancel / Send) | — | Desktop recorder follows the same flow | PASS | `test_web_chat_settings_and_recorder.py` | Fake Chrome devices only; no real microphone used |
+| Gateway address | — | n/a | collapsed under "Connection settings"; `?gateway=` accepted | `test_web_chat_settings_and_recorder.py` | Kept because a different gateway host needs it |
+| Group membership events (added / left / removed) | unchanged | PASS | PASS | `test_group_membership_events.py`, `test_desktop_group_events.py`, `test_web_group_attachments_and_events.py` | Server-written from authenticated identities; members only, from their join time; once; in order |
+| Group attachments (file, image, voice, video) | unchanged | PASS | **PASS (new)** | `test_group_attachments.py`, `test_desktop_group_attachments_gui.py`, `test_web_group_attachments_and_events.py` | One stored message + one delivery row per member; removed members and non-members cannot fetch or decrypt |
+
+### How to read the evidence column
+
+"Acceptance" means `tests/acceptance/` — the built Desktop executable and Chrome driven through the real UIs against an
+isolated deployment (see `acceptance_testing.md`). Everything else is the regression suite (in-process clients, real
+server, real database; Playwright for the Website). A **manual** result exists only where this document says so; none is
+claimed yet — the manual acceptance checklist is `docs/manual_acceptance_checklist.md`.
+
 ## Remaining gaps (not hidden)
 
 1. **Group picture / avatar — MISSING on all platforms.** Needs a new protocol
@@ -111,6 +158,13 @@ unvalidated on hardware) — see "Remaining gaps".
    a pre-existing design difference, not introduced here, and means Web
    cannot show pre-rotation group history after a rotation.
 5. **Desktop has no dark theme.**
+6. **Desktop dialogs with buttons inside list rows** (Devices, Inbox, group members) are unreachable for assistive
+   technology and for UI Automation. They work by mouse and keyboard and are covered by widget-level tests, not by the
+   UI-driven acceptance suite.
+7. **Desktop does not reconnect by itself** after losing the server; it offers "Sign in again".
+8. **Account enumeration** is closed for wrong-password versus unknown-number replies only; locked/inactive accounts and
+   login timing still differ.
+9. **The executable is unsigned** and has only been run on the development machine.
 
 ## Continuation checkpoint (2026-10-20)
 

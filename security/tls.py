@@ -42,6 +42,16 @@ def build_server_context() -> ssl.SSLContext:
 
     context.minimum_version = ssl.TLSVersion.TLSv1_2
 
+    # No TLS 1.3 session tickets. This application never resumes TLS sessions
+    # (every connection authenticates and establishes its keys from scratch), so
+    # the tickets give nothing -- but the server sends them immediately after the
+    # handshake, on the very connection a client's reader thread is already
+    # blocked on while another thread sends its first request. Processing them
+    # in that window made the first request occasionally vanish (see
+    # tests/test_tls_post_handshake_race.py). Removing the tickets removes the
+    # window; it does not relax any authentication or encryption property.
+    context.num_tickets = 0
+
     context.load_cert_chain(certfile=TLS_CERT_FILE, keyfile=TLS_KEY_FILE)
 
     return context

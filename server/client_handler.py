@@ -6,7 +6,7 @@ Handles communication with individual clients.
 
 import base64
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest, RegisterRequest
@@ -16,7 +16,13 @@ from config import (
 )
 from database.connection import SessionLocal
 from database.models.conversation import Conversation
-from database.models.inbox_notification import TYPE_GROUP_ADD_REQUEST, TYPE_VERIFICATION_REQUEST
+from database.models.inbox_notification import (
+    STATUS_EXPIRED,
+    STATUS_PENDING,
+    TYPE_GROUP_ADD_REQUEST,
+    TYPE_GROUP_INVITATION,
+    TYPE_VERIFICATION_REQUEST,
+)
 from database.models.user import User
 from database.repositories.blocked_user_repository import BlockedUserRepository
 from database.repositories.conversation_repository import ConversationRepository
@@ -26,6 +32,9 @@ from database.repositories.user_repository import UserRepository
 from domain.message_delivery_status import MessageDeliveryStatus
 from domain.payload_envelope import PayloadEnvelope
 from domain.payload_type import BLOB_STORAGE_PAYLOAD_TYPES, PayloadType
+from database.models.group_event import GroupEvent
+from database.repositories.group_event_repository import GroupEventRepository
+from security.image_validation import InvalidImageError, inspect_image
 from security.jwt_handler import TokenExpiredError, TokenValidationError
 from security.phone_number import (
     InvalidPhoneNumberError,
@@ -49,6 +58,8 @@ from server.device_handler import (
 from storage import encrypted_blob_store
 from utils.network import receive_message
 from utils.protocol import (
+    MAX_DISPLAY_NAME_LENGTH,
+    MAX_DISPLAY_NAME_LOOKUP,
     create_auth_result_packet,
     create_blob_download_result_packet,
     create_conversation_list_result_packet,
@@ -72,6 +83,8 @@ from utils.protocol import (
     create_unblock_user_result_packet,
     create_join_packet,
     create_bio_result_packet,
+    create_change_display_name_result_packet,
+    create_display_names_result_packet,
     create_change_bio_result_packet,
     create_leave_packet,
     create_login_result_packet,
@@ -230,6 +243,15 @@ def persist_message(sender_id, receiver_id, algorithm, packet, conversation_id=N
         except (ValueError, AttributeError, TypeError):
             reply_to_message_id = None
 
+        # A reply may only point at a message in THIS conversation. Anything else -- a
+        # message from another conversation, or an id that does not exist (which used to
+        # fail the whole send on the foreign key) -- is dropped, so the message is still
+        # delivered, just without the reference.
+        if reply_to_message_id is not None:
+            referenced = message_repo.get_message(reply_to_message_id)
+            if referenced is None or str(referenced.conversation_id) != str(conversation_id):
+                reply_to_message_id = None
+
         message, was_duplicate = message_repo.save_message_idempotent(
             sender_id=sender_id,
             receiver_id=receiver_id,
@@ -268,10 +290,12 @@ def persist_message(sender_id, receiver_id, algorithm, packet, conversation_id=N
             # deleted here (it already exists on disk independently of
             # this DB transaction).
             db.commit()
+            message.was_duplicate_send = True
             return message
 
         db.commit()
 
+        message.was_duplicate_send = False
         return message
     finally:
         db.close()
@@ -367,6 +391,11 @@ def persist_group_message(
         conversation_id=conversation_id,
     )
 
+    if message.was_duplicate_send:
+        # A repeated send of a message already stored (same client_message_id): its recipient rows
+        # were written by the original, and inserting them again violates their unique key.
+        return message
+
     db = SessionLocal()
 
     try:
@@ -381,6 +410,20 @@ def persist_group_message(
         db.close()
 
     return message
+
+
+def _stamp_relayed_references(packet, message):
+    """
+    What a relayed message says about itself comes from the stored row, never from the sender's
+    packet: its server-assigned id, and the reply reference persist_message() actually kept --
+    which is None when the sender named a message from another conversation or one that does not
+    exist. Neither field is part of the signed payload, so this changes nothing a recipient
+    verifies.
+    """
+
+    packet["message_id"] = str(message.id)
+    reply_to = getattr(message, "reply_to_message_id", None)
+    packet["reply_to_message_id"] = str(reply_to) if reply_to else None
 
 
 def _record_direct_recipient(message, receiver_id):
@@ -517,7 +560,15 @@ def handle_group_chat_delivery(state, client_socket, user, conversation_id, pack
     # rendered this live group message can recognize it again later via
     # history and skip re-rendering it. Not part of any ML-DSA-signed
     # payload, so this changes nothing about what was already signed.
-    packet["message_id"] = str(message.id)
+    _stamp_relayed_references(packet, message)
+
+    if message.was_duplicate_send:
+        # Already stored and relayed by the original send: relaying it again would show every member
+        # the same message twice.
+        state.logger.info(
+            f"Ignored a repeated send in group {conversation_id} (same client_message_id)"
+        )
+        return
 
     member_id_strings = {str(member_id) for member_id in member_ids}
     connected_member_ids = []
@@ -595,6 +646,8 @@ def handle_group_create(state, client_socket, user, packet):
 
         member_ids = [user.id]
         resolved_usernames = [user.username]
+        invitees = []
+        consent = bool(packet.get("consent_invitations"))
         blocked_repo = BlockedUserRepository(db)
 
         for username in member_usernames:
@@ -618,6 +671,12 @@ def handle_group_create(state, client_socket, user, packet):
             if blocked_repo.is_blocked(member.id, user.id) or blocked_repo.is_blocked(user.id, member.id):
                 continue
 
+            if consent:
+                # Invited, not added: they become members only by approving in their own Inbox.
+                if member not in invitees:
+                    invitees.append(member)
+                continue
+
             member_ids.append(member.id)
             resolved_usernames.append(member.username)
 
@@ -628,6 +687,12 @@ def handle_group_create(state, client_socket, user, packet):
         conversation_repo.commit()
 
         conversation_id = str(conversation.id)
+
+        pending_invitations = None
+        if consent:
+            pending_invitations = _invite_candidates(
+                state, db, user, conversation.id, invitees, name,
+            )
     finally:
         db.close()
 
@@ -636,6 +701,7 @@ def handle_group_create(state, client_socket, user, packet):
         name=name,
         creator=user.username,
         members=resolved_usernames,
+        pending_invitations=pending_invitations,
     )
 
     for sock, client in list(state.clients.items()):
@@ -726,10 +792,19 @@ def _dispatch_pending_rotation_if_needed(state, conversation_id_str):
 
         member_ids = conversation_repo.get_member_user_ids(conversation_id)
         member_usernames = _usernames_for(db, member_ids)
+        admin_user_id = conversation_repo.get_admin_user_id(conversation_id)
     finally:
         db.close()
 
-    selected = _select_connected_active_member(state, member_ids)
+    # The admin first: members of a group invited through the Inbox have verified the admin who
+    # invited them, not necessarily one another, and a key is only ever wrapped for a verified
+    # identity -- so the member who distributes a new epoch has to be one every member trusts.
+    # Any other connected member is the fallback, as before.
+    selected = None
+    if admin_user_id is not None:
+        selected = _select_connected_active_member(state, [admin_user_id])
+    if selected is None:
+        selected = _select_connected_active_member(state, member_ids)
 
     if selected is None:
         state.logger.info(
@@ -770,6 +845,18 @@ def _dispatch_pending_rotation_if_needed(state, conversation_id_str):
         f"Dispatched group key rotation for {conversation_id_str} epoch "
         f"{next_epoch} to {selected_username}"
     )
+
+
+def _serialize_group_event(event):
+    """The wire form of a recorded membership event (see GroupEvent): structured fields only."""
+
+    return {
+        "event_id": str(event.id),
+        "event_type": event.event_type,
+        "actor": event.actor_username,
+        "subject": event.subject_username,
+        "timestamp": event.created_at.isoformat(),
+    }
 
 
 def handle_group_leave(state, client_socket, user, packet):
@@ -819,6 +906,15 @@ def handle_group_leave(state, client_socket, user, packet):
         conversation_repo.leave_conversation(conversation_uuid, user.id)
         conversation_repo.reserve_next_epoch(conversation_uuid)
 
+        # The membership event is written with the change itself (one transaction), from the
+        # authenticated connection -- not from anything in the packet.
+        group_event = GroupEventRepository(db).record(
+            conversation_uuid, GroupEvent.TYPE_MEMBER_LEFT,
+            subject_user_id=user.id, subject_username=user.username,
+            actor_user_id=user.id, actor_username=user.username,
+        )
+        event_payload = _serialize_group_event(group_event)
+
         conversation_repo.commit()
 
         remaining_ids = [m for m in member_ids if m != user.id]
@@ -830,6 +926,7 @@ def handle_group_leave(state, client_socket, user, packet):
         conversation_id=conversation_id,
         username=user.username,
         members=remaining_usernames,
+        event=event_payload,
     )
 
     all_former_id_strings = {str(m) for m in member_ids}
@@ -921,6 +1018,14 @@ def handle_group_remove_member(state, client_socket, user, packet):
         conversation_repo.leave_conversation(conversation_uuid, target.id)
         conversation_repo.reserve_next_epoch(conversation_uuid)
 
+        # Actor = the authenticated admin; subject = the member whose row changed.
+        group_event = GroupEventRepository(db).record(
+            conversation_uuid, GroupEvent.TYPE_MEMBER_REMOVED,
+            subject_user_id=target.id, subject_username=target.username,
+            actor_user_id=user.id, actor_username=user.username,
+        )
+        event_payload = _serialize_group_event(group_event)
+
         conversation_repo.commit()
 
         remaining_ids = [m for m in member_ids if m != target.id]
@@ -932,6 +1037,7 @@ def handle_group_remove_member(state, client_socket, user, packet):
         conversation_id=conversation_id,
         username=target_username,
         members=remaining_usernames,
+        event=event_payload,
     )
 
     all_former_id_strings = {str(m) for m in member_ids}
@@ -1004,17 +1110,76 @@ def _serialize_verification_notification(notification, requester_username, recip
     }
 
 
-def _serialize_group_add_notification(notification, requester_username, candidate_username, group_name=None):
+# A group invitation that nobody answered stops being valid after this long.
+_INVITATION_TTL = timedelta(days=14)
+
+
+def _invitation_is_stale(notification):
+    created = notification.created_at
+    if created is None:
+        return False
+    return datetime.now(timezone.utc).replace(tzinfo=None) - created > _INVITATION_TTL
+
+
+def _effective_status(notification):
+    """The stored status, except that a pending invitation past its time limit reads as expired."""
+
+    if (
+        notification.type == TYPE_GROUP_INVITATION
+        and notification.status == STATUS_PENDING
+        and _invitation_is_stale(notification)
+    ):
+        return STATUS_EXPIRED
+    return notification.status
+
+
+def _serialize_group_add_notification(
+    notification, requester_username, candidate_username, group_name=None, recipient_username=None,
+):
+    """One group_add_request or group_invitation. For an invitation the requester is the inviter and
+    the recipient (who decides) is the invitee -- named so either side's client can show who asked
+    whom without a second lookup."""
+
     return {
         "notification_id": str(notification.id),
-        "type": TYPE_GROUP_ADD_REQUEST,
-        "status": notification.status,
+        "type": notification.type,
+        "status": _effective_status(notification),
         "requester_username": requester_username,
         "candidate_username": candidate_username,
+        "recipient_username": recipient_username,
         "conversation_id": str(notification.conversation_id),
         "group_name": group_name,
         "created_at": notification.created_at.isoformat(),
     }
+
+
+def _invite_candidates(state, db, inviter, conversation_uuid, candidates, group_name):
+    """Create (or find) a pending group_invitation from ``inviter`` for each candidate and push it to
+    each who is online. Nobody is added to the group here: a person becomes a member only by approving
+    their own invitation (handle_inbox_response()). Returns the invited usernames."""
+
+    inbox_repo = InboxRepository(db)
+    created = [
+        (inbox_repo.create_group_invitation(inviter.id, candidate.id, conversation_uuid), candidate)
+        for candidate in candidates
+    ]
+    inbox_repo.commit()
+
+    payloads = [
+        (
+            candidate.id,
+            _serialize_group_add_notification(
+                notification, inviter.username, candidate.username, group_name,
+                recipient_username=candidate.username,
+            ),
+        )
+        for notification, candidate in created
+    ]
+
+    for candidate_id, payload in payloads:
+        _push_inbox_notification(state, candidate_id, payload)
+
+    return [candidate.username for _notification, candidate in created]
 
 
 def handle_verification_request(state, client_socket, user, packet):
@@ -1110,11 +1275,14 @@ def handle_inbox_list_request(state, client_socket, user, packet):
             else:
                 candidate = user_repo.get_by_id(notification.candidate_user_id)
                 candidate_username = candidate.username if candidate is not None else None
+                recipient = user_repo.get_by_id(notification.recipient_user_id)
+                recipient_username = recipient.username if recipient is not None else None
                 conversation = db.get(Conversation, notification.conversation_id)
                 group_name = conversation.name if conversation is not None else None
                 notifications.append(
                     _serialize_group_add_notification(
                         notification, requester_username, candidate_username, group_name,
+                        recipient_username=recipient_username,
                     )
                 )
     finally:
@@ -1148,16 +1316,32 @@ def handle_inbox_response(state, client_socket, user, packet):
     Inbox screen wiring) -- exactly as it would from the existing
     Verify Identity dialog.
 
-    group_add_request: approving here runs the real membership change
-    through _perform_group_add_members() -- the exact same path an
-    admin's own direct add uses -- rather than re-implementing it.
+    group_invitation (2026-10-22): the RECIPIENT is the person invited. Approving is what makes them a
+    member -- through _perform_group_add_members(), the exact same path an admin's own direct add
+    uses, acting as the inviter -- and only while the invitation is still valid: not older than
+    _INVITATION_TTL, and the inviter still an active member of the group (otherwise it is marked
+    expired and nothing is added). A block between the two, in either direction, is re-checked at the
+    moment of approval. Denying never adds anyone.
+
+    group_add_request: the admin's approval. With ``consent_invitations`` set by the responding
+    client, it creates an invitation for the candidate (who must then approve too) instead of adding
+    them at once; without it (older clients) it runs the real membership change through
+    _perform_group_add_members() as before.
     """
 
     notification_id = packet.get("notification_id")
     approve = bool(packet.get("approve"))
+    consent = bool(packet.get("consent_invitations"))
 
     if not notification_id:
         return
+
+    try:
+        notification_uuid = uuid.UUID(notification_id)
+    except (TypeError, ValueError, AttributeError):
+        return
+
+    invitation_payloads = []
 
     db = SessionLocal()
 
@@ -1165,7 +1349,7 @@ def handle_inbox_response(state, client_socket, user, packet):
         inbox_repo = InboxRepository(db)
         user_repo = UserRepository(db)
 
-        notification = inbox_repo.get_by_id(uuid.UUID(notification_id))
+        notification = inbox_repo.get_by_id(notification_uuid)
 
         if notification is None or notification.recipient_user_id != user.id:
 
@@ -1181,7 +1365,28 @@ def handle_inbox_response(state, client_socket, user, packet):
         conversation_id = notification.conversation_id
         candidate_id = notification.candidate_user_id
 
-        resolved = inbox_repo.resolve(uuid.UUID(notification_id), approve)
+        conversation_repo = ConversationRepository(db)
+        member_ids = set(conversation_repo.get_member_user_ids(conversation_id)) if conversation_id else set()
+        blocked_repo = BlockedUserRepository(db)
+
+        # An invitation that can no longer be accepted: too old, the inviter is no longer in the group,
+        # or either side has since blocked the other. Approving it adds nobody; it simply expires.
+        invitation_void = (
+            notification_type == TYPE_GROUP_INVITATION
+            and approve
+            and (
+                _invitation_is_stale(notification)
+                or requester_id not in member_ids
+                or blocked_repo.is_blocked(candidate_id, requester_id)
+                or blocked_repo.is_blocked(requester_id, candidate_id)
+            )
+        )
+
+        if invitation_void:
+            resolved = inbox_repo.mark_expired(notification_uuid)
+            approve = False
+        else:
+            resolved = inbox_repo.resolve(notification_uuid, approve)
 
         if resolved is None:
             # Already resolved (duplicate Approve/Deny) -- no-op.
@@ -1203,29 +1408,55 @@ def handle_inbox_response(state, client_socket, user, packet):
             group_name = conversation.name if conversation is not None else None
             notification_dict = _serialize_group_add_notification(
                 resolved, requester_username, candidate_username, group_name,
+                recipient_username=user.username,
             )
 
+        candidate_is_member = candidate_id in member_ids
+
         should_add_member = (
-            notification_type == TYPE_GROUP_ADD_REQUEST and approve
-            and candidate_id not in set(
-                ConversationRepository(db).get_member_user_ids(conversation_id)
-            )
+            approve and not candidate_is_member
+            and notification_type in (TYPE_GROUP_ADD_REQUEST, TYPE_GROUP_INVITATION)
+            and not (notification_type == TYPE_GROUP_ADD_REQUEST and consent)
         )
+
+        # The admin approved a non-admin's request: with consent, the candidate is now INVITED.
+        if (
+            notification_type == TYPE_GROUP_ADD_REQUEST and approve and consent and not candidate_is_member
+            and candidate is not None
+            and not blocked_repo.is_blocked(candidate_id, user.id)
+            and not blocked_repo.is_blocked(user.id, candidate_id)
+        ):
+            invitation = inbox_repo.create_group_invitation(user.id, candidate_id, conversation_id)
+            inbox_repo.commit()
+            invitation_payloads.append((
+                candidate_id,
+                _serialize_group_add_notification(
+                    invitation, user.username, candidate_username, group_name,
+                    recipient_username=candidate_username,
+                ),
+            ))
+
         conversation_id_str = str(conversation_id) if conversation_id else None
         candidate_id_value = candidate_id
+        # An approved invitation adds the member AS the inviter (who is the actor in the group's
+        # "added" event); an approved group_add_request adds as the admin who approved it.
+        acting_username = requester_username if notification_type == TYPE_GROUP_INVITATION else user.username
     finally:
         db.close()
 
     _push_inbox_notification(state, requester_id, notification_dict, is_response=True)
 
+    for invitee_id, payload in invitation_payloads:
+        _push_inbox_notification(state, invitee_id, payload)
+
     state.logger.info(
-        f"{user.username} {'approved' if approve else 'denied'} "
+        f"{user.username} {'approved' if approve else 'denied or let expire'} "
         f"{notification_type} {notification_id} from {requester_username}"
     )
 
     if should_add_member:
         _perform_group_add_members(
-            state, conversation_id_str, [candidate_id_value], user.username,
+            state, conversation_id_str, [candidate_id_value], acting_username,
         )
 
 
@@ -1480,6 +1711,16 @@ def handle_profile_picture_upload_request(state, client_socket, user, packet):
         ))
         return
 
+    # What is about to be stored and shown to everyone who looks this account up must be a
+    # supported image of a sane size -- checked from its header, never decoded here.
+    try:
+        inspect_image(image_bytes)
+    except InvalidImageError as error:
+        send_to_client(client_socket, create_profile_picture_upload_result_packet(
+            request_id=request_id, success=False, error=str(error),
+        ))
+        return
+
     old_reference = user.profile_picture
 
     db = SessionLocal()
@@ -1629,6 +1870,93 @@ def handle_bio_request(state, client_socket, user, packet):
 
     send_to_client(client_socket, create_bio_result_packet(
         request_id=request_id, found=True, bio=bio,
+    ))
+
+
+def handle_display_names_request(state, client_socket, user, packet):
+    """
+    Resolve account handles to the display names people chose. Only for
+    an authenticated connection, at most MAX_DISPLAY_NAME_LOOKUP handles
+    per request; unknown handles are simply absent from the answer.
+    Display names are what every contact already sees, so this exposes
+    nothing a phone-number lookup or a conversation does not.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    requested = packet.get("usernames")
+
+    if not isinstance(requested, list):
+        requested = []
+
+    handles = []
+
+    for handle in requested[:MAX_DISPLAY_NAME_LOOKUP]:
+        if isinstance(handle, str) and handle and handle not in handles:
+            handles.append(handle)
+
+    names = {}
+
+    db = SessionLocal()
+
+    try:
+        repo = UserRepository(db)
+
+        for handle in handles:
+            account = repo.get_by_username(handle)
+            if account is not None:
+                names[handle] = account.display_name or account.username
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_display_names_result_packet(request_id, names))
+
+
+def handle_change_display_name_request(state, client_socket, user, packet):
+    """
+    Change THIS account's display name (never anyone else's: the target
+    is always the authenticated connection's own account). Display names
+    need not be unique; they are plain text, 1-64 characters, with no
+    control characters.
+    """
+
+    request_id = packet.get("request_id")
+
+    if not request_id:
+        return
+
+    raw = packet.get("display_name")
+    display_name = raw.strip() if isinstance(raw, str) else ""
+
+    error = None
+
+    if not display_name:
+        error = "Please enter a name."
+    elif len(display_name) > MAX_DISPLAY_NAME_LENGTH:
+        error = f"Names can be at most {MAX_DISPLAY_NAME_LENGTH} characters."
+    elif any(ord(ch) < 32 or ord(ch) == 127 for ch in display_name):
+        error = "Names cannot contain control characters."
+
+    if error is not None:
+        send_to_client(client_socket, create_change_display_name_result_packet(
+            request_id, False, error=error,
+        ))
+        return
+
+    db = SessionLocal()
+
+    try:
+        account = UserRepository(db).get_by_id(user.id)
+        account.display_name = display_name
+        db.commit()
+    finally:
+        db.close()
+
+    send_to_client(client_socket, create_change_display_name_result_packet(
+        request_id, True, display_name=display_name,
     ))
 
 
@@ -2000,6 +2328,24 @@ def _perform_group_add_members(state, conversation_id, new_user_ids, acting_user
 
         conversation_repo.reserve_next_epoch(conversation_uuid)
 
+        # One "member_added" event per person actually added (a person already in the group is not
+        # in ``affected``, so a repeated add records nothing). The actor is whoever performed the
+        # add: the admin directly, or the admin who approved a member's request.
+        user_repo = UserRepository(db)
+        acting_user = user_repo.get_by_username(acting_username)
+        event_repo = GroupEventRepository(db)
+        event_payloads = []
+        for added_id in affected:
+            added_user = user_repo.get_by_id(added_id)
+            if added_user is None:
+                continue
+            event_payloads.append(_serialize_group_event(event_repo.record(
+                conversation_uuid, GroupEvent.TYPE_MEMBER_ADDED,
+                subject_user_id=added_user.id, subject_username=added_user.username,
+                actor_user_id=acting_user.id if acting_user is not None else None,
+                actor_username=acting_user.username if acting_user is not None else acting_username,
+            )))
+
         conversation_repo.commit()
 
         all_member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
@@ -2014,6 +2360,7 @@ def _perform_group_add_members(state, conversation_id, new_user_ids, acting_user
         conversation_id=str(conversation_uuid),
         name=name,
         members=all_usernames,
+        events=event_payloads,
     )
 
     all_member_id_strings = {str(member_id) for member_id in all_member_ids}
@@ -2123,6 +2470,16 @@ def handle_group_add_members(state, client_socket, user, packet):
 
             admin_user = db.get(User, admin_id)
             admin_username = admin_user.username if admin_user is not None else None
+        elif packet.get("consent_invitations"):
+            # The admin invites; each person becomes a member only by approving their own invitation.
+            group = db.get(Conversation, conversation_uuid)
+            invited = _invite_candidates(
+                state, db, user, conversation_uuid, candidates, group.name if group is not None else None,
+            )
+            state.logger.info(
+                f"{user.username} invited {invited} to group {conversation_id} -- awaiting their approval"
+            )
+            return
         else:
             new_user_ids = [candidate.id for candidate in candidates]
             notifications = None
@@ -3166,6 +3523,81 @@ def _ensure_group_keys_current_for_reconnecting_user(state, user):
         )
 
 
+def handle_group_key_request(state, client_socket, user, packet):
+    """
+    An active member asks, on demand, for the current key of ONE group -- the same thing
+    _ensure_group_keys_current_for_reconnecting_user() does for every group at login, triggered
+    when the member has just verified someone who may hold it.
+
+    Why it exists: a person added to a group before they and the key holder had verified each
+    other is skipped when the key is first distributed (a key is only ever wrapped for a VERIFIED
+    identity, and only accepted from a VERIFIED sender). Until now nothing asked again once
+    verification happened, so the member stayed in the group without being able to read it.
+
+    Authorization: the requester is the authenticated identity of this socket, never a packet
+    field; they must be an ACTIVE member of that group. The instruction sent is the existing
+    group_key_rotation_required for the CURRENT epoch with the requester as the only recipient,
+    so the holder redistributes a key it already has (or, exactly as for a reconnecting member,
+    does nothing). The group's admin is asked first because the admin always created the key; any
+    other connected member is only a fallback. Rejections are silent and server-log-only, like
+    every other group-authorization check here. No key material passes through this handler.
+    """
+
+    conversation_id = packet.get("conversation_id")
+
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except (TypeError, ValueError, AttributeError):
+        state.logger.warning(f"Rejected group_key_request from {user.username}: invalid conversation_id")
+        return
+
+    db = SessionLocal()
+
+    try:
+        conversation_repo = ConversationRepository(db)
+        active_group_ids = set(conversation_repo.get_active_group_conversation_ids(user.id))
+        if conversation_uuid not in active_group_ids:
+            state.logger.warning(
+                f"Rejected group_key_request from {user.username}: not an active member of {conversation_id}"
+            )
+            return
+        current_epoch, _confirmed_epoch = conversation_repo.get_epoch_state(conversation_uuid)
+        member_ids = conversation_repo.get_member_user_ids(conversation_uuid)
+        admin_user_id = conversation_repo.get_admin_user_id(conversation_uuid)
+    finally:
+        db.close()
+
+    if current_epoch is None:
+        return
+
+    # Ask the admin, who created the key and so holds it. Any other connected member could be one
+    # who does NOT hold it (for example another late joiner), and the rotation instruction makes a
+    # member without the epoch create a new key -- which would split the group. So when the
+    # requester is not the admin and the admin is offline, nothing is sent; the request is simply
+    # made again at the next verification or reconnect. Only when the requester IS the admin
+    # (who lost the key) is any connected member asked, exactly as at a reconnect.
+    if admin_user_id is not None and admin_user_id != user.id:
+        selected = _select_connected_active_member(state, [admin_user_id], exclude_user_id=user.id)
+    else:
+        selected = _select_connected_active_member(state, member_ids, exclude_user_id=user.id)
+    if selected is None:
+        state.logger.info(f"No suitable connected member to send {conversation_id} to {user.username}")
+        return
+
+    sock, selected_username = selected
+
+    if send_to_client(
+        sock,
+        create_group_key_rotation_required_packet(
+            conversation_id=str(conversation_uuid), epoch=current_epoch, members=[user.username],
+        ),
+    ):
+        state.logger.info(
+            f"Requested current-epoch key for {conversation_id} from {selected_username} for {user.username} "
+            f"(member-initiated)"
+        )
+
+
 def _recover_direct_keys_for_reconnecting_user(state, client_socket, user):
     """
     Reconnect recovery for DIRECT conversations, step 1 of 2 (BUG 4
@@ -3541,6 +3973,14 @@ def handle_login_request(state, client_socket, packet):
 
     token_pair = result.token_pair
 
+    errors = result.errors
+    if not result.success and errors and set(errors) <= {"identifier", "password"}:
+        # The service records WHY a credential check failed ("User not found." versus "Password
+        # verification failed.") for its own audit log. That distinction must never reach the
+        # caller: it would tell anyone whether a phone number has an account. Both cases get the
+        # same, generic reply.
+        errors = {"credentials": result.message}
+
     response = create_login_result_packet(
         request_id=request_id,
         success=result.success,
@@ -3554,7 +3994,7 @@ def handle_login_request(state, client_socket, packet):
         refresh_token=token_pair.refresh_token if token_pair else None,
         expires_in=token_pair.expires_in if token_pair else None,
         token_type=token_pair.token_type if token_pair else None,
-        errors=result.errors,
+        errors=errors,
     )
 
     if not send_to_client(client_socket, response):
@@ -4058,6 +4498,7 @@ def handle_message_history_request(state, client_socket, user, packet):
         conversation_uuid = None
 
     messages_payload = None
+    events_payload = None
     error = None
 
     if conversation_uuid is None:
@@ -4085,6 +4526,11 @@ def handle_message_history_request(state, client_socket, user, packet):
 
                 if is_group:
                     messages = message_repo.get_group_conversation(conversation_uuid)
+                    # Membership events, from when this member joined (see GroupEventRepository).
+                    events_payload = [
+                        _serialize_group_event(event)
+                        for event in GroupEventRepository(db).list_visible_to(conversation_uuid, user.id)
+                    ]
                 else:
                     other_ids = [
                         member_id for member_id in member_ids if member_id != user.id
@@ -4246,6 +4692,7 @@ def handle_message_history_request(state, client_socket, user, packet):
         request_id=request_id,
         messages=messages_payload,
         error=error,
+        events=events_payload,
     )
 
     if not send_to_client(client_socket, response):
@@ -4780,6 +5227,7 @@ def handle_client(state, client_socket, client_address):
                     # fan-out below -- not a new routing mechanism, the
                     # SAME one group messaging already shipped with).
                     message = None
+                    repeated_send = False
 
                     try:
                         message = persist_message(
@@ -4790,7 +5238,13 @@ def handle_client(state, client_socket, client_address):
                             conversation_id=direct_conversation_id,
                         )
 
-                        _record_direct_recipient(message, receiver_user.id)
+                        # A repeated send of a message already stored (same client_message_id) was
+                        # recorded and relayed by the original; doing either again would violate the
+                        # recipient row's unique key and show the recipient the message twice.
+                        repeated_send = bool(getattr(message, "was_duplicate_send", False))
+
+                        if not repeated_send:
+                            _record_direct_recipient(message, receiver_user.id)
 
                     except Exception as error:  # noqa: BLE001
 
@@ -4824,6 +5278,14 @@ def handle_client(state, client_socket, client_address):
                             create_delivery_failure_packet(receiver)
                         )
 
+                    elif repeated_send:
+
+                        # Already stored, recorded and relayed by the original send; relaying it again
+                        # would show the recipient the same message twice.
+                        state.logger.info(
+                            f"Ignored a repeated send: {username} -> {receiver} (same client_message_id)"
+                        )
+
                     else:
 
                         # Phase 18.5 -- Step 6 (History Deduplication):
@@ -4840,7 +5302,7 @@ def handle_client(state, client_socket, client_address):
                         # it, on either side), so adding it here changes
                         # nothing about what was already signed or how
                         # it verifies.
-                        packet["message_id"] = str(message.id)
+                        _stamp_relayed_references(packet, message)
 
                         delivered_to_any_device = False
 
@@ -5098,6 +5560,13 @@ def handle_client(state, client_socket, client_address):
                 handle_direct_key_recovery_request(state, client_socket, user, packet)
 
             # -----------------------------
+            # Member-initiated group key request (after a late verification)
+            # -----------------------------
+            elif packet.get("type") == "group_key_request":
+
+                handle_group_key_request(state, client_socket, user, packet)
+
+            # -----------------------------
             # Group Leave Packet (Phase 7)
             # -----------------------------
             elif packet.get("type") == "group_leave":
@@ -5178,6 +5647,14 @@ def handle_client(state, client_socket, client_address):
             elif packet.get("type") == "bio_request":
 
                 handle_bio_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "display_names_request":
+
+                handle_display_names_request(state, client_socket, user, packet)
+
+            elif packet.get("type") == "change_display_name_request":
+
+                handle_change_display_name_request(state, client_socket, user, packet)
 
             elif packet.get("type") == "last_seen_request":
 

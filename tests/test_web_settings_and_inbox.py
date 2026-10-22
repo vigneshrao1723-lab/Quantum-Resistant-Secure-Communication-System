@@ -1,6 +1,6 @@
 """
 Phase 19.18 -- L-5 closure: real-browser proof that Web's Change
-Username, Change Password, Inbox (verification approve/deny), and
+Display Name (formerly Change Username), Change Password, Inbox (verification approve/deny), and
 Group Info remove-member all actually work end-to-end through the
 real UI -- not just that the underlying WebClientSession methods
 exist. Mirrors tests/test_web_browser_e2e.py's own fixtures and
@@ -15,13 +15,14 @@ Run with:
 from auth.authentication_service import AuthenticationService
 from auth.schemas import LoginRequest
 from database.connection import SessionLocal
+from database.repositories.user_repository import UserRepository
 from tests.test_web_browser_e2e import (  # noqa: F401 -- fixtures reused, not re-implemented
     running_server, gateway_url, browser_page, desktop_app, static_url,
     _connect_browser, _register, _delete, _wait_for, PASSWORD,
 )
 
 
-def test_web_change_username_and_password_real_ui(gateway_url, browser_page):
+def test_web_change_display_name_and_password_real_ui(gateway_url, browser_page):
     payload = _register("wsettings_")
     try:
         _connect_browser(browser_page, gateway_url, payload)
@@ -29,13 +30,19 @@ def test_web_change_username_and_password_real_ui(gateway_url, browser_page):
 
         page.click("#settingsToggleBtn")
 
-        # --- Change Username, through the real form ---
+        # --- Change the display name, through the real form ---
+        # The name people see is not unique, so it is the display name that changes; the
+        # account's handle (what every packet, key and verification is addressed to) does not.
         page.click("#changeUsernameToggleBtn")
-        new_username = f"renamed_{payload['username'][-10:]}"
-        page.fill("#newUsernameInput", new_username)
+        page.fill("#newUsernameInput", "Renamed Person")
         page.click("#changeUsernameSubmitBtn")
-        assert _wait_for(lambda: "Username changed." in page.inner_text("#changeUsernameHint"))
-        assert page.evaluate("window.__session.username") == new_username
+        assert _wait_for(lambda: "Name updated." in page.inner_text("#changeUsernameHint"))
+        assert page.evaluate("window.__session.username") == payload["username"]
+        db = SessionLocal()
+        try:
+            assert UserRepository(db).get_by_username(payload["username"]).display_name == "Renamed Person"
+        finally:
+            db.close()
 
         # --- Change Password, through the real form ---
         new_password = "N3w!StrongerPassw0rd"
@@ -88,6 +95,7 @@ def test_web_inbox_approve_verification_request_real_ui(running_server, gateway_
         # required before Bob's own confirmPeerVerified() can succeed.
         assert _wait_for(lambda: alice.key_manager.get_public_key(bob_username) is not None)
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         assert _wait_for(lambda: alice.username in page.inner_text("#fingerprintDisplay"))
 
         # Alice requests verification from Bob via the real production
@@ -134,6 +142,16 @@ def test_web_group_info_remove_member_real_ui(running_server, gateway_url, brows
             return "remove-member-group" in groups
 
         assert _wait_for(_group_exists)
+
+        # The member is INVITED: they are in the group only once they approve it in their own Inbox.
+        def _invitation():
+            return next(
+                (e for e in member.load_inbox()
+                 if e.get("type") == "group_invitation" and e.get("status") == "pending"), None,
+            )
+
+        assert _wait_for(lambda: _invitation() is not None)
+        member.respond_to_inbox(_invitation(), True)
 
         page.click('.row-card:has-text("remove-member-group")')
         page.click("#groupInfoBtn")

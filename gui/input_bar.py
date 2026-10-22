@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from gui.icons import toolbar_icon
 from gui.media_recorder_dialog import MediaRecorderDialog
-from gui.styles import COLOR_TEXT_MUTED
+from gui.styles import COLOR_ON_ACCENT, COLOR_TEXT_MUTED
 
 
 class ComposerTextEdit(QPlainTextEdit):
@@ -189,7 +189,7 @@ class InputBar(QFrame):
         self.send_button = QPushButton()
         self.send_button.setObjectName("SendButton")
         self.send_button.setIcon(
-            toolbar_icon("send", color="#FFFFFF", active_color="#FFFFFF", disabled_color=COLOR_TEXT_MUTED)
+            toolbar_icon("send", color=COLOR_ON_ACCENT, active_color=COLOR_ON_ACCENT, disabled_color=COLOR_TEXT_MUTED)
         )
         self.send_button.setIconSize(QSize(20, 20))
         self.send_button.setFixedSize(40, 40)

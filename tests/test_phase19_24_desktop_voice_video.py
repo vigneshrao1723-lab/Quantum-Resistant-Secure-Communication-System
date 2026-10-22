@@ -79,7 +79,10 @@ def test_voice_bubble_renders_a_play_button_not_a_plain_file_row(_keep_alive):
 
     assert bubble.payload_type == PayloadType.VOICE
     assert hasattr(bubble, "_voice_play_button")
-    assert bubble._voice_play_button.text() == "▶"
+    # An icon button whose state is in its accessible name (the old "▶" text glyph rendered as
+    # an empty box in a 40 px button).
+    assert bubble._voice_play_button.accessibleName() == "Play voice message"
+    assert bubble._voice_play_button.isEnabled()
 
 
 def test_voice_bubble_still_offers_lifecycle_features(_keep_alive):
@@ -118,7 +121,9 @@ def test_voice_bubble_play_button_toggles_without_crashing_on_fake_bytes(_keep_a
     for _ in range(4):
         bubble._toggle_voice_playback()
         _app.processEvents()
-        assert bubble._voice_play_button.text() in ("▶", "⏸")
+        assert bubble._voice_play_button.accessibleName() in (
+            "Play voice message", "Pause voice message", "Voice message cannot be played",
+        )
 
 
 def test_voice_bubble_duration_label_present_when_metadata_supplies_it(_keep_alive):

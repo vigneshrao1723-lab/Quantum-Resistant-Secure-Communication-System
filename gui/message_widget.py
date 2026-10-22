@@ -10,7 +10,7 @@ import mimetypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QBuffer, QByteArray, QEvent, QIODevice, QObject, QSize, QUrl
+from PySide6.QtCore import Qt, QBuffer, QByteArray, QEvent, QIODevice, QObject, QSize, QTimer, QUrl
 from PySide6.QtGui import QImageReader, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QAbstractItemView,
     QDialog,
+    QFrame,
+    QToolButton,
     QWidget,
     QLabel,
     QFileDialog,
@@ -33,6 +35,15 @@ from PySide6.QtWidgets import (
 
 from domain.payload_type import PayloadType
 
+from gui.icons import toolbar_icon
+from gui.message_parts import (
+    MEDIA_REPLY_LABELS,
+    MediaPlayerCard,
+    ReactionStrip,
+    ReplyQuote,
+    format_clock,
+    media_action_button,
+)
 from gui.styles import (
     COLOR_ACCENT,
     COLOR_BUBBLE_FAILED,
@@ -42,10 +53,13 @@ from gui.styles import (
     COLOR_BUBBLE_RECEIVED_META,
     COLOR_BUBBLE_RECEIVED_TEXT,
     COLOR_BUBBLE_SYSTEM,
+    COLOR_QUOTE_BG,
+    COLOR_QUOTE_BORDER,
     COLOR_READ_RECEIPT,
     COLOR_SEND_FAILED,
     COLOR_TEXT_MUTED,
     LIST_ITEM_VERTICAL_MARGIN,
+    is_dark_theme,
 )
 
 
@@ -188,7 +202,7 @@ class _HoverReveal(QObject):
         return False
 
 
-def _message_footer(bubble, time_label):
+def _message_footer(bubble, time_label, extra_widgets=()):
     footer = QWidget()
     # Without this the footer falls through to the application-wide
     # ``QWidget { background-color }`` rule and paints an opaque band over
@@ -202,9 +216,128 @@ def _message_footer(bubble, time_label):
     layout.setSpacing(6)
     bubble.actions_button = _create_message_actions_button(bubble)
     layout.addWidget(bubble.actions_button)
+    for widget in extra_widgets:
+        layout.addWidget(widget)
     layout.addStretch()
     layout.addWidget(time_label)
     return footer
+
+
+def _refresh_row(bubble):
+    """Re-measure a bubble's list row after its content changed (a reply quote, reactions or a
+    pin marker appeared, an edit or a deletion). A row keeps the height it was measured at when
+    added, so without this the new content was clipped."""
+
+    item = getattr(bubble, "_list_item", None)
+    if item is not None:
+        item.setSizeHint(_row_size_hint(bubble))
+
+
+def _quote_colors(kind, read_status):
+    if kind == "sent" and read_status != STATUS_FAILED:
+        return "#FFFFFF", "rgba(255, 255, 255, 0.92)", "rgba(255, 255, 255, 0.16)"
+    return COLOR_ACCENT, COLOR_BUBBLE_RECEIVED_META, "rgba(118, 92, 242, 0.08)"
+
+
+def _pill_colors(kind, read_status):
+    if kind == "sent" and read_status != STATUS_FAILED:
+        return "#FFFFFF", "rgba(255, 255, 255, 0.18)", "rgba(255, 255, 255, 0.35)"
+    return COLOR_BUBBLE_RECEIVED_TEXT, COLOR_QUOTE_BG, COLOR_QUOTE_BORDER
+
+
+class _BubbleExtras:
+    """
+    The pieces every message bubble shares, whatever it carries: the "Pinned" marker, the quoted
+    message a reply points at, and the reaction pills. Text, image and file/voice/video bubbles
+    all render them the same way (previously only text bubbles did).
+    """
+
+    def _init_extras(self):
+        self.on_reply_activated = None
+        self._name_for = None
+        self._own_username = None
+
+    def _build_top_extras(self, bubble_layout):
+        self._pinned_label = QLabel("")
+        self._pinned_label.setTextFormat(Qt.PlainText)
+        self._pinned_label.setVisible(False)
+        bubble_layout.addWidget(self._pinned_label)
+
+        self._reply_quote = ReplyQuote()
+        self._reply_quote.activated.connect(self._on_reply_quote_activated)
+        bubble_layout.addWidget(self._reply_quote)
+
+    def _build_reactions(self, bubble_layout):
+        self._reactions_strip = ReactionStrip()
+        bubble_layout.addWidget(self._reactions_strip)
+
+    def _style_extras(self):
+        read_status = getattr(self, "_read_status", None)
+        self._pinned_label.setStyleSheet(
+            f"color: {self._content_meta_color}; font-size: 8.5pt; font-weight: 600; background: transparent;"
+        )
+        self._reply_quote.set_colors(*_quote_colors(self.kind, read_status))
+        self._reactions_strip.set_colors(*_pill_colors(self.kind, read_status))
+
+    def _on_reply_quote_activated(self):
+        if self.on_reply_activated is not None:
+            self.on_reply_activated(self)
+
+    def set_reply_preview(self, preview_text, author=None, clickable=False, unavailable=False):
+        """Show the quoted message this one replies to: who wrote it and a short excerpt, or a
+        media label ("Voice message", "Photo"), already resolved by the caller from the
+        original's stable message id. Never fetches or decrypts anything itself."""
+
+        if self.kind == "system" or not preview_text or self.is_deleted:
+            return
+
+        self.reply_preview_text = preview_text
+        self._reply_quote.set_quote(author, preview_text, clickable=clickable, unavailable=unavailable)
+        _refresh_row(self)
+
+    def update_reactions(self, reactions):
+        """
+        ``reactions``: already-decrypted, already-signature-verified {"user", "reaction"} dicts
+        (ClientSession verifies each before this is called -- this widget never touches
+        ciphertext). One pill per emoji with its count, like the Website.
+        """
+
+        if self.kind == "system":
+            return
+
+        self.reactions = list(reactions or [])
+        self._reactions_strip.set_reactions(self.reactions, self._own_username, self._name_for)
+        _refresh_row(self)
+
+    def set_pinned(self, pinned, pinned_by=None):
+        """Show/hide this bubble's "Pinned by X" marker (Phase 19.24)."""
+
+        if self.kind == "system":
+            return
+
+        self.is_pinned = bool(pinned)
+        self.pinned_by = pinned_by if self.is_pinned else None
+
+        if self.is_pinned:
+            if pinned_by and pinned_by == self._own_username:
+                who = "you"
+            elif pinned_by:
+                who = (self._name_for or str)(pinned_by) or pinned_by
+            else:
+                who = None
+            self._pinned_label.setText(f"\U0001F4CC Pinned by {who}" if who else "\U0001F4CC Pinned")
+            self._pinned_label.setVisible(True)
+        else:
+            self._pinned_label.setText("")
+            self._pinned_label.setVisible(False)
+
+        _refresh_row(self)
+
+    def _clear_extras_for_deletion(self):
+        self._reply_quote.clear()
+        self.reactions = []
+        self._reactions_strip.set_reactions([])
+        self.set_pinned(False)
 
 
 def _row_size_hint(widget):
@@ -558,7 +691,48 @@ class DateSeparatorBubble(QWidget):
         outer.addStretch()
 
 
-class MessageBubble(QWidget):
+def _accessible_summary(bubble):
+    """
+    Plain-text description of a message row for assistive technology.
+
+    A list row is a ``setItemWidget()`` widget, which accessibility clients cannot
+    see into, so without this a screen reader (or UI automation) finds an empty row.
+    It repeats exactly what the bubble already shows -- no new information.
+    """
+
+    kind = getattr(bubble, "kind", "")
+    if kind == "system":
+        return getattr(bubble, "message_text", "") or ""
+    who = "You" if kind == "sent" else (getattr(bubble, "_accessible_sender", None) or "")
+    if getattr(bubble, "is_deleted", False):
+        content = "Message deleted"
+    elif isinstance(bubble, MessageBubble):
+        content = bubble.message_text or ""
+        if getattr(bubble, "edit_version", 0):
+            content += " (edited)"
+    elif isinstance(bubble, ImageMessageBubble):
+        content = "Image " + (getattr(bubble, "_filename", "") or "")
+    elif getattr(bubble, "payload_type", None) == PayloadType.VOICE:
+        content = "Voice message"
+    elif getattr(bubble, "payload_type", None) == PayloadType.VIDEO:
+        content = "Video message"
+    else:
+        content = "File " + (getattr(bubble, "_filename", "") or "")
+    if getattr(bubble, "reply_preview_text", None) and not getattr(bubble, "is_deleted", False):
+        content = f"Reply to: {bubble.reply_preview_text}. {content}"
+    when = getattr(bubble, "_timestamp_text", "") or ""
+    return ", ".join(part for part in (who, content.strip(), when) if part)
+
+
+def _sync_item_accessible_text(bubble):
+    """Refresh the list row's accessible text after the bubble changed (edit / delete)."""
+
+    item = getattr(bubble, "_list_item", None)
+    if item is not None:
+        item.setData(Qt.AccessibleTextRole, _accessible_summary(bubble))
+
+
+class MessageBubble(_BubbleExtras, QWidget):
     """
     A single chat bubble.
 
@@ -578,6 +752,8 @@ class MessageBubble(QWidget):
         super().__init__()
 
         self.kind = kind
+        self._accessible_sender = sender
+        self._list_item = None
         self._content_text_color, self._content_meta_color = _bubble_content_colors(kind, read_status)
 
         # Retained so a failed send can be retried without the
@@ -614,6 +790,7 @@ class MessageBubble(QWidget):
         # ClientSession.edit_message()'s own docstring).
         self.supports_edit = True
         self.on_context_action = on_context_action
+        self._init_extras()
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(4, 2, 4, 2)
@@ -668,40 +845,8 @@ class MessageBubble(QWidget):
                 )
                 bubble_layout.addWidget(name_label)
 
-            # Phase 19.24 -- Pinned Messages: a small "Pinned by X"
-            # marker, hidden by default (zero-height-until-relevant,
-            # same pattern as the reply-preview/reactions labels below)
-            # -- shown only once set_pinned(True, ...) is called (gui/
-            # chat_window.py, from history load or a live message_
-            # pinned notification).
-            self._pinned_label = QLabel("")
-            self._pinned_label.setTextFormat(Qt.PlainText)
-            self._pinned_label.setStyleSheet(
-                f"color: {self._content_meta_color}; font-size: 8.5pt; "
-                "font-weight: 600; background: transparent;"
-            )
-            self._pinned_label.setVisible(False)
-            bubble_layout.addWidget(self._pinned_label)
-
-            # Phase 19.24 (continued) -- Reply preview: a small quoted
-            # snippet above the message text, shown only once a caller
-            # supplies one via set_reply_preview() (gui/chat_window.py
-            # resolves the referenced message's own already-decrypted
-            # text from the currently-loaded transcript -- never a
-            # second network round trip, and never shown at all if the
-            # original is not currently loaded/visible). Hidden by
-            # default -- most messages are not replies.
-            self._reply_preview_label = QLabel("")
-            self._reply_preview_label.setTextFormat(Qt.PlainText)
-            self._reply_preview_label.setWordWrap(True)
-            self._reply_preview_label.setStyleSheet(
-                f"color: {self._content_meta_color}; font-size: 9pt; "
-                "font-style: italic; background: transparent; "
-                f"border-left: 2px solid {self._content_meta_color}; "
-                "padding-left: 6px;"
-            )
-            self._reply_preview_label.setVisible(False)
-            bubble_layout.addWidget(self._reply_preview_label)
+            # Pinned marker and reply quote (hidden until set) -- shared with every bubble kind.
+            self._build_top_extras(bubble_layout)
 
             text_label = QLabel(text)
             # L-1 -- the critical one. This label renders decrypted
@@ -725,18 +870,8 @@ class MessageBubble(QWidget):
             bubble_layout.addWidget(text_label)
             self._text_label = text_label
 
-            # Phase 19.24 (continued) -- Reactions: a small row of
-            # "emoji count" badges below the message text, updated by
-            # update_reactions(). Hidden (zero height, not just empty
-            # text) until there is at least one to show, so an
-            # ordinary un-reacted message's layout is unaffected.
-            self._reactions_label = QLabel("")
-            self._reactions_label.setTextFormat(Qt.PlainText)
-            self._reactions_label.setStyleSheet(
-                f"color: {self._content_text_color}; font-size: 10pt; background: transparent;"
-            )
-            self._reactions_label.setVisible(False)
-            bubble_layout.addWidget(self._reactions_label)
+            # Reaction pills below the text (hidden until there is one).
+            self._build_reactions(bubble_layout)
 
             self._timestamp_text = timestamp or datetime.now().strftime("%H:%M")
 
@@ -848,18 +983,7 @@ class MessageBubble(QWidget):
         if self.is_deleted:
             text_style += " font-style: italic;"
         self._text_label.setStyleSheet(text_style)
-        self._pinned_label.setStyleSheet(
-            f"color: {self._content_meta_color}; font-size: 8.5pt; "
-            "font-weight: 600; background: transparent;"
-        )
-        self._reply_preview_label.setStyleSheet(
-            f"color: {self._content_meta_color}; font-size: 9pt; "
-            "font-style: italic; background: transparent; "
-            f"border-left: 2px solid {self._content_meta_color}; padding-left: 6px;"
-        )
-        self._reactions_label.setStyleSheet(
-            f"color: {self._content_text_color}; font-size: 10pt; background: transparent;"
-        )
+        self._style_extras()
         self.time_label.setStyleSheet(
             f"color: {self._content_meta_color}; font-size: 8pt; background: transparent;"
         )
@@ -943,76 +1067,6 @@ class MessageBubble(QWidget):
     def contextMenuEvent(self, event):
         _handle_message_context_menu_event(self, event, self)
 
-    def set_reply_preview(self, preview_text):
-        """Show a quoted snippet of the message this one replies to.
-        ``preview_text`` is already-decrypted plaintext the caller
-        resolved locally (gui/chat_window.py) -- this widget never
-        fetches or decrypts anything itself. A long original is
-        truncated for the preview only; the full text was never
-        altered."""
-
-        if self.kind == "system" or not preview_text:
-            return
-
-        self.reply_preview_text = preview_text
-
-        shown = preview_text if len(preview_text) <= 80 else preview_text[:77] + "…"
-
-        self._reply_preview_label.setText(shown)
-        self._reply_preview_label.setVisible(True)
-
-    def update_reactions(self, reactions):
-        """
-        ``reactions``: a list of already-decrypted, already-signature-
-        verified {"user": str, "reaction": str} dicts (gui/chat_window.py
-        resolves and verifies each one via ClientSession before this is
-        ever called -- this widget never touches ciphertext). Renders
-        as a compact "emoji×count" row; hovering isn't required to see
-        or use it (Phase 19.23's own "no hover-only essential controls"
-        rule applies here too).
-        """
-
-        if self.kind == "system":
-            return
-
-        self.reactions = list(reactions or [])
-
-        if not self.reactions:
-            self._reactions_label.setText("")
-            self._reactions_label.setVisible(False)
-            return
-
-        counts = {}
-        for entry in self.reactions:
-            emoji = entry.get("reaction", "")
-            if emoji:
-                counts[emoji] = counts.get(emoji, 0) + 1
-
-        self._reactions_label.setText(
-            "  ".join(f"{emoji}×{count}" for emoji, count in counts.items())
-        )
-        self._reactions_label.setVisible(True)
-
-    def set_pinned(self, pinned, pinned_by=None):
-        """Show/hide this bubble's "📌 Pinned by X" marker (Phase
-        19.24). A no-op for a system bubble, same guard as update_
-        reactions()."""
-
-        if self.kind == "system":
-            return
-
-        self.is_pinned = bool(pinned)
-        self.pinned_by = pinned_by if self.is_pinned else None
-
-        if self.is_pinned:
-            self._pinned_label.setText(
-                f"\U0001F4CC Pinned by {pinned_by}" if pinned_by else "\U0001F4CC Pinned"
-            )
-            self._pinned_label.setVisible(True)
-        else:
-            self._pinned_label.setText("")
-            self._pinned_label.setVisible(False)
-
     def apply_edit(self, new_text, edit_version):
         """
         Update this bubble's own text in place after a successful edit
@@ -1029,6 +1083,8 @@ class MessageBubble(QWidget):
         self.message_text = new_text
         self.edit_version = edit_version
         self._text_label.setText(f"{new_text} (edited)")
+        self._sync_accessible_text()
+        _refresh_row(self)
 
     def mark_deleted(self):
         """
@@ -1049,9 +1105,12 @@ class MessageBubble(QWidget):
         self.message_text = ""
         self._text_label.setText("Message deleted")
         self._refresh_content_colors()
-        self._reply_preview_label.setVisible(False)
-        self.update_reactions([])
-        self.set_pinned(False)
+        self._clear_extras_for_deletion()
+        self._sync_accessible_text()
+        _refresh_row(self)
+
+    def _sync_accessible_text(self):
+        _sync_item_accessible_text(self)
 
 
 def _format_file_size(size_bytes):
@@ -1149,7 +1208,7 @@ def _decode_image(image_bytes):
         buffer.close()
 
 
-class ImageMessageBubble(QWidget):
+class ImageMessageBubble(_BubbleExtras, QWidget):
     """
     A single image chat bubble -- an inline thumbnail rendered
     directly from already-decrypted bytes (Phase 8 -- File & Image
@@ -1184,6 +1243,8 @@ class ImageMessageBubble(QWidget):
         super().__init__()
 
         self.kind = kind
+        self._accessible_sender = sender
+        self._list_item = None
         self._content_text_color, self._content_meta_color = _bubble_content_colors(kind, read_status)
 
         # BUG 5 -- the decrypted bytes are RETAINED, not discarded once
@@ -1210,6 +1271,7 @@ class ImageMessageBubble(QWidget):
         self.pinned_by = None
         self.supports_edit = False
         self.on_context_action = on_context_action
+        self._init_extras()
 
         self._filename = _safe_filename(
             self.content_metadata.get("filename"), "image.png"
@@ -1240,6 +1302,8 @@ class ImageMessageBubble(QWidget):
                 f"font-size: 9pt; font-weight: 600; color: {COLOR_ACCENT};"
             )
             bubble_layout.addWidget(name_label)
+
+        self._build_top_extras(bubble_layout)
 
         self.image_label = QLabel()
         # L-1: normally shows a pixmap, but falls back to a text
@@ -1289,31 +1353,19 @@ class ImageMessageBubble(QWidget):
 
         bubble_layout.addWidget(self.image_label)
 
-        # Actions, offered only when there is really an image to act
-        # on. An attachment whose key this client never received
-        # renders the placeholder above and must not offer to open or
-        # save bytes it does not have.
+        self._build_reactions(bubble_layout)
+
+        # View / Save share the footer row with the time, as on the Website -- offered only when
+        # there is really an image to act on (an attachment whose key this client never received
+        # renders the placeholder above and must not offer to open or save bytes it does not have).
+        actions = []
         if self._full_pixmap is not None:
-
-            actions = QHBoxLayout()
-            actions.setContentsMargins(0, 0, 0, 0)
-            actions.setSpacing(6)
-
-            view_button = QPushButton("View")
-            view_button.setObjectName("SecondaryButton")
-            view_button.setCursor(Qt.PointingHandCursor)
+            view_button = media_action_button("View", "expand", self._content_text_color, "View image")
             view_button.clicked.connect(self.open_viewer)
-            actions.addWidget(view_button)
-
-            save_button = QPushButton("Save As...")
-            save_button.setObjectName("SecondaryButton")
-            save_button.setCursor(Qt.PointingHandCursor)
+            save_button = media_action_button("Save", "download", self._content_text_color, "Save image")
             save_button.clicked.connect(self._handle_save_as)
-            actions.addWidget(save_button)
-
-            actions.addStretch()
-
-            bubble_layout.addLayout(actions)
+            actions = [view_button, save_button]
+        self._action_buttons = actions
 
         self._timestamp_text = timestamp or datetime.now().strftime("%H:%M")
 
@@ -1338,12 +1390,13 @@ class ImageMessageBubble(QWidget):
         self.time_label.setAlignment(
             Qt.AlignRight if kind == "sent" else Qt.AlignLeft
         )
-        bubble_layout.addWidget(_message_footer(self, self.time_label))
+        bubble_layout.addWidget(_message_footer(self, self.time_label, actions))
 
         self._bubble = bubble
         self._read_status = read_status
 
         _apply_bubble_style(bubble, kind, read_status)
+        self._style_extras()
 
         if kind == "sent":
             outer.addStretch()
@@ -1513,21 +1566,6 @@ class ImageMessageBubble(QWidget):
 
     def contextMenuEvent(self, event):
         _handle_message_context_menu_event(self, event, self)
-    def update_reactions(self, reactions):
-        """No visible reaction row on an image bubble in this pass --
-        tracked (self.reactions) so the context menu/data model stay
-        consistent even though there is nowhere to render it yet."""
-
-        self.reactions = list(reactions or [])
-
-    def set_pinned(self, pinned, pinned_by=None):
-        """No visible pin marker on an image bubble in this pass --
-        tracked (self.is_pinned/pinned_by) so the context menu/data
-        model stay consistent, mirroring update_reactions()'s own
-        identical "tracked, not yet rendered" precedent above."""
-
-        self.is_pinned = bool(pinned)
-        self.pinned_by = pinned_by if self.is_pinned else None
 
     def mark_deleted(self):
         """Replace the image with a plain deleted-message notice --
@@ -1546,15 +1584,20 @@ class ImageMessageBubble(QWidget):
         )
         self.image_label.setToolTip("")
         self.image_label.setCursor(Qt.ArrowCursor)
-        self.set_pinned(False)
+        for button in getattr(self, "_action_buttons", []):
+            button.setVisible(False)
+        self._clear_extras_for_deletion()
+        _sync_item_accessible_text(self)
+        _refresh_row(self)
 
 
 
-class FileMessageBubble(QWidget):
+class FileMessageBubble(_BubbleExtras, QWidget):
     """
     A single file chat bubble -- filename, human-readable size, and a
-    "Save As..." button that writes the already-decrypted bytes held
-    in memory (Phase 8 -- File & Image Transfer). No plaintext is ever
+    "Save" button that writes the already-decrypted bytes held in
+    memory (Phase 8 -- File & Image Transfer). Voice and video messages
+    are this same bubble with an inline player (MediaPlayerCard). No plaintext is ever
     written to disk until the user explicitly chooses to save it.
 
     A sibling class to MessageBubble, for the same reason
@@ -1575,6 +1618,8 @@ class FileMessageBubble(QWidget):
         super().__init__()
 
         self.kind = kind
+        self._accessible_sender = sender
+        self._list_item = None
         self._content_text_color, self._content_meta_color = _bubble_content_colors(kind, read_status)
         self._file_bytes = file_bytes
         # Phase 19.24 -- Voice/Video Messages: which specialised row
@@ -1592,8 +1637,7 @@ class FileMessageBubble(QWidget):
         self._filename = _safe_filename(
             (content_metadata or {}).get("filename"), "file"
         )
-        self._media_player = None
-        self._media_buffer = None
+        self._media_card = None
         self._video_dialog = None
 
         # Phase 19.24 (continued) -- Message Lifecycle Events UI --
@@ -1609,16 +1653,24 @@ class FileMessageBubble(QWidget):
         self.pinned_by = None
         self.supports_edit = False
         self.on_context_action = on_context_action
+        self._init_extras()
+        self._read_status = read_status
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(4, 2, 4, 2)
 
         bubble = QWidget()
         bubble_layout = QVBoxLayout(bubble)
-        bubble_layout.setContentsMargins(14, 10, 14, 10)
-        bubble_layout.setSpacing(4)
+        bubble_layout.setContentsMargins(14, 10, 14, 8)
+        bubble_layout.setSpacing(6)
 
         bubble.setMaximumWidth(600)
+        is_media = self.payload_type in (PayloadType.VOICE, PayloadType.VIDEO)
+        if is_media:
+            # Room for the play control, a usable progress bar and the time.
+            bubble.setMinimumWidth(MediaPlayerCard.VIDEO_SIZE[0] + 28 if self.payload_type == PayloadType.VIDEO else 340)
+        else:
+            bubble.setMinimumWidth(300)  # room for the file tile, a readable name and the download button
         bubble.setSizePolicy(
             QSizePolicy.Maximum,
             QSizePolicy.Minimum,
@@ -1634,52 +1686,145 @@ class FileMessageBubble(QWidget):
             )
             bubble_layout.addWidget(sender_label)
 
-        icon = {
-            PayloadType.VOICE: "\U0001F3A4",
-            PayloadType.VIDEO: "\U0001F3AC",
-        }.get(self.payload_type, "\U0001F4C4")
-        label_text = {
+        self._build_top_extras(bubble_layout)
+
+        size_bytes = (content_metadata or {}).get("size_bytes", len(file_bytes or b""))
+
+        # Laid out like the Website's cards. A voice or video message is titled "Voice message" /
+        # "Video message" above its player. A file is a tile with its type, the name over the size,
+        # and a round download button.
+        title = {
             PayloadType.VOICE: "Voice message",
             PayloadType.VIDEO: "Video message",
         }.get(self.payload_type, self._filename)
+        is_plain_file = not is_media
+        # A soft inset on the bubble: lighter than a sent (purple) bubble, and darker than a received
+        # one on the light theme but lighter than it on the dark theme.
+        tint = (
+            "rgba(255, 255, 255, 0.18)" if kind == "sent"
+            else ("rgba(255, 255, 255, 0.08)" if is_dark_theme() else "rgba(0, 0, 0, 0.07)")
+        )
 
-        name_label = QLabel(f"{icon} {label_text}")
-        # L-1: the filename arrives inside content_metadata from
-        # the sender. Sanitised at ingress too (see _safe_filename()),
-        # but rendered as data regardless.
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+
+        icon_label = QLabel()
+        icon_label.setTextFormat(Qt.PlainText)
+        icon_label.setAlignment(Qt.AlignCenter)
+        icon_label.setStyleSheet("background: transparent;")
+        if is_plain_file:
+            # The file tile: the document glyph with its extension under it ("PDF").
+            icon_label.setFixedSize(46, 52)
+            icon_label.setStyleSheet(f"background: {tint}; border-radius: 10px;")
+            icon_label.setPixmap(
+                toolbar_icon("file", color=self._content_text_color, active_color=self._content_text_color)
+                .pixmap(QSize(22, 22))
+            )
+            extension = Path(self._filename).suffix.lstrip(".").upper()[:4]
+            self._extension_label = QLabel(extension, icon_label)
+            self._extension_label.setTextFormat(Qt.PlainText)
+            self._extension_label.setAlignment(Qt.AlignCenter)
+            self._extension_label.setGeometry(0, 33, 46, 14)
+            self._extension_label.setStyleSheet(
+                f"color: {self._content_text_color}; font-size: 7pt; font-weight: 700; background: transparent;"
+            )
+            title_row.addWidget(icon_label)
+        else:
+            icon_label.setVisible(False)  # (kept so a deleted message can hide it, as before)
+
+        text_column = QVBoxLayout()
+        text_column.setContentsMargins(0, 0, 0, 0)
+        text_column.setSpacing(2)
+        # L-1: the filename arrives inside content_metadata from the sender. Sanitised at
+        # ingress too (see _safe_filename()), but rendered as data regardless.
+        name_label = QLabel(title)
         name_label.setTextFormat(Qt.PlainText)
         name_label.setWordWrap(True)
         name_label.setStyleSheet(
-            f"color: {self._content_text_color}; font-size: 10.5pt; background: transparent;"
+            f"color: {self._content_text_color}; font-size: 10pt; font-weight: 600; background: transparent;"
         )
-        bubble_layout.addWidget(name_label)
-
-        size_bytes = (content_metadata or {}).get("size_bytes", len(file_bytes))
+        text_column.addWidget(name_label)
         size_label = QLabel(_format_file_size(size_bytes))
         size_label.setTextFormat(Qt.PlainText)
         size_label.setStyleSheet(
-            f"color: {self._content_meta_color}; "
-            "font-size: 8.5pt; background: transparent;"
+            f"color: {self._content_meta_color}; font-size: 8.5pt; background: transparent;"
         )
-        bubble_layout.addWidget(size_label)
+        size_label.setVisible(is_plain_file)  # a voice/video message shows its length in the player
+        text_column.addWidget(size_label)
+        title_row.addLayout(text_column, 1)
+        self._icon_label, self._title_label, self._size_label = icon_label, name_label, size_label
+        self._title_row = title_row
+        bubble_layout.addLayout(title_row)
 
-        # Phase 19.24 -- Voice/Video Messages: a real playback control,
-        # not merely a download link. Plays DIRECTLY from the already-
-        # decrypted bytes already held in memory (QBuffer/QIODevice),
-        # never writing decrypted plaintext to disk merely to play it
-        # back -- "Save As..." below remains the only path that ever
-        # touches disk, and only on the user's own explicit request,
-        # unchanged from every other attachment kind.
-        if self.payload_type == PayloadType.VOICE:
-            bubble_layout.addLayout(self._build_voice_playback_row())
-        elif self.payload_type == PayloadType.VIDEO:
-            bubble_layout.addLayout(self._build_video_playback_row())
+        # Phase 19.24 -- Voice/Video Messages: a real player, not merely a download link. Plays
+        # DIRECTLY from the already-decrypted bytes held in memory (QBuffer), never writing
+        # plaintext to disk merely to play it -- Save below remains the only path that touches
+        # disk, and only on the user's explicit request.
+        footer_actions = []
+        if is_media:
+            self._media_card = MediaPlayerCard(
+                file_bytes,
+                self.content_metadata.get("mime_type") or "",
+                is_video=self.payload_type == PayloadType.VIDEO,
+                text_color=self._content_text_color,
+                meta_color=self._content_meta_color,
+                accent_color=COLOR_ACCENT,
+                duration_seconds=self.content_metadata.get("duration_seconds"),
+            )
+            if self.payload_type == PayloadType.VOICE:
+                pill = QFrame()
+                pill.setObjectName("MediaPill")
+                pill.setStyleSheet(f"QFrame#MediaPill {{ background: {tint}; border-radius: 22px; }}")
+                pill_layout = QHBoxLayout(pill)
+                pill_layout.setContentsMargins(8, 6, 12, 6)
+                pill_layout.addWidget(self._media_card)
+                self._media_pill = pill
+                bubble_layout.addWidget(pill)
+            else:
+                bubble_layout.addWidget(self._media_card)
+            if self.payload_type == PayloadType.VOICE:
+                # Kept under their established names (tests and callers use them).
+                self._voice_play_button = self._media_card.play_button
+                self._voice_duration_label = self._media_card.time_label
+            else:
+                expand_button = media_action_button(
+                    "Full screen", "expand", self._content_text_color, "Play video full screen"
+                )
+                expand_button.clicked.connect(self._open_video_player)
+                footer_actions.append(expand_button)
 
-        save_button = QPushButton("Save As...")
-        save_button.setObjectName("SecondaryButton")
-        save_button.setCursor(Qt.PointingHandCursor)
-        save_button.clicked.connect(self._handle_save_as)
-        bubble_layout.addWidget(save_button)
+        if is_plain_file:
+            # A round download button at the end of the file row, like the Website's.
+            save_button = QToolButton()
+            save_button.setObjectName("FileDownloadButton")
+            save_button.setCursor(Qt.PointingHandCursor)
+            save_button.setFixedSize(36, 36)
+            save_button.setIcon(
+                toolbar_icon("download", color=self._content_text_color, active_color=self._content_text_color)
+            )
+            save_button.setIconSize(QSize(18, 18))
+            save_button.setAccessibleName(f"Save {title}")
+            save_button.setToolTip("Save")
+            save_button.setStyleSheet(
+                f"QToolButton#FileDownloadButton {{ background: {tint}; border: none; border-radius: 18px; }}"
+                f"QToolButton#FileDownloadButton:hover {{ background: rgba(127, 127, 127, 0.35); }}"
+                f"QToolButton#FileDownloadButton:focus {{ border: 2px solid {self._content_text_color}; }}"
+            )
+            save_button.clicked.connect(self._handle_save_as)
+            self._title_row.addWidget(save_button)
+            self._save_button = save_button
+            self._action_buttons = footer_actions + [save_button]
+        else:
+            save_button = media_action_button(
+                "Save", "download", self._content_text_color, f"Save {title}"
+            )
+            save_button.clicked.connect(self._handle_save_as)
+            footer_actions.insert(0, save_button)
+            self._save_button = save_button
+            self._action_buttons = footer_actions
+
+        self._build_reactions(bubble_layout)
 
         self._timestamp_text = timestamp or datetime.now().strftime("%H:%M")
 
@@ -1704,12 +1849,12 @@ class FileMessageBubble(QWidget):
         self.time_label.setAlignment(
             Qt.AlignRight if kind == "sent" else Qt.AlignLeft
         )
-        bubble_layout.addWidget(_message_footer(self, self.time_label))
+        bubble_layout.addWidget(_message_footer(self, self.time_label, footer_actions))
 
         self._bubble = bubble
-        self._read_status = read_status
 
         _apply_bubble_style(bubble, kind, read_status)
+        self._style_extras()
 
         if kind == "sent":
             outer.addStretch()
@@ -1723,6 +1868,9 @@ class FileMessageBubble(QWidget):
         Write the already-decrypted bytes this bubble holds to a
         user-chosen local path. A no-op if the dialog is cancelled.
         """
+
+        if not self._file_bytes:
+            return
 
         path, _selected_filter = QFileDialog.getSaveFileName(
             self,
@@ -1743,114 +1891,39 @@ class FileMessageBubble(QWidget):
         right decoder by extension) carrying this attachment's real
         extension, derived from its own mime_type."""
 
-        mime_type = self.content_metadata.get("mime_type") or ""
+        mime_type = (self.content_metadata.get("mime_type") or "").split(";")[0].strip()
         ext = mimetypes.guess_extension(mime_type) or ".bin"
         return QUrl(f"clip{ext}")
-
-    def _ensure_media_player(self):
-        if self._media_player is not None:
-            return self._media_player
-
-        player = QMediaPlayer(self)
-        audio_output = QAudioOutput(self)
-        player.setAudioOutput(audio_output)
-        self._media_player = player
-        self._media_audio_output = audio_output
-        return player
-
-    def _load_media_source(self, player):
-        # Plays directly from the already-decrypted bytes already held
-        # in memory -- see __init__'s own comment for why this never
-        # writes decrypted plaintext to disk merely to play it back.
-        # The QBuffer must outlive playback, so it is kept as an
-        # instance attribute, not a local variable.
-        self._media_buffer = QBuffer()
-        self._media_buffer.setData(QByteArray(bytes(self._file_bytes)))
-        self._media_buffer.open(QIODevice.ReadOnly)
-        player.setSourceDevice(self._media_buffer, self._media_source_url())
-
-    def _build_voice_playback_row(self):
-        row = QHBoxLayout()
-
-        play_button = QPushButton("▶")
-        play_button.setObjectName("SecondaryButton")
-        play_button.setCursor(Qt.PointingHandCursor)
-        play_button.setFixedWidth(40)
-        play_button.setToolTip("Play voice message")
-        play_button.clicked.connect(self._toggle_voice_playback)
-        self._voice_play_button = play_button
-        row.addWidget(play_button)
-
-        duration_text = self._format_duration()
-        duration_label = QLabel(duration_text)
-        duration_label.setTextFormat(Qt.PlainText)
-        duration_label.setStyleSheet(
-            f"color: {self._content_meta_color}; font-size: 8.5pt; "
-            "background: transparent;"
-        )
-        self._voice_duration_label = duration_label
-        row.addWidget(duration_label)
-        row.addStretch()
-        return row
 
     def _format_duration(self, seconds=None):
         if seconds is None:
             seconds = self.content_metadata.get("duration_seconds")
         if not seconds:
             return ""
-        seconds = int(round(seconds))
-        return f"{seconds // 60}:{seconds % 60:02d}"
+        return format_clock(seconds)
 
     def _toggle_voice_playback(self):
-        player = self._ensure_media_player()
+        if self._media_card is not None:
+            self._media_card.toggle()
 
-        if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            player.pause()
-            self._voice_play_button.setText("▶")
-            return
-
-        if self._media_buffer is None:
-            self._load_media_source(player)
-            player.mediaStatusChanged.connect(self._on_voice_media_status_changed)
-            player.durationChanged.connect(self._on_voice_duration_changed)
-
-        player.play()
-        self._voice_play_button.setText("⏸")
-
-    def _on_voice_media_status_changed(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self._voice_play_button.setText("▶")
-            self._media_player.setPosition(0)
-
-    def _on_voice_duration_changed(self, duration_ms):
-        # Live, always-accurate duration from the decoder itself --
-        # takes over from content_metadata's own duration_seconds (if
-        # any) the moment real playback data is available.
-        if duration_ms > 0:
-            self._voice_duration_label.setText(
-                self._format_duration(duration_ms / 1000)
-            )
-
-    def _build_video_playback_row(self):
-        row = QHBoxLayout()
-
-        play_button = QPushButton("▶ Play Video")
-        play_button.setObjectName("SecondaryButton")
-        play_button.setCursor(Qt.PointingHandCursor)
-        play_button.clicked.connect(self._open_video_player)
-        row.addWidget(play_button)
-        row.addStretch()
-        return row
+    @property
+    def is_playing(self):
+        return bool(self._media_card is not None and self._media_card.is_playing)
 
     def _open_video_player(self):
-        """Opens a small modal player -- a real QVideoWidget/
-        QMediaPlayer, playing directly from the already-decrypted bytes
-        in memory (see _load_media_source()'s identical comment).
-        Stops and releases playback the moment the dialog closes."""
+        """A larger player for a video message -- a real QVideoWidget/QMediaPlayer, playing
+        directly from the already-decrypted bytes in memory. Stops and releases playback the
+        moment the window closes. The inline card pauses while it is open."""
+
+        if not self._file_bytes:
+            return None
+
+        if self._media_card is not None:
+            self._media_card.pause()
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Video Message")
-        dialog.resize(480, 360)
+        dialog.setWindowTitle("Video message")
+        dialog.resize(640, 400)
 
         layout = QVBoxLayout(dialog)
         video_widget = QVideoWidget(dialog)
@@ -1867,9 +1940,11 @@ class FileMessageBubble(QWidget):
         player.setSourceDevice(buffer, self._media_source_url())
 
         dialog.finished.connect(lambda *_: player.stop())
+        self._video_dialog = dialog
 
         player.play()
-        dialog.exec()
+        dialog.show()
+        return dialog
 
     def set_read_status(self, read_status):
         """
@@ -1920,20 +1995,6 @@ class FileMessageBubble(QWidget):
 
     def contextMenuEvent(self, event):
         _handle_message_context_menu_event(self, event, self)
-    def update_reactions(self, reactions):
-        """No visible reaction row on a file bubble in this pass --
-        tracked (self.reactions) so the context menu/data model stay
-        consistent even though there is nowhere to render it yet."""
-
-        self.reactions = list(reactions or [])
-
-    def set_pinned(self, pinned, pinned_by=None):
-        """No visible pin marker on a file bubble in this pass --
-        tracked (self.is_pinned/pinned_by), mirroring update_
-        reactions()'s own identical precedent above."""
-
-        self.is_pinned = bool(pinned)
-        self.pinned_by = pinned_by if self.is_pinned else None
 
     def mark_deleted(self):
         """Mark this file bubble deleted -- the decrypted bytes this
@@ -1941,7 +2002,20 @@ class FileMessageBubble(QWidget):
 
         self.is_deleted = True
         self._file_bytes = None
-        self.set_pinned(False)
+        self._icon_label.setVisible(False)
+        self._size_label.setVisible(False)
+        self._title_label.setText("Message deleted")
+        self._title_label.setStyleSheet(
+            f"color: {self._content_text_color}; font-size: 10pt; font-style: italic; background: transparent;"
+        )
+        if self._media_card is not None:
+            self._media_card.release()
+            self._media_card.setVisible(False)
+        for button in getattr(self, "_action_buttons", []):
+            button.setVisible(False)
+        self._clear_extras_for_deletion()
+        _sync_item_accessible_text(self)
+        _refresh_row(self)
 
 
 
@@ -1952,6 +2026,17 @@ class MessageWidget(QListWidget):
 
     def __init__(self):
         super().__init__()
+
+        # handle -> name to show above a received group message; ChatWindow supplies the
+        # session's display-name cache. Only for display: nothing here is keyed on it.
+        self.name_for = None
+        # This account's handle (reactions/pins by "you") and the open direct chat's display
+        # name (the author of a quoted message when a bubble carries no sender label).
+        self.own_username = None
+        self.peer_display_name = None
+        # original message_id -> [reply bubbles quoting it], so a quote updates when its
+        # original arrives later, is edited or is deleted.
+        self._replies_by_target = {}
 
         # C2 -- Read Receipts: this client's own sent bubbles in the
         # currently-open conversation, so a later
@@ -2083,6 +2168,7 @@ class MessageWidget(QListWidget):
         separator_bubble = DateSeparatorBubble(message_date)
 
         separator_item.setSizeHint(_row_size_hint(separator_bubble))
+        separator_item.setData(Qt.AccessibleTextRole, message_date.strftime("%d %B %Y"))
 
         self.addItem(separator_item)
 
@@ -2097,6 +2183,10 @@ class MessageWidget(QListWidget):
     def _add_bubble(self, bubble, message_id=None, message_date=None):
 
         bubble.on_context_action = self._context_action_handler
+        if bubble.kind != "system":
+            bubble._name_for = self.name_for
+            bubble._own_username = self.own_username
+            bubble.on_reply_activated = self._on_reply_activated
 
         self._maybe_insert_date_separator(message_date)
 
@@ -2111,6 +2201,9 @@ class MessageWidget(QListWidget):
         self.addItem(item)
 
         self.setItemWidget(item, bubble)
+
+        bubble._list_item = item
+        item.setData(Qt.AccessibleTextRole, _accessible_summary(bubble))
 
         self.scrollToBottom()
 
@@ -2149,6 +2242,7 @@ class MessageWidget(QListWidget):
 
         if bubble.kind != "system" and assigned_id is not None and not str(assigned_id).startswith("live-"):
             self._bubbles_by_message_id[assigned_id] = bubble
+            self._refresh_replies_to(assigned_id)
 
         # Phase 19.24 -- Message Lifecycle Events: lets a caller (e.g.
         # add_sent_message() -> gui/chat_window.py::send_message())
@@ -2161,6 +2255,17 @@ class MessageWidget(QListWidget):
     # Public Methods
     # ==========================================================
 
+    def add_group_event(self, text, event_id=None, message_date=None):
+        """A group membership event ("Alice added Bob") as a centred system line, in order with the
+        messages. Like any system notice it never breaks a date separator -- except that its own
+        calendar date (when known) is given one, so an event on a new day starts that day."""
+
+        self._maybe_insert_date_separator(message_date)
+        bubble = self.add_system_message(text)
+        if bubble is not None:
+            bubble.group_event_id = event_id
+        return bubble
+
     def add_system_message(self, message):
         """
         Display a system message. Deliberately no ``message_date``: a
@@ -2168,9 +2273,17 @@ class MessageWidget(QListWidget):
         _maybe_insert_date_separator()'s docstring.
         """
 
-        self._add_bubble(
+        return self._add_bubble(
             MessageBubble(message, kind="system")
         )
+
+    def _shown_name(self, sender):
+        if not sender or self.name_for is None:
+            return sender
+        try:
+            return self.name_for(sender) or sender
+        except Exception:  # noqa: BLE001 -- a name is cosmetic; never lose the message over it
+            return sender
 
     def add_received_message(
         self,
@@ -2197,7 +2310,7 @@ class MessageWidget(QListWidget):
 
         return self._add_bubble(
             MessageBubble(
-                message, kind="received", sender=sender, timestamp=timestamp
+                message, kind="received", sender=self._shown_name(sender), timestamp=timestamp
             ),
             message_date=message_date,
             message_id=message_id,
@@ -2253,7 +2366,7 @@ class MessageWidget(QListWidget):
             ImageMessageBubble(
                 image_bytes,
                 kind="received",
-                sender=sender,
+                sender=self._shown_name(sender),
                 timestamp=timestamp,
                 content_metadata=content_metadata,
             ),
@@ -2309,7 +2422,7 @@ class MessageWidget(QListWidget):
                 file_bytes,
                 content_metadata,
                 kind="received",
-                sender=sender,
+                sender=self._shown_name(sender),
                 timestamp=timestamp,
                 payload_type=payload_type,
             ),
@@ -2452,6 +2565,7 @@ class MessageWidget(QListWidget):
             self._bubbles_by_message_id[real_message_id] = bubble
             if hasattr(bubble, "refresh_actions_button"):
                 bubble.refresh_actions_button()
+            self._refresh_replies_to(real_message_id)
 
             return
 
@@ -2459,11 +2573,85 @@ class MessageWidget(QListWidget):
         bubble = self._bubbles_by_message_id.get(message_id)
         if bubble is not None and bubble.supports_edit:
             bubble.apply_edit(new_text, edit_version)
+            self._refresh_replies_to(message_id)
 
     def mark_message_deleted(self, message_id):
         bubble = self._bubbles_by_message_id.get(message_id)
         if bubble is not None:
             bubble.mark_deleted()
+            self._refresh_replies_to(message_id)
+
+    # ==========================================================
+    # Replies -- resolved by the original's stable message id, never by text
+    # ==========================================================
+
+    def reply_excerpt_for(self, original):
+        """What a reply quotes for ``original``: its text, a media label (never the media
+        itself), or "Message deleted"."""
+
+        if getattr(original, "is_deleted", False):
+            return "Message deleted"
+        if isinstance(original, MessageBubble):
+            return original.message_text or "Message"
+        if isinstance(original, ImageMessageBubble):
+            return MEDIA_REPLY_LABELS["image"]
+        payload_type = getattr(original, "payload_type", None)
+        if payload_type == PayloadType.VOICE:
+            return MEDIA_REPLY_LABELS["voice"]
+        if payload_type == PayloadType.VIDEO:
+            return MEDIA_REPLY_LABELS["video"]
+        return f"\U0001F4C4 {getattr(original, '_filename', '') or 'File'}"
+
+    def _author_of(self, original):
+        if original.kind == "sent":
+            return "You"
+        return getattr(original, "_accessible_sender", None) or self.peer_display_name or "Them"
+
+    def set_reply_reference(self, bubble, reply_to_message_id):
+        """
+        Show on ``bubble`` the message it replies to. The original is looked up by its stable,
+        server-assigned id among THIS transcript's bubbles only (one conversation is rendered at
+        a time, and the server only keeps a reply reference that points into the same
+        conversation), so nothing from another conversation can be quoted. An original that is
+        not loaded -- older than what is shown, hidden for this account, or not visible to it --
+        is shown as unavailable rather than guessed at.
+        """
+
+        if bubble is None or not reply_to_message_id or bubble.kind == "system":
+            return
+
+        bubble.reply_to_message_id = reply_to_message_id
+        waiting = self._replies_by_target.setdefault(reply_to_message_id, [])
+        if bubble not in waiting:
+            waiting.append(bubble)
+
+        if getattr(bubble, "is_deleted", False):
+            return
+
+        original = self._bubbles_by_message_id.get(reply_to_message_id)
+
+        if original is None:
+            bubble.set_reply_preview(
+                "Original message unavailable", author="Reply", clickable=False, unavailable=True
+            )
+        else:
+            bubble.set_reply_preview(
+                self.reply_excerpt_for(original),
+                author=self._author_of(original),
+                clickable=not getattr(original, "is_deleted", False),
+            )
+
+        _sync_item_accessible_text(bubble)
+
+    def _refresh_replies_to(self, message_id):
+        for reply in list(self._replies_by_target.get(message_id, ())):
+            self.set_reply_reference(reply, message_id)
+
+    def _on_reply_activated(self, bubble):
+        original = self._bubbles_by_message_id.get(getattr(bubble, "reply_to_message_id", None))
+        if original is not None and self.scroll_to_bubble(original):
+            # A brief highlight, like the Website's jump-to-original.
+            QTimer.singleShot(2200, self.clear_highlight)
 
     def update_message_reactions(self, message_id, reactions):
         bubble = self._bubbles_by_message_id.get(message_id)
@@ -2491,6 +2679,7 @@ class MessageWidget(QListWidget):
 
         if bubble.kind != "system":
             self._bubbles_by_message_id[message_id] = bubble
+            self._refresh_replies_to(message_id)
 
     def get_bubble(self, message_id):
         """Read-only lookup -- used by gui/chat_window.py to resolve a
@@ -2678,6 +2867,7 @@ class MessageWidget(QListWidget):
 
         self._sent_bubbles_by_message_id = {}
         self._bubbles_by_message_id = {}
+        self._replies_by_target = {}
 
         self._live_bubble_sequence = 0
 

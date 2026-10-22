@@ -23,7 +23,7 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=Roboto+Mono:wght@500&display=swap">
 <!-- ?v= busts the browser cache whenever the UI build changes, so a
      reviewer never sees a stale stylesheet/script from an older pass. -->
-<link rel="stylesheet" href="./style.css?v=1.7.0">
+<link rel="stylesheet" href="./style.css?v=1.10.0">
 <!--
   Import map (a native browser feature, no bundler needed): resolves
   both the bare specifiers crypto.js itself imports AND the absolute
@@ -160,10 +160,17 @@
       <li><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>End-to-end encrypted</li>
     </ul>
 
-    <div class="gateway-field">
-      <label class="field-label" for="gatewayUrl">Gateway URL</label>
-      <input id="gatewayUrl" class="input" value="ws://127.0.0.1:8765" spellcheck="false">
-    </div>
+    <!-- The gateway address is a deployment detail, not something every person signing in needs to
+         see: it defaults to this page's own host and stays available, collapsed, for the rare case
+         the gateway lives somewhere else. -->
+    <details class="connection-settings" id="connectionSettings">
+      <summary id="connectionSettingsSummary">Connection settings</summary>
+      <div class="gateway-field">
+        <label class="field-label" for="gatewayUrl">Gateway address</label>
+        <input id="gatewayUrl" class="input" value="ws://127.0.0.1:8765" spellcheck="false" autocomplete="off">
+        <div class="field-hint">Only change this if your administrator gave you a different address.</div>
+      </div>
+    </details>
   </main>
 </div>
 
@@ -201,7 +208,7 @@
       <div class="sidebar-search">
         <div class="search-field">
           <svg class="icon search-field-icon" aria-hidden="true"><use href="#i-search"/></svg>
-          <input id="peerUsername" class="input" placeholder="Search chats or start one by username" aria-label="Search chats, or enter a username to start a chat" autocomplete="off" spellcheck="false">
+          <input id="peerUsername" class="input" placeholder="Search, or phone number + Enter" aria-label="Search chats. Press Enter to look up a phone number or username and start a chat" autocomplete="off" spellcheck="false">
         </div>
         <button id="unreadFilterToggle" class="btn-icon" type="button" aria-label="Show only unread conversations" aria-pressed="false" data-tooltip="Unread only" data-tooltip-align="end"><svg class="icon"><use href="#i-filter"/></svg></button>
       </div>
@@ -256,22 +263,26 @@
       <section id="chatView" class="chat-view" hidden aria-label="Direct conversation">
         <div class="chat-header">
           <button class="btn-icon chat-header-back" id="chatBackBtn" type="button" aria-label="Back to conversations"><svg class="icon"><use href="#i-chevron-left"/></svg></button>
-          <div class="avatar sm" id="chatAvatar">?</div>
+          <button type="button" class="avatar sm avatar-btn" id="chatAvatar" aria-label="View profile picture" data-tooltip="View profile picture">?</button>
           <div class="chat-header-info">
             <div class="chat-header-title" id="chatTitle"><span class="chat-header-name">&mdash;</span>
               <span id="peerVerifiedBadge" class="verified-badge is-unverified" data-state="UNVERIFIED">Unverified</span>
             </div>
             <div class="chat-header-sub" id="peerPresence"></div>
           </div>
-          <div class="chat-header-actions" role="toolbar" aria-label="Conversation tools">
-            <button id="markReadBtn" class="btn-icon" type="button" aria-label="Mark as read" data-tooltip="Mark as read"><svg class="icon"><use href="#i-check-check"/></svg></button>
-            <button id="loadHistoryBtn" class="btn-icon" type="button" aria-label="Load history" data-tooltip="Load history"><svg class="icon"><use href="#i-history"/></svg></button>
-            <button id="peerProfileBtn" class="btn-icon" type="button" aria-label="View profile" data-tooltip="Profile"><svg class="icon"><use href="#i-info"/></svg></button>
-            <span class="toolbar-divider" aria-hidden="true"></span>
-            <button id="searchBtn" class="btn-icon" type="button" aria-label="Search in this conversation" data-tooltip="Search"><svg class="icon"><use href="#i-search"/></svg></button>
-            <button id="pinnedBtn" class="btn-icon" type="button" aria-label="Pinned messages" data-tooltip="Pinned messages"><svg class="icon"><use href="#i-pin"/></svg></button>
-            <button id="galleryBtn" class="btn-icon" type="button" aria-label="Media gallery" data-tooltip="Media gallery"><svg class="icon"><use href="#i-image"/></svg></button>
-            <button id="wallpaperBtn" class="btn-icon" type="button" aria-label="Chat wallpaper" data-tooltip="Wallpaper" data-tooltip-align="end"><svg class="icon"><use href="#i-palette"/></svg></button>
+          <div class="chat-header-actions" role="toolbar" aria-label="Chat tools">
+            <button id="chatSettingsBtn" class="btn-icon" type="button" aria-label="Chat settings" aria-haspopup="menu" data-tooltip="Chat settings" data-tooltip-align="end"><svg class="icon"><use href="#i-settings"/></svg></button>
+          </div>
+          <!-- The chat tools live in the Chat settings menu (chatSettingsBtn). These controls are the
+               tools themselves -- each keeps its id and handler; the menu runs them. -->
+          <div class="tool-registry" hidden>
+            <button id="markReadBtn" type="button">Mark as read</button>
+            <button id="loadHistoryBtn" type="button">Load history</button>
+            <button id="peerProfileBtn" type="button">Contact info</button>
+            <button id="searchBtn" type="button">Search in conversation</button>
+            <button id="pinnedBtn" type="button">Pinned messages</button>
+            <button id="galleryBtn" type="button">Media gallery</button>
+            <button id="wallpaperBtn" type="button">Chat wallpaper</button>
           </div>
         </div>
         <!-- Safety number + the three key-trust actions, moved out of the
@@ -280,14 +291,27 @@
              one-character-wide column next to the action buttons. -->
         <div class="security-bar" id="securityBar" data-state="UNVERIFIED">
           <svg class="icon security-bar-icon" aria-hidden="true"><use href="#i-shield"/></svg>
-          <button id="securityBarToggle" class="btn-icon btn-icon-sm security-bar-toggle" type="button" aria-expanded="false" aria-controls="fingerprintDisplay" aria-label="Show full safety number"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
           <div class="security-bar-body">
-            <div id="fingerprintDisplay" class="fingerprint-display" aria-live="polite"></div>
+            <span id="securityStatusText" class="security-status-text">Not verified</span>
           </div>
           <div class="security-bar-actions" role="group" aria-label="Identity and key">
+            <button id="reverifyBtn" class="btn btn-ghost btn-xs" type="button" aria-controls="safetyDetails" hidden>Re-verify</button>
+            <button id="establishKeyBtn" class="btn btn-ghost btn-xs" type="button"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>Establish key</button>
+            <button id="securityBarToggle" class="btn-icon btn-icon-sm security-bar-toggle" type="button" aria-expanded="false" aria-controls="safetyDetails" aria-label="Show safety numbers"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+          </div>
+        </div>
+        <!-- The comparison itself: the contact's safety number, the explicit confirmation, and (only
+             when asked for) your own number. Open by default while the contact is not verified. -->
+        <div class="safety-details" id="safetyDetails" hidden>
+          <div id="fingerprintDisplay" class="fingerprint-display" aria-live="polite"></div>
+          <div class="safety-details-actions" role="group" aria-label="Verify this contact">
             <button id="confirmVerifiedBtn" class="btn btn-ghost btn-xs" type="button"><svg class="icon" aria-hidden="true"><use href="#i-shield-check"/></svg>Confirm match</button>
             <button id="requestVerificationBtn" class="btn btn-ghost btn-xs" type="button"><svg class="icon" aria-hidden="true"><use href="#i-user-check"/></svg>Request Approval</button>
-            <button id="establishKeyBtn" class="btn btn-ghost btn-xs" type="button"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>Establish key</button>
+            <button id="showOwnNumberBtn" class="btn btn-text btn-xs" type="button" aria-expanded="false" aria-controls="ownNumberPanel">Show my safety number</button>
+          </div>
+          <div id="ownNumberPanel" class="own-number-panel" hidden>
+            <div class="own-number-hint">Your number. Read it to <b id="ownNumberPeer"></b> when they verify you &mdash; it should match what their app shows for you.</div>
+            <div id="ownSafetyNumber" class="own-safety-number" aria-label="Your safety number" tabindex="0">Available once you are signed in.</div>
           </div>
         </div>
         <!-- Pinned banner: one ACTIVE pinned message at a time (main.js
@@ -341,14 +365,17 @@
             <div class="chat-header-title" id="groupTitle">&mdash;</div>
             <div class="chat-header-sub" id="groupSub"></div>
           </div>
-          <div class="chat-header-actions" role="toolbar" aria-label="Conversation tools">
-            <button id="groupInfoBtn" class="btn-icon" type="button" aria-label="Group info" data-tooltip="Group info"><svg class="icon"><use href="#i-info"/></svg></button>
-            <button id="loadGroupHistoryBtn" class="btn-icon" type="button" aria-label="Load history" data-tooltip="Load history"><svg class="icon"><use href="#i-history"/></svg></button>
-            <span class="toolbar-divider" aria-hidden="true"></span>
-            <button id="groupSearchBtn" class="btn-icon" type="button" aria-label="Search in this conversation" data-tooltip="Search"><svg class="icon"><use href="#i-search"/></svg></button>
-            <button id="groupPinnedBtn" class="btn-icon" type="button" aria-label="Pinned messages" data-tooltip="Pinned messages"><svg class="icon"><use href="#i-pin"/></svg></button>
-            <button id="groupGalleryBtn" class="btn-icon" type="button" aria-label="Media gallery" data-tooltip="Media gallery"><svg class="icon"><use href="#i-image"/></svg></button>
-            <button id="groupWallpaperBtn" class="btn-icon" type="button" aria-label="Chat wallpaper" data-tooltip="Wallpaper" data-tooltip-align="end"><svg class="icon"><use href="#i-palette"/></svg></button>
+          <div class="chat-header-actions" role="toolbar" aria-label="Group tools">
+            <!-- Members and the admin's controls stay one tap away; everything else is in Chat settings. -->
+            <button id="groupInfoBtn" class="btn btn-ghost btn-xs" type="button" aria-label="Group info and members"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg>Members</button>
+            <button id="groupSettingsBtn" class="btn-icon" type="button" aria-label="Chat settings" aria-haspopup="menu" data-tooltip="Chat settings" data-tooltip-align="end"><svg class="icon"><use href="#i-settings"/></svg></button>
+          </div>
+          <div class="tool-registry" hidden>
+            <button id="loadGroupHistoryBtn" type="button">Load history</button>
+            <button id="groupSearchBtn" type="button">Search in conversation</button>
+            <button id="groupPinnedBtn" type="button">Pinned messages</button>
+            <button id="groupGalleryBtn" type="button">Media gallery</button>
+            <button id="groupWallpaperBtn" type="button">Chat wallpaper</button>
           </div>
         </div>
         <div class="pinned-bar-wrap" id="groupPinnedBarWrap" hidden>
@@ -380,7 +407,10 @@
         </div>
         <div id="groupTypingStatus" class="typing-status" hidden aria-live="polite"></div>
         <div class="composer">
+          <input id="groupAttachmentInput" type="file" hidden>
+          <button id="groupAttachBtn" class="btn-icon composer-icon-btn" type="button" aria-label="Attach a photo, file, voice, or video message" data-tooltip="Attach" data-tooltip-pos="top"><svg class="icon"><use href="#i-paperclip"/></svg></button>
           <textarea id="groupMessageText" class="input composer-input" rows="1" placeholder="Message the group..." aria-label="Message" autocomplete="off"></textarea>
+          <button id="sendGroupAttachmentBtn" class="btn btn-ghost btn-sm composer-file-btn" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#i-file"/></svg><span class="composer-file-label">Send file</span></button>
           <button id="sendGroupMessageBtn" class="btn btn-primary composer-send" type="button"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg><span class="composer-send-label">Send</span></button>
         </div>
       </section>
@@ -403,6 +433,7 @@
           </div>
           <div class="card">
             <div class="card-heading">Members</div>
+            <div class="group-key-notice" id="groupKeyNotice" role="status" hidden></div>
             <div id="groupInfoMembers"></div>
           </div>
           <div class="card" id="groupManageCard">
@@ -410,13 +441,14 @@
             <div class="settings-item">
               <div>
                 <div class="settings-item-label">Add members</div>
-                <div class="settings-item-hint" id="groupAddHint">Enter one or more usernames. Only the group's admin can add people directly; anyone else's request goes to the admin for approval.</div>
+                <div class="settings-item-hint" id="groupAddHint">Enter a username, or a phone number to see who it is first. Each person gets an invitation in their Inbox and joins only if they approve. Only the group's admin can invite directly; anyone else's request goes to the admin first.</div>
               </div>
             </div>
             <div class="settings-form" id="groupAddForm">
-              <input id="groupAddMemberInput" class="input input-sm" placeholder="Username to add" aria-label="Username to add to this group" autocomplete="off" spellcheck="false">
+              <input id="groupAddMemberInput" class="input input-sm" placeholder="Username or phone number to add" aria-label="Username or phone number to add to this group" autocomplete="off" spellcheck="false">
               <button id="groupAddMemberBtn" class="btn btn-primary btn-sm" type="button">Add</button>
             </div>
+            <div class="member-lookup" id="groupAddLookup" hidden aria-live="polite"></div>
             <div class="settings-item">
               <div>
                 <div class="settings-item-label">Leave group</div>
@@ -437,6 +469,19 @@
           </div>
         </div>
         <div class="scroll-view-body">
+        <div class="panel-header">Profile</div>
+        <div class="card">
+          <div class="profile-row">
+            <button type="button" class="avatar lg avatar-btn" id="myProfilePicAvatar" aria-label="Your profile picture. Open it to view or change it." data-tooltip="View or change your picture">?</button>
+            <div class="profile-row-text">
+              <div class="profile-row-name" id="ownDisplayName">&mdash;</div>
+              <div class="profile-row-handle" id="ownHandle"></div>
+              <div class="profile-row-hint" id="myProfilePicHint">Select your picture to view or change it. It is visible to anyone who looks your account up.</div>
+            </div>
+          </div>
+          <input id="profilePicInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+        </div>
+
         <div class="panel-header">Appearance</div>
         <div class="card">
           <div class="settings-item settings-item-stack">
@@ -495,14 +540,14 @@
         <div class="card">
           <div class="settings-item">
             <div>
-              <div class="settings-item-label">Change Username</div>
-              <div class="settings-item-hint" id="changeUsernameHint">Your display name across every client.</div>
+              <div class="settings-item-label">Display name</div>
+              <div class="settings-item-hint" id="changeUsernameHint">The name people see. It does not have to be unique; your phone number identifies you.</div>
             </div>
             <button id="changeUsernameToggleBtn" class="btn btn-ghost btn-sm">Edit</button>
           </div>
           <div id="changeUsernameForm" class="settings-form" hidden>
-            <input id="newUsernameInput" class="input input-sm" placeholder="New username" aria-label="New username">
-            <button id="changeUsernameSubmitBtn" class="btn btn-primary btn-sm">Save Username</button>
+            <input id="newUsernameInput" class="input input-sm" placeholder="New display name" aria-label="New display name" maxlength="64">
+            <button id="changeUsernameSubmitBtn" class="btn btn-primary btn-sm">Save name</button>
           </div>
           <div class="settings-item">
             <div>
@@ -527,17 +572,6 @@
           <div id="bioForm" class="settings-form" hidden>
             <textarea id="bioInput" class="input" rows="3" maxlength="256" placeholder="Write a short bio (up to 256 characters)" aria-label="Bio"></textarea>
             <button id="bioSaveBtn" class="btn btn-primary btn-sm" type="button">Save Bio</button>
-          </div>
-          <div class="settings-item">
-            <div class="settings-item-lead">
-              <div class="avatar" id="myProfilePicAvatar" style="cursor:pointer;">?</div>
-              <div>
-                <div class="settings-item-label">Profile Picture</div>
-                <div class="settings-item-hint" id="myProfilePicHint">Visible to anyone who looks your account up.</div>
-              </div>
-            </div>
-            <input id="profilePicInput" type="file" accept="image/*" hidden>
-            <button id="profilePicChangeBtn" class="btn btn-ghost btn-sm">Change</button>
           </div>
           <div class="settings-item">
             <div>
@@ -569,7 +603,7 @@
           <div class="settings-item">
             <div>
               <div class="settings-item-label">Safety numbers</div>
-              <div class="settings-item-hint">Open a conversation to compare its safety number, then use Confirm match to verify the contact.</div>
+              <div class="settings-item-hint">Open a conversation and use Re-verify (or Confirm match) to compare its safety number. Your own number is shown there too, when you ask for it.</div>
             </div>
             <span class="settings-chip"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg>Per contact</span>
           </div>
@@ -633,9 +667,10 @@
       <label class="field-label" for="groupMembers">Members</label>
       <div class="member-picker" id="groupMemberPicker">
         <span class="member-chips" id="groupMemberChips" role="list" aria-label="Selected members"></span>
-        <input id="groupMembers" class="member-picker-input" placeholder="Add a username…" aria-describedby="groupMembersHint" autocomplete="off" spellcheck="false">
+        <input id="groupMembers" class="member-picker-input" placeholder="Add a username or phone number…" aria-describedby="groupMembersHint" autocomplete="off" spellcheck="false">
       </div>
-      <div class="field-hint" id="groupMembersHint">Press Enter or comma to add each person. You're included automatically.</div>
+      <div class="field-hint" id="groupMembersHint">Press Enter or comma to add a username. For a phone number, press Enter to see who it is, then Add. You're included automatically.</div>
+      <div class="member-lookup" id="groupMemberLookup" hidden aria-live="polite"></div>
       <div class="member-suggestions" id="groupMemberSuggestions" hidden>
         <div class="member-suggestions-label">Suggested</div>
         <div class="member-suggestions-list" id="groupMemberSuggestionsList"></div>
@@ -657,6 +692,6 @@
   <div id="log"></div>
 </div>
 
-<script type="module" src="./main.js?v=1.7.0"></script>
+<script type="module" src="./main.js?v=1.10.0"></script>
 </body>
 </html>

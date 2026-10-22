@@ -973,3 +973,44 @@ conversation.
 any in-flight send before closing the TLS socket (previously it closed it
 underneath them, which could kill the interpreter with a native access
 violation in `ssl.read`); `ClientSession.disconnect()` follows the same order.
+
+## Group key history, TLS tickets, gateway teardown, own safety number (2026-10-21)
+
+**Group key history.** The Web client used to keep one key per conversation (the newest epoch), so after a rotation
+every older group message was skipped as undecryptable. It now keeps every installed key by epoch
+(`WebClientSession.keyHistory`, persisted with the rest of the browser's encrypted state) and picks the key for a
+message by the message's own `epoch`, which is covered by the signature that is verified before any key is used. A
+late-arriving older key can no longer replace the key new messages are sent with. Limit: device key sync still sends
+only a conversation's current key, so a *newly linked* browser device cannot read pre-rotation history; and state
+saved before this change has no history, so only the current key is known until older keys are received again.
+
+**TLS session tickets.** The server no longer issues TLS 1.3 session tickets (`security/tls.py`). About 0.5% of
+first requests sent the instant a WebSocket opened went unanswered; removing the tickets removed the loss (0/2000
+against repeated failures without the change). The application never resumes TLS sessions, so nothing is given up.
+`tests/test_web_gateway_first_request.py` fails without the change and passes with it.
+
+**Gateway teardown.** The gateway used to wait for both directions to end; a browser that closed its WebSocket
+cleanly (Logout, closing the tab) left its server-side connection open, so the user stayed "online" to everyone else
+until some unrelated packet made a send fail. The connection now ends as soon as either direction ends
+(`tests/test_web_gateway_teardown.py`).
+
+**Own safety number.** Settings → Security shows the account's own safety number (`WebClientSession.ownFingerprint()`).
+
+## Desktop parity, chat tools, media and groups (2026-10-21)
+
+* **Chat settings menu.** The gear in the chat header opens a menu (a tool registry in `web/client/main.js`). The original buttons keep
+  their ids and handlers but are hidden; the menu entry dispatches the same click, so every earlier flow still works. Group chats get the
+  group tools role-limited (the server still decides). Verification status and the group Members control remain in the header.
+* **Verified line.** `safetyDetailsRequested` drives a compact "Verified" bar with Re-verify; the comparison and "Show my safety number"
+  are in the details. `sendMessage` / `sendAttachment` refuse a peer whose key changed until it is re-verified.
+* **Search.** The sidebar box filters the list; Enter or **Start chat** looks the person up (a phone number resolves to its account). A
+  conversation row exists only after a message is exchanged.
+* **Profile picture.** choose → validate (type, size, dimensions) → crop/zoom/position → 256 px square PNG → upload; the server validates
+  again from the header (`security/image_validation.py`). The avatar in the profile row and chat header opens the enlarged viewer.
+* **Voice recorder modal.** header, input level, timer, preview, Record again / Cancel / Send; same permission, cancel and error handling
+  and the same encrypted send path.
+* **Group attachments.** the group composer has the attach button, picker and recorder; messages ride the existing
+  `message + message_recipients` pipeline with the group key. **Group events** arrive as `group_event` packets and in history.
+* **Names.** `display_names_request` fills the display-name cache; the handle is shown beside a name only for namesakes.
+* **Gateway address** is a collapsed "Connection settings" field (default: the page's host; `?gateway=ws://…` accepted).
+* **Replies/reactions** use stable message ids; the server stamps the stored reference on relayed packets and drops cross-conversation ones.

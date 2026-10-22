@@ -101,7 +101,10 @@ from utils.protocol import (
     create_group_remove_member_packet,
     create_inbox_list_request_packet,
     create_inbox_response_packet,
+    MAX_DISPLAY_NAME_LOOKUP,
     create_bio_request_packet,
+    create_change_display_name_request_packet,
+    create_display_names_request_packet,
     create_change_bio_request_packet,
     create_login_request_packet,
     create_logout_request_packet,
@@ -114,6 +117,7 @@ from utils.protocol import (
     create_last_seen_request_packet,
     create_change_password_request_packet,
     create_change_username_request_packet,
+    create_group_key_request_packet,
     create_payload_packet,
     create_reaction_add_packet,
     create_reaction_remove_packet,
@@ -216,6 +220,9 @@ class ClientSession(QObject):
 
     message_received = Signal(str, str, str)
     users_updated = Signal(list)
+
+    # Display names arrived for some account handles (see fetch_display_names()).
+    display_names_updated = Signal()
     error_occurred = Signal(str)
     connection_changed = Signal(bool)
 
@@ -292,6 +299,18 @@ class ClientSession(QObject):
     # rebuilt from history (which already carries message_id). (identity_
     # key, message_id).
     message_id_received = Signal(str, str)
+
+    # (conversation key, message_id, reply_to_message_id) for a live message that replies to
+    # another. The server stamps reply_to_message_id from the stored row before relaying, so it
+    # is always a reference it accepted for that same conversation.
+    reply_reference_received = Signal(str, str, str)
+
+    # (conversation_id, event) for a live group membership event -- "Alice added Bob", "Bob left",
+    # "Alice removed Carol". ``event`` is {"event_id", "event_type", "actor", "subject",
+    # "timestamp"}: structured fields the server recorded from authenticated identities (see
+    # database/models/group_event.py), never text a peer wrote. The window renders a fixed
+    # sentence from them and de-duplicates by event_id (a live event is also in history).
+    group_event_received = Signal(str, dict)
 
     # Phase 19.24 -- Typing Indicator. Purely a live, ephemeral hint --
     # never persisted, never replayed via history. (conversation_id,
@@ -414,6 +433,10 @@ class ClientSession(QObject):
         # ---------------------------------
 
         self.unread_counts = {}
+
+        # Account handle -> the display name that person chose (not unique; see
+        # fetch_display_names()). Empty until asked; display_name_for() falls back to the handle.
+        self._display_names = {}
 
         # ---------------------------------
         # Conversation List (Phase 2)
@@ -632,6 +655,15 @@ class ClientSession(QObject):
         # instead of leaving it stuck until the recipient's next
         # reconnect re-announces it.
         self._declined_redeliveries_awaiting_verification = {}
+
+        # {member_username: {(conversation_id, epoch), ...}} -- the third half of the same gap: a
+        # group key this client HOLDS but did not send to ``member`` because it had not verified
+        # them yet (or had never seen their identity). _distribute_group_key() skips such a member
+        # on purpose -- a key is only ever wrapped for a VERIFIED identity -- but used to forget the
+        # skip, so a member added before verification stayed in the group without the key even
+        # after they were verified. Retried once this client verifies them (or sees their identity
+        # while they are already verified). Session-local, like its two siblings above.
+        self._skipped_group_key_distributions = {}
 
         # ---------------------------------
         # Legacy Callbacks
@@ -1285,6 +1317,54 @@ class ClientSession(QObject):
         """
 
         return self.send_request(create_change_bio_request_packet(bio))
+
+    def display_name_for(self, username):
+        """The name to SHOW for an account handle: its display name once known, else the
+        handle itself. Never use the result to address, verify or authorize anything --
+        display names are not unique; every packet still routes on the handle."""
+
+        if not username:
+            return ""
+
+        return self._display_names.get(username) or username
+
+    def fetch_display_names(self, usernames):
+        """Ask the server for the display names of ``usernames`` (handles), cache them and
+        return {handle: display_name} for the ones that exist. Emits display_names_updated
+        when anything changed."""
+
+        handles = []
+
+        for handle in usernames or []:
+            if isinstance(handle, str) and handle and handle not in handles:
+                handles.append(handle)
+
+        if not handles:
+            return {}
+
+        response = self.send_request(create_display_names_request_packet(handles[:MAX_DISPLAY_NAME_LOOKUP]))
+        names = response.get("names") or {}
+        names = {k: v for k, v in names.items() if isinstance(k, str) and isinstance(v, str) and v}
+
+        changed = any(self._display_names.get(k) != v for k, v in names.items())
+        self._display_names.update(names)
+
+        if changed:
+            self.display_names_updated.emit()
+
+        return names
+
+    def change_display_name(self, display_name):
+        """Change THIS account's display name (not unique, 1-64 characters). Returns the
+        server's result dict ({"success": bool, "display_name": ..., "error": ...})."""
+
+        response = self.send_request(create_change_display_name_request_packet(display_name))
+
+        if response.get("success") and self.username:
+            self._display_names[self.username] = response.get("display_name") or display_name
+            self.display_names_updated.emit()
+
+        return response
 
     def fetch_bio(self, username):
         """
@@ -2779,6 +2859,8 @@ class ClientSession(QObject):
         (see create_message_history_request_packet()'s docstring).
         """
 
+        self.last_history_events = []
+
         if self.current_conversation_id is None:
             return []
 
@@ -2790,6 +2872,12 @@ class ClientSession(QObject):
         )
 
         messages = response.get("messages") or []
+
+        # Membership events (groups): kept beside the messages so the window can show them in order.
+        self.last_history_events = [
+            event for event in (self._clean_group_event(raw) for raw in response.get("events") or [])
+            if event is not None
+        ]
 
         history = []
 
@@ -3567,6 +3655,10 @@ class ClientSession(QObject):
 
             if message_id:
                 self.message_id_received.emit(identity_key, message_id)
+                if packet.get("reply_to_message_id"):
+                    self.reply_reference_received.emit(
+                        identity_key, message_id, str(packet["reply_to_message_id"])
+                    )
 
             return
 
@@ -3608,6 +3700,10 @@ class ClientSession(QObject):
 
         if message_id:
             self.message_id_received.emit(identity_key, message_id)
+            if packet.get("reply_to_message_id"):
+                self.reply_reference_received.emit(
+                    identity_key, message_id, str(packet["reply_to_message_id"])
+                )
 
     # Phase 16D -- Multi-Device Security Hardening + Device-Aware Peer
     # Identity: every peer-trust-state method below (_resolve_trusted_
@@ -4532,6 +4628,12 @@ class ClientSession(QObject):
         if device_id:
             self._device_scoped_identity_keys[username] = device_id
 
+        # A member this client skipped earlier only because it had never seen their identity, and
+        # who is ALREADY verified (a stored verification of the same identity), can be sent the
+        # key now. An unverified one stays skipped until it is explicitly verified.
+        if username in self._skipped_group_key_distributions and self._peer_key_is_verified(username):
+            self._retry_skipped_group_key_distributions(username)
+
         self.public_key_received.emit(username)
 
     def _is_verified_key_mismatch(self, username, raw_public_key):
@@ -4865,6 +4967,26 @@ class ClientSession(QObject):
 
         return entry["fingerprint"] if entry is not None else None
 
+    def get_own_fingerprint(self):
+        """
+        This account's OWN combined-identity safety number: the value another
+        person's app shows for this account (it is derived from the same two
+        public keys, in the same way, as get_peer_fingerprint_for_verification()
+        does for a peer). A user reads it to the person verifying them.
+
+        None if this session has no identity keys yet.
+        """
+
+        kem_public_key = getattr(self.key_manager, "public_key", None)
+        signer = getattr(self.key_manager, "ml_dsa", None)
+
+        if not kem_public_key or signer is None:
+            return None
+
+        return self._compute_combined_fingerprint(
+            kem_public_key, signer.export_public_key()
+        )
+
     def _currently_observed_peer_public_key(self, username, device_id=None):
         """
         Returns the raw public-key bytes confirm_peer_verification()
@@ -4982,6 +5104,65 @@ class ClientSession(QObject):
                 f"Re-requested recovery of {conversation_id} epoch "
                 f"{epoch} from {sender} now that they are verified"
             )
+
+    def _after_peer_verified(self, username):
+        """
+        What follows a genuine local verification of ``username`` (called only from the two
+        confirm_*_verification methods, i.e. only after the explicit, independently re-derived
+        fingerprint check succeeded -- never on its own):
+
+        * send the group keys this client holds but had skipped for them, and
+        * ask for the current key of every group they share with this client that this client
+          cannot yet read -- they may be the member who holds it, and they could not hand it over
+          before this client had verified them.
+
+        Both are best-effort and silent: a failed send loses nothing (the same happens again on the
+        next reconnect), and neither can make anyone trusted -- the key is still only wrapped for,
+        and accepted from, a VERIFIED identity.
+        """
+
+        username = username.split(self._DEVICE_IDENTITY_KEY_SEPARATOR, 1)[0]
+
+        self._retry_skipped_group_key_distributions(username)
+
+        if self.client_socket is None:
+            return
+
+        for summary in list(self.conversation_store.get_all()):
+            if not summary.is_group or username not in (summary.participants or []):
+                continue
+            if self.key_manager.has_key(summary.conversation_id):
+                continue
+            try:
+                send_message(self.client_socket, create_group_key_request_packet(summary.conversation_id))
+            except Exception as error:  # noqa: BLE001
+                self.logger.warning(f"Could not ask for the key of {summary.conversation_id}: {error}")
+
+    def _retry_skipped_group_key_distributions(self, member):
+        """Send ``member`` the group keys that were skipped for them (see
+        _skipped_group_key_distributions). Every condition _distribute_group_key() applies is
+        applied again, fresh: the key is still held, the group still lists them, and they are
+        verified now."""
+
+        pending = self._skipped_group_key_distributions.pop(member, None)
+
+        if not pending or self.client_socket is None:
+            return
+
+        for conversation_id, epoch in sorted(pending):
+            summary = self.conversation_store.get(conversation_id)
+            if summary is None or not summary.is_group or member not in (summary.participants or []):
+                continue
+            if not self.key_manager.has_key(conversation_id, epoch=epoch):
+                continue
+            try:
+                self._distribute_group_key(
+                    conversation_id, self.key_manager.get_key(conversation_id, epoch=epoch), epoch, [member]
+                )
+            except Exception as error:  # noqa: BLE001
+                self.logger.warning(
+                    f"Failed to send the group key for {conversation_id} to {member} after verification: {error}"
+                )
 
     def _retry_declined_redeliveries(self, recipient):
         """
@@ -5170,6 +5351,7 @@ class ClientSession(QObject):
 
         self._retry_pending_key_requests(username)
         self._retry_declined_redeliveries(username)
+        self._after_peer_verified(username)
 
     # ----------------------------------------------------------
     # ML-DSA identity/key-persistence foundation phase: combined
@@ -5547,6 +5729,7 @@ class ClientSession(QObject):
 
         self._retry_pending_key_requests(username)
         self._retry_declined_redeliveries(username)
+        self._after_peer_verified(username)
 
     # ----------------------------------------------------------
 
@@ -5909,6 +6092,8 @@ class ClientSession(QObject):
                     f"group key for {conversation_id} epoch {epoch}."
                 )
 
+                self._skipped_group_key_distributions.setdefault(member, set()).add((conversation_id, epoch))
+
                 continue
 
             # Server-Untrusted Identity Verification, Stage 3: same
@@ -5929,6 +6114,8 @@ class ClientSession(QObject):
                     f"epoch {epoch} to this member "
                     f"({self.get_peer_verification_state(member)})."
                 )
+
+                self._skipped_group_key_distributions.setdefault(member, set()).add((conversation_id, epoch))
 
                 continue
 
@@ -6216,6 +6403,11 @@ class ClientSession(QObject):
         departed_username = packet["username"]
         members = packet.get("members", [])
 
+        # (When it is this account that left or was removed, the conversation disappears from
+        # its view below, so there is nothing to show an event in.)
+        if departed_username != self.username:
+            self._emit_group_event(conversation_id, packet.get("event"))
+
         if departed_username == self.username:
 
             self.conversation_store.remove_conversation(conversation_id)
@@ -6301,9 +6493,46 @@ class ClientSession(QObject):
 
         self.conversation_store.add_or_update_group(conversation_id, name, participants)
 
+        for raw_event in packet.get("events") or []:
+            self._emit_group_event(conversation_id, raw_event)
+
         self.logger.info(
             f"Group {conversation_id} members updated: {members}"
         )
+
+    GROUP_EVENT_TYPES = ("member_added", "member_left", "member_removed")
+
+    def _clean_group_event(self, raw):
+        """A group membership event from the wire, validated -- or None if it is malformed.
+        Only the known structured fields are kept; nothing free-form is ever displayed."""
+
+        if not isinstance(raw, dict):
+            return None
+
+        event_type = raw.get("event_type")
+        event_id = raw.get("event_id")
+        subject = raw.get("subject")
+        actor = raw.get("actor")
+
+        if event_type not in self.GROUP_EVENT_TYPES:
+            return None
+
+        if not isinstance(event_id, str) or not event_id or not isinstance(subject, str) or not subject:
+            return None
+
+        return {
+            "event_id": event_id,
+            "event_type": event_type,
+            "actor": actor if isinstance(actor, str) and actor else None,
+            "subject": subject,
+            "timestamp": self._parse_incoming_timestamp(raw.get("timestamp")),
+        }
+
+    def _emit_group_event(self, conversation_id, raw):
+        event = self._clean_group_event(raw)
+
+        if event is not None:
+            self.group_event_received.emit(conversation_id, event)
 
     def handle_read_receipt_notification(self, packet):
         """
@@ -6660,7 +6889,7 @@ class ClientSession(QObject):
             packet
         )
 
-    def add_group_members(self, conversation_id, member_usernames):
+    def add_group_members(self, conversation_id, member_usernames, consent_invitations=False):
         """
         Ask the server to add one or more users to an existing group
         conversation (Issue 2 fix -- Add Members After Group
@@ -6675,6 +6904,7 @@ class ClientSession(QObject):
             sender=self.username,
             conversation_id=conversation_id,
             member_usernames=member_usernames,
+            consent_invitations=consent_invitations,
         )
 
         send_message(
@@ -6702,7 +6932,7 @@ class ClientSession(QObject):
             packet
         )
 
-    def create_group_conversation(self, name, member_usernames):
+    def create_group_conversation(self, name, member_usernames, consent_invitations=False):
         """
         Ask the server to create a new group conversation. The result
         (including this client's own confirmation) arrives
@@ -6716,6 +6946,7 @@ class ClientSession(QObject):
             sender=self.username,
             name=name,
             member_usernames=member_usernames,
+            consent_invitations=consent_invitations,
         )
 
         send_message(
@@ -6783,7 +7014,7 @@ class ClientSession(QObject):
 
         return response.get("notifications") or []
 
-    def respond_to_inbox(self, notification, approve):
+    def respond_to_inbox(self, notification, approve, consent_invitations=False):
         """
         Approve or deny one pending inbox notification (Phase 19.13).
 
@@ -6808,9 +7039,20 @@ class ClientSession(QObject):
         record + (if approved) the existing add-member path runs.
         """
 
-        if approve and notification.get("type") == "verification_request":
+        # A group invitation is approved like a verification request: approving is the explicit act that
+        # lets the inviter and this account trust each other, which is what lets the group key reach
+        # this account. The inviter's identity must have been observed by THIS client.
+        if approve and notification.get("type") in ("verification_request", "group_invitation"):
 
             requester_username = notification.get("requester_username")
+
+            # Approving would verify the NEW identity of someone whose key changed, which this
+            # client has never compared: refuse, and send nothing. They must be verified by hand.
+            if self.get_peer_verification_state(requester_username) == PEER_KEY_STATE_CHANGED:
+                raise PeerVerificationMismatchError(
+                    f"{requester_username}'s identity has changed since it was verified; verify "
+                    f"them again with Verify Identity before approving."
+                )
 
             fingerprint = self.get_peer_fingerprint_for_verification(requester_username)
 
@@ -6827,6 +7069,7 @@ class ClientSession(QObject):
             self.client_socket,
             create_inbox_response_packet(
                 notification_id=notification.get("notification_id"), approve=approve,
+                consent_invitations=consent_invitations,
             ),
         )
 
@@ -6852,7 +7095,7 @@ class ClientSession(QObject):
         does -- the user can still finish manually via Verify Identity.
         """
 
-        if notification.get("type") != "verification_request":
+        if notification.get("type") not in ("verification_request", "group_invitation"):
             return
         if notification.get("status") != "approved":
             return
@@ -6862,6 +7105,16 @@ class ClientSession(QObject):
         approver_username = notification.get("recipient_username")
 
         if not approver_username:
+            return
+
+        # A KEY_CHANGED identity is never re-trusted on someone else's say-so: its fingerprint here
+        # is the NEW, never-compared one, so completing the requester's half automatically would
+        # silently restore trust after a key change. The person must verify it again by hand.
+        if self.get_peer_verification_state(approver_username) == PEER_KEY_STATE_CHANGED:
+            self.logger.warning(
+                f"{approver_username} approved, but their identity changed since it was verified; "
+                f"it must be verified again by hand."
+            )
             return
 
         try:
