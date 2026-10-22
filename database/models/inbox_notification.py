@@ -15,6 +15,10 @@ no approval step). Backs two workflows with one shape:
   fingerprint it has already observed. This table only ever records
   who asked whom and what B decided.
 
+- group_invitation (2026-10-22): the group's admin invites a person; that person -- the recipient --
+  approves or denies in their own Inbox, and only an approval makes them a member. A non-admin's
+  group_add_request, once the admin approves it, becomes one of these as well.
+
 - group_add_request: a non-admin group member asks the group's admin
   to add a candidate. Approving runs the SAME server-side add-member +
   group-key-distribution path an admin's own direct add already uses
@@ -46,10 +50,15 @@ def _utc_now() -> datetime:
 
 TYPE_VERIFICATION_REQUEST = "verification_request"
 TYPE_GROUP_ADD_REQUEST = "group_add_request"
+# The group's admin invites someone: the INVITEE is the recipient and decides. Nobody becomes a member
+# of a group through this until they approve it in their own Inbox.
+TYPE_GROUP_INVITATION = "group_invitation"
 
 STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
 STATUS_DENIED = "denied"
+# A pending invitation that is no longer valid (too old, or the inviter is no longer in the group).
+STATUS_EXPIRED = "expired"
 
 
 class InboxNotification(Base):

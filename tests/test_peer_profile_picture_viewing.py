@@ -81,7 +81,7 @@ def test_view_peer_profile_picture_shows_real_uploaded_image(running_server, mon
         dialog = ProfilePictureDialog(bob, target_username=alice.username)
         try:
             assert dialog.is_own is False
-            assert dialog.windowTitle() == f"{alice.username}'s Profile Picture"
+            assert dialog.windowTitle() == f"{dialog._display_name}'s profile picture"
 
             # Read-only: no Change button reachable at all for a peer
             # -- Close is the only button in the whole dialog.
@@ -93,6 +93,7 @@ def test_view_peer_profile_picture_shows_real_uploaded_image(running_server, mon
             pixmap = dialog.preview_label.pixmap()
             assert pixmap is not None
             assert not pixmap.isNull()
+            assert not dialog.is_placeholder
         finally:
             dialog.close()
     finally:
@@ -110,8 +111,10 @@ def test_view_peer_profile_picture_gracefully_handles_no_picture_set(running_ser
     try:
         dialog = ProfilePictureDialog(bob, target_username=alice.username)
         try:
-            assert dialog.preview_label.text() == "No picture set"
+            assert dialog.is_placeholder
+            assert dialog.caption_label.text().endswith("hasn't added a profile picture.")
             assert dialog.status_label.text() == ""
+            assert not dialog.preview_label.pixmap().isNull()  # a placeholder, not an empty box
         finally:
             dialog.close()
     finally:
@@ -133,8 +136,8 @@ def test_own_profile_picture_dialog_unaffected_by_target_username_addition(runni
         dialog = ProfilePictureDialog(session)
         try:
             assert dialog.is_own is True
-            assert dialog.windowTitle() == "Profile Picture"
-            assert any(btn.text() == "Change" for btn in dialog.findChildren(QPushButton))
+            assert dialog.windowTitle() == "Profile picture"
+            assert any(btn.text() in ("Change picture", "Add a picture") for btn in dialog.findChildren(QPushButton))
         finally:
             dialog.close()
     finally:

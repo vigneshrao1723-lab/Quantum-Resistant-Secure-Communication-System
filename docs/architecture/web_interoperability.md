@@ -932,3 +932,85 @@ evidence-backed, documented decision rather than an unexamined default.
   polling/auto-refresh for the device list (a user must click "List
   devices" again to see a state change) -- consistent with this
   client's existing "deliberately plain" design philosophy throughout.
+
+## Messenger layout and Android-parity additions (2026-10-20)
+
+**Layout.** The app shell is a navigation rail, a conversation sidebar and the
+conversation pane (`index.html`, `style.css` "Messenger layout"). The rail holds
+the same elements the sidebar and top bar used to hold, moved rather than
+rewritten (`.tab-btn[data-tab]`, `#settingsToggleBtn`, `#logoutBtn`), and the
+connection status moved into the sidebar header, so every id and selector is
+unchanged. At 800 px and below one pane shows at a time and the rail becomes a
+bottom bar that is hidden while a conversation is open. On a phone, a
+*verified* peer's safety number collapses to one row (the number truncated, the
+three actions as icon buttons, a toggle to expand); an unverified or
+key-changed peer always keeps the full number and labelled actions.
+
+**Login form readiness.** `#connectBtn` and `#toggleModeBtn` start `disabled`
+and are enabled at the very end of `main.js`. `main.js` is an ES module with
+many imports; a click that arrived before its handlers were attached was lost
+silently (measured: 2 of 30 fresh page loads, 0 of 30 after the change).
+
+**New Web capabilities** (same packets and server handlers as Desktop/Android):
+bio (view/edit, peer profile card), leave group, add members to an existing
+group (admin adds directly; anyone else's request goes to the admin's Inbox),
+the `group_members_added` and self-`group_member_left` events, and the group
+key-rotation initiator (`group_key_rotation_required`: reuse the key already
+held for that epoch, distribute it to each VERIFIED member through the same
+KEM-then-DEM wrap as group creation, report completion). The Web client still
+keeps one key per conversation (the newest epoch) — see
+`feature_parity_matrix.md`.
+
+**Composer.** The message fields are auto-growing textareas: Enter sends
+(unless "Press Enter to send" is off), Shift+Enter inserts a line break.
+
+**Sidebar search.** The search box also holds the open chat's username (typing
+a username there opens that chat), so its text filters the lists only while it
+differs from the open chat's name and matches at least one existing
+conversation.
+
+**Teardown.** `web/gateway/gateway.py` now waits for its TCP reader thread and
+any in-flight send before closing the TLS socket (previously it closed it
+underneath them, which could kill the interpreter with a native access
+violation in `ssl.read`); `ClientSession.disconnect()` follows the same order.
+
+## Group key history, TLS tickets, gateway teardown, own safety number (2026-10-21)
+
+**Group key history.** The Web client used to keep one key per conversation (the newest epoch), so after a rotation
+every older group message was skipped as undecryptable. It now keeps every installed key by epoch
+(`WebClientSession.keyHistory`, persisted with the rest of the browser's encrypted state) and picks the key for a
+message by the message's own `epoch`, which is covered by the signature that is verified before any key is used. A
+late-arriving older key can no longer replace the key new messages are sent with. Limit: device key sync still sends
+only a conversation's current key, so a *newly linked* browser device cannot read pre-rotation history; and state
+saved before this change has no history, so only the current key is known until older keys are received again.
+
+**TLS session tickets.** The server no longer issues TLS 1.3 session tickets (`security/tls.py`). About 0.5% of
+first requests sent the instant a WebSocket opened went unanswered; removing the tickets removed the loss (0/2000
+against repeated failures without the change). The application never resumes TLS sessions, so nothing is given up.
+`tests/test_web_gateway_first_request.py` fails without the change and passes with it.
+
+**Gateway teardown.** The gateway used to wait for both directions to end; a browser that closed its WebSocket
+cleanly (Logout, closing the tab) left its server-side connection open, so the user stayed "online" to everyone else
+until some unrelated packet made a send fail. The connection now ends as soon as either direction ends
+(`tests/test_web_gateway_teardown.py`).
+
+**Own safety number.** Settings → Security shows the account's own safety number (`WebClientSession.ownFingerprint()`).
+
+## Desktop parity, chat tools, media and groups (2026-10-21)
+
+* **Chat settings menu.** The gear in the chat header opens a menu (a tool registry in `web/client/main.js`). The original buttons keep
+  their ids and handlers but are hidden; the menu entry dispatches the same click, so every earlier flow still works. Group chats get the
+  group tools role-limited (the server still decides). Verification status and the group Members control remain in the header.
+* **Verified line.** `safetyDetailsRequested` drives a compact "Verified" bar with Re-verify; the comparison and "Show my safety number"
+  are in the details. `sendMessage` / `sendAttachment` refuse a peer whose key changed until it is re-verified.
+* **Search.** The sidebar box filters the list; Enter or **Start chat** looks the person up (a phone number resolves to its account). A
+  conversation row exists only after a message is exchanged.
+* **Profile picture.** choose → validate (type, size, dimensions) → crop/zoom/position → 256 px square PNG → upload; the server validates
+  again from the header (`security/image_validation.py`). The avatar in the profile row and chat header opens the enlarged viewer.
+* **Voice recorder modal.** header, input level, timer, preview, Record again / Cancel / Send; same permission, cancel and error handling
+  and the same encrypted send path.
+* **Group attachments.** the group composer has the attach button, picker and recorder; messages ride the existing
+  `message + message_recipients` pipeline with the group key. **Group events** arrive as `group_event` packets and in history.
+* **Names.** `display_names_request` fills the display-name cache; the handle is shown beside a name only for namesakes.
+* **Gateway address** is a collapsed "Connection settings" field (default: the page's host; `?gateway=ws://…` accepted).
+* **Replies/reactions** use stable message ids; the server stamps the stored reference on relayed packets and drops cross-conversation ones.

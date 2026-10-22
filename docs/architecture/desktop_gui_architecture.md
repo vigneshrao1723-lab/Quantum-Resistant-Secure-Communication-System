@@ -148,3 +148,86 @@ at the top of every such test file) lets these run on a CI/headless
 machine with no real display attached — the widgets are still fully
 real, constructed, and laid out; only the final pixel presentation is
 skipped.
+
+## 10. Chat window layout (2026-10-20)
+
+`gui/chat_window.py` lays the window out as three regions, edge to edge:
+
+| Region | Widget | Contents |
+|---|---|---|
+| Navigation rail (72 px) | `QFrame#NavRail` | brand mark; Chats, Archived, Inbox (with a pending-request badge), Devices; Settings at the bottom |
+| Conversation sidebar (340 px) | `QFrame#Sidebar` | "Chats" title, New chat / New group, search box, filter menu (All, Unread, Direct, Groups), `ConversationListWidget` |
+| Conversation pane | `QFrame#MainPane` | one-row header (avatar, name, presence, verification state and actions, tools), message list, composer, status bar |
+
+Every control is the same widget object and handler as before the redesign
+(`find_user_button`, `new_group_button`, `inbox_button`,
+`account_settings_button`, `device_management_button`,
+`archived_toggle_button`); only their presentation changed. The rail buttons are
+icon-only `QToolButton`s that keep their label as `text()`. There is no "Calls"
+destination: no platform has a calling feature.
+
+Notes for maintainers:
+
+- **Colours** are the existing palette tokens in `gui/styles.py`; the new
+  `COLOR_SIDEBAR` / `COLOR_ACCENT_SOFT` match the Web client's `--sidebar-bg` /
+  `--accent-soft`, and `avatar_tone_color()` reproduces the Web client's
+  `avatarTone()` so a contact has the same colour on both.
+- **Icons** are drawn by `gui/icons.py` (QPainter strokes, accent on
+  hover/checked) instead of emoji.
+- **A QSS `min-/max-width/height` overrides `setFixedSize()`.** Buttons whose
+  size matters (`RailButton`, `ComposerButton`, `SendButton`) state it in the
+  stylesheet, otherwise a bottom-aligned layout shrinks them to their hint.
+- **Row heights** are measured after `ensurePolished()` (`_row_size_hint()`), and
+  the "message actions" button keeps its space while hidden, so a bubble's
+  footer never grows into its text after the row was measured.
+- **The composer** (`gui/input_bar.py::ComposerTextEdit`) is a `QPlainTextEdit`
+  that keeps the `QLineEdit` surface the rest of the app uses (`text()`,
+  `setText()`, `returnPressed`). Enter sends, Shift+Enter inserts a line break,
+  and it grows to six lines before scrolling.
+- Sidebar search/filter only narrows the already-loaded conversations; nothing
+  is sent to the server.
+
+## Packaged executable, accessibility and branding (2026-10-21)
+
+- **Windows executable.** `python scripts/build_desktop_exe.py` builds
+  `dist/desktop/QRSCS-Desktop/QRSCS-Desktop.exe` (PyInstaller, one folder). It contains the client only: no
+  `.env`, no private key, no database or server code (`scripts/qrscs_desktop.spec` excludes them and the build
+  script validates its own output). `config.py` is frozen-aware: bundled resources and the public CA certificate
+  come from the unpack directory, the operator-editable `.env` from beside the executable, and logs go to
+  `%LOCALAPPDATA%`. Running from source is unchanged.
+- **Assistive technology.** A list row is a `setItemWidget()` widget, which accessibility clients cannot look
+  inside, so message and conversation rows carry accessible text ("who, text, time" / "name, preview, N unread"),
+  kept current on edit, delete and unread changes. Login fields have accessible names. **Not solved:** buttons that
+  live inside list rows (Devices, Inbox, group member list) are still unreachable for assistive technology;
+  they work with the mouse and keyboard but cannot be driven through UI Automation (recorded in the parity matrix).
+- **Own safety number.** Settings shows the account's own safety number
+  (`ClientSession.get_own_fingerprint()`), which equals what a contact's app shows for it.
+- **Brand mark.** `gui/resources/logo.png` has been an empty file since the first commit; the login screen,
+  window and executable icon now use a mark drawn in code (`gui/icons.py::brand_pixmap()`: white padlock on the
+  accent square, as on the Website).
+
+## Website-parity pass: chat settings, profile pictures, media cards, replies, group events (2026-10-21)
+
+* **Header.** One avatar (a button that opens the enlarged picture viewer; a placeholder when there is none), the chat name, the
+  verification status ("Verified" + Re-verify, or Verify Identity), the group Members control (kept visible) and one **Chat settings**
+  icon. The old standalone profile icon is gone. `gui/chat_window.py` (`handle_open_chat_settings`, `_is_group_admin`).
+* **Chat settings** (`gui/chat_details_dialog.py`, `ChatDetailsDialog`): profile card, security card (verification status and key
+  change), group card (members; admin: Add members; other members: Request to add a member; Leave) and tools (search, pinned, media,
+  wallpaper, mark read, load history, mute, archive, block). The chosen tool runs after the dialog closes. The status bar now shows
+  only the connection; nothing about the contact.
+* **Verify Identity window** (`gui/verify_identity_dialog.py`): the contact's number and the comparison; "Show my safety number" is a plain
+  button that reveals the user's own number on demand. Settings no longer carries it.
+* **Settings** (`gui/account_settings_dialog.py`): profile row (round picture button, display name, handle, phone); the picture button
+  opens `ProfilePictureDialog`, the only place "Change picture" lives. Inline edit forms are `SettingsForm` frames with a
+  transparent background (no grey bands).
+* **Message parts** (`gui/message_parts.py`): `ReplyQuote` (author + excerpt or media label, resolved by stable message id, click/Enter
+  navigates, deleted/unavailable shown), `ReactionStrip` (one pill per emoji, counts, a person counts once), `MediaPlayerCard`
+  (play/pause icon, seekable progress, time, size, Save) playing from the decrypted bytes in a `QBuffer`; nothing is written to disk
+  for playback. `gui/message_widget.py` composes them for text, image, file, voice and video.
+* **Recorder** (`gui/media_recorder_dialog.py`): explicit formats (AAC/MP4 voice, H.264+AAC/MP4 video) so Chrome and Qt both decode
+  the result; permissions, cancel and error handling unchanged; sending is unchanged and encrypted.
+* **Names.** `client/session.py::display_name_for` gives every list, header, reply and group event the display name, with `@handle`
+  added where two people share one. Routing always uses the handle.
+* **Group events** render as centred system lines from the server's `group_events` (live and in history); their wording is built
+  client-side from the stored actor/member handles and names.
+* Packaging: the executable bundles QtMultimedia and the FFmpeg plugin (verified in `dist/desktop`).

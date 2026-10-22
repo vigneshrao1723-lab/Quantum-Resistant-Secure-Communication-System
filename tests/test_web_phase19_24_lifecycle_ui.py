@@ -35,6 +35,7 @@ from tests.test_web_browser_e2e import (  # noqa: F401 -- fixtures reused, not r
     _register,
     _wait_for,
     browser_page,
+    chat_tool,
     desktop_app,
     gateway_url,
     running_server,
@@ -63,6 +64,7 @@ def _verify_desktop_observes_browser(desktop_session, page, browser_username):
 
 def _verify_browser_observes_desktop(desktop_session, page):
     page.fill("#peerUsername", desktop_session.username)
+    page.press("#peerUsername", "Enter")
     assert _wait_for(lambda: desktop_session.username in page.inner_text("#fingerprintDisplay"))
     page.click("#confirmVerifiedBtn")
     assert _wait_for(lambda: "marked VERIFIED" in page.inner_text("#log"))
@@ -102,8 +104,17 @@ def _establish_key_in_browser(page, peer_username):
     establishSessionKey()'s own real production call path."""
 
     page.fill("#peerUsername", peer_username)
-    page.click("#establishKeyBtn")
-    assert _wait_for(lambda: f"Session key established with {peer_username}" in page.inner_text("#log"))
+    page.press("#peerUsername", "Enter")
+    # "Establish key" is offered only while there is no secure session with this person yet (once one
+    # exists the button is gone, as it is for a user); establishing is idempotent either way.
+    if page.locator("#establishKeyBtn").is_visible():
+        page.click("#establishKeyBtn")
+        assert _wait_for(lambda: f"Session key established with {peer_username}" in page.inner_text("#log"))
+    else:
+        assert page.evaluate(
+            f"(() => {{ const id = window.__session.directConversationIds.get({peer_username!r}); "
+            f"return !!id && window.__session.sessionKeys.has(id); }})()"
+        )
 
 
 # ========================================================================
@@ -429,6 +440,7 @@ def test_web_media_gallery_lists_a_received_image_and_voice_message(
         _verify_desktop_observes_browser(alice, page, bob_username)
 
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         alice.set_current_chat(
             ConversationSummary(conversation_id=None, username=bob_username, is_online=True, latest_message=None)
         )
@@ -453,7 +465,7 @@ def test_web_media_gallery_lists_a_received_image_and_voice_message(
         alice.send_attachment(str(voice_path))
         assert _wait_for(lambda: "Voice message" in page.inner_text("#messages"))
 
-        page.click("#galleryBtn")
+        chat_tool(page, "galleryBtn")
         assert _wait_for(lambda: page.evaluate("!!document.querySelector('.gallery-card')"))
         assert _wait_for(lambda: page.evaluate("!!document.querySelector('.gallery-thumb')"))
         assert "Voice message" in page.inner_text(".gallery-list")
@@ -486,6 +498,7 @@ def test_web_forwarding_a_voice_message_preserves_its_payload_type(
         _verify_desktop_observes_browser(alice, page, bob_username)
 
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         alice.set_current_chat(
             ConversationSummary(conversation_id=None, username=bob_username, is_online=True, latest_message=None)
         )
@@ -1175,7 +1188,7 @@ def test_web_setting_a_wallpaper_via_real_ui_applies_and_persists(
 
         assert "wallpaper-" not in (page.get_attribute("#messages", "class") or "")
 
-        page.click("#wallpaperBtn")
+        chat_tool(page, "wallpaperBtn")
         page.click(".bubble-context-menu >> text=Ocean")
 
         assert _wait_for(
@@ -1199,7 +1212,7 @@ def test_web_setting_a_wallpaper_via_real_ui_applies_and_persists(
         assert "wallpaper-ocean" in (page.get_attribute("#messages", "class") or "")
 
         # Reset to Default clears it.
-        page.click("#wallpaperBtn")
+        chat_tool(page, "wallpaperBtn")
         page.click(".bubble-context-menu >> text=Default")
         assert _wait_for(
             lambda: "wallpaper-" not in (page.get_attribute("#messages", "class") or "")
@@ -1246,7 +1259,7 @@ def test_web_message_search_via_real_ui_finds_navigates_and_closes(
 
         assert page.get_attribute("#searchBar", "hidden") is not None
 
-        page.click("#searchBtn")
+        chat_tool(page, "searchBtn")
         assert page.get_attribute("#searchBar", "hidden") is None
 
         page.fill("#searchInput", "world")
@@ -1333,8 +1346,9 @@ def test_web_pinning_via_context_menu_syncs_to_desktop_and_panel_navigates(
         assert _wait_for(lambda: len(pinned_events) == 1)
         assert pinned_events[0][1] == bob_username
 
+        # The marker names who pinned it -- "you" for the pinner's own view (display names, not handles).
         assert _wait_for(
-            lambda: bob_username in (page.evaluate(
+            lambda: "Pinned by you" in (page.evaluate(
                 "[...document.querySelectorAll('#messages .bubble')]"
                 ".find(b => b.dataset.text === 'pin me please')"
                 "?.querySelector('.bubble-pinned')?.textContent || ''"
@@ -1349,7 +1363,7 @@ def test_web_pinning_via_context_menu_syncs_to_desktop_and_panel_navigates(
             # showPinnedMessagesPanel() itself calls closeAnyOpenPopup()
             # first, so simply re-clicking replaces any stale popup from
             # a previous, too-early attempt.
-            page.click("#pinnedBtn")
+            chat_tool(page, "pinnedBtn")
             return page.evaluate(
                 "document.querySelector('.bubble-context-menu button')?.textContent || ''"
             ).startswith("pin me please")

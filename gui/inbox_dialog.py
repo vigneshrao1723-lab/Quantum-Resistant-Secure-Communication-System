@@ -28,10 +28,10 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
+    QWidget,
 )
 
 from gui.styles import COLOR_ACCENT, COLOR_DANGER, COLOR_ONLINE, COLOR_TEXT_MUTED
@@ -61,10 +61,30 @@ class InboxRow(QFrame):
 
         requester = notification.get("requester_username", "Someone")
         is_group_request = notification.get("type") == "group_add_request"
+        is_invitation = notification.get("type") == "group_invitation"
+        is_mine = requester == session.username
 
-        kind_label = QLabel(
-            "GROUP MEMBER REQUEST" if is_group_request else "VERIFICATION REQUEST"
-        )
+        def shown(handle):
+            lookup = getattr(session, "display_name_for", None)
+            try:
+                name = lookup(handle) if lookup and handle else None
+            except Exception:  # noqa: BLE001
+                name = None
+            return name if isinstance(name, str) and name else (handle or "someone")
+
+        group_name = notification.get("group_name") or "the group"
+        invitee = notification.get("recipient_username") or notification.get("candidate_username")
+
+        if is_invitation and is_mine:
+            title = "GROUP INVITATION SENT"
+        elif is_invitation:
+            title = "GROUP INVITATION"
+        elif is_group_request:
+            title = "GROUP MEMBER REQUEST"
+        else:
+            title = "VERIFICATION REQUEST"
+
+        kind_label = QLabel(title)
         kind_label.setTextFormat(Qt.PlainText)
         kind_label.setStyleSheet(
             f"color: {COLOR_ACCENT}; font-size: 9pt; font-weight: 700; "
@@ -72,14 +92,21 @@ class InboxRow(QFrame):
         )
         layout.addWidget(kind_label)
 
-        if is_group_request:
+        if is_invitation and is_mine:
+            text = f"You invited {shown(invitee)} to {group_name}"
+        elif is_invitation:
+            text = (
+                f"{shown(requester)} wants to add you to the group “{group_name}”. "
+                "You join only if you approve."
+            )
+        elif is_group_request:
             text = (
                 f"{requester} wants to add "
                 f"{notification.get('candidate_username', 'a member')} "
                 f"to {notification.get('group_name', 'the group')}"
             )
         else:
-            text = f"{requester} wants to verify their identity"
+            text = f"{shown(requester)} wants to verify their identity"
 
         body_label = QLabel(text)
         body_label.setTextFormat(Qt.PlainText)
@@ -102,13 +129,16 @@ class InboxRow(QFrame):
             button_row.setSpacing(8)
 
             approve_button = QPushButton("Approve")
+            approve_button.setObjectName("ApproveButton")
             approve_button.setCursor(Qt.PointingHandCursor)
+            approve_button.setAccessibleName(f"Approve: {text}")
             approve_button.clicked.connect(lambda: self._respond(True))
             button_row.addWidget(approve_button)
 
             deny_button = QPushButton("Deny")
-            deny_button.setObjectName("SecondaryButton")
+            deny_button.setObjectName("DenyButton")
             deny_button.setCursor(Qt.PointingHandCursor)
+            deny_button.setAccessibleName(f"Deny: {text}")
             deny_button.clicked.connect(lambda: self._respond(False))
             button_row.addWidget(deny_button)
 
@@ -117,11 +147,21 @@ class InboxRow(QFrame):
         else:
 
             resolved_color = COLOR_ONLINE if status == "approved" else COLOR_TEXT_MUTED
-            resolved_text = {
-                "approved": "Approved",
-                "denied": "Denied",
-                "pending": "Waiting for a response...",
-            }.get(status, status or "")
+            if is_invitation and is_mine:
+                who = shown(invitee)
+                resolved_text = {
+                    "approved": f"{who} approved and joined",
+                    "denied": f"{who} declined",
+                    "pending": f"Waiting for {who} to approve",
+                    "expired": "Expired — no longer valid",
+                }.get(status, status or "")
+            else:
+                resolved_text = {
+                    "approved": "Approved",
+                    "denied": "Denied",
+                    "pending": "Waiting for a response...",
+                    "expired": "Expired",
+                }.get(status, status or "")
             resolved_label = QLabel(resolved_text)
             resolved_label.setTextFormat(Qt.PlainText)
             resolved_label.setStyleSheet(
@@ -144,7 +184,7 @@ class InboxRow(QFrame):
         # requester truly isn't observed once this window elapses
         # (actually stale/offline), respond_to_inbox() below still
         # raises the exact same, unchanged error.
-        if approve and self.notification.get("type") == "verification_request":
+        if approve and self.notification.get("type") in ("verification_request", "group_invitation"):
             requester = self.notification.get("requester_username")
             if requester and not self.session.has_observed_combined_identity(requester):
                 self.status_label.setStyleSheet(
@@ -165,7 +205,12 @@ class InboxRow(QFrame):
                 )
 
         try:
-            self.session.respond_to_inbox(self.notification, approve)
+            # An admin approving someone's request to add a person INVITES that person (who must then
+            # approve too); an approved invitation adds the invitee.
+            self.session.respond_to_inbox(
+                self.notification, approve,
+                consent_invitations=self.notification.get("type") == "group_add_request",
+            )
         except Exception as error:  # noqa: BLE001
             self.status_label.setText(str(error))
             self.status_label.setVisible(True)
@@ -208,9 +253,27 @@ class InboxDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        self.list_widget = QListWidget()
-        self.list_widget.setSpacing(6)
-        layout.addWidget(self.list_widget)
+        # The cards are real child widgets in a scrolling column (not item widgets of a list), so a
+        # screen reader and UI automation can reach every Approve / Deny.
+        self.rows_holder = QWidget()
+        self.rows_holder.setObjectName("InboxRows")
+        self.rows_holder.setStyleSheet("QWidget#InboxRows { background: transparent; }")
+        self.rows_layout = QVBoxLayout(self.rows_holder)
+        self.rows_layout.setContentsMargins(0, 0, 6, 0)
+        self.rows_layout.setSpacing(8)
+        self.rows_layout.addStretch()
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("InboxScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet(
+            "QScrollArea#InboxScroll { background: transparent; border: none; }"
+            "QScrollArea#InboxScroll > QWidget > QWidget { background: transparent; }"
+        )
+        self.scroll.setWidget(self.rows_holder)
+        layout.addWidget(self.scroll, 1)
 
         self.error_label = QLabel("")
         self.error_label.setWordWrap(True)
@@ -228,9 +291,27 @@ class InboxDialog(QDialog):
     # Public Methods
     # ==========================================================
 
+    def rows(self):
+        """The cards currently shown, top to bottom."""
+
+        found = []
+        for index in range(self.rows_layout.count()):
+            widget = self.rows_layout.itemAt(index).widget()
+            if isinstance(widget, (InboxRow, QLabel)) and widget.isVisibleTo(self.rows_holder):
+                found.append(widget)
+        return found
+
+    def _clear_rows(self):
+        while self.rows_layout.count() > 1:  # the trailing stretch stays
+            item = self.rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.deleteLater()
+
     def refresh(self):
 
-        self.list_widget.clear()
+        self._clear_rows()
 
         try:
             notifications = self.session.load_inbox()
@@ -255,9 +336,11 @@ class InboxDialog(QDialog):
         sent = [n for n in notifications if n.get("requester_username") == my_username]
 
         if not actionable and not sent:
-            placeholder = QListWidgetItem("Nothing here yet.")
-            placeholder.setFlags(Qt.NoItemFlags)
-            self.list_widget.addItem(placeholder)
+            placeholder = QLabel("Nothing here yet.")
+            placeholder.setObjectName("InboxEmpty")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; padding: 28px 0;")
+            self.rows_layout.insertWidget(0, placeholder)
             return
 
         for notification in actionable + sent:
@@ -269,14 +352,9 @@ class InboxDialog(QDialog):
 
     def _add_row(self, notification):
 
-        item = QListWidgetItem()
-        self.list_widget.addItem(item)
-
         row = InboxRow(self.session, notification, self.refresh, self)
 
-        item.setSizeHint(row.sizeHint())
-
-        self.list_widget.setItemWidget(item, row)
+        self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
 
     # ==========================================================
     # Events

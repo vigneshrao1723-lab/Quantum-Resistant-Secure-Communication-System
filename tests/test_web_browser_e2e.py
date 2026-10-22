@@ -246,14 +246,30 @@ def browser_page(static_url):
         page.on("console", lambda msg: console_messages.append((msg.type, msg.text)))
         page.on("pageerror", lambda exc: page_errors.append(str(exc)))
         page.goto(static_url)
-        page.fill("#gatewayUrl", "")  # placeholder; real value set per-test before connecting
+        set_gateway(page, "")  # placeholder; real value set per-test before connecting
         yield {"page": page, "console": console_messages, "errors": page_errors}
         browser.close()
 
 
+GROUP_TOOLS = {"loadGroupHistoryBtn", "groupSearchBtn", "groupPinnedBtn", "groupGalleryBtn", "groupWallpaperBtn"}
+
+
+def set_gateway(page, url):
+    """The gateway address lives in the collapsed "Connection settings" on the login screen; the
+    input still holds the value the Connect button reads, so tests set it directly."""
+    page.evaluate("(u) => { document.getElementById('gatewayUrl').value = u; }", url)
+
+
+def chat_tool(page, tool_id):
+    """Run a chat tool the way a person does: open Chat settings, choose the item."""
+    gear = "#groupSettingsBtn" if tool_id in GROUP_TOOLS else "#chatSettingsBtn"
+    page.click(gear)
+    page.click(f'.bubble-context-menu [data-tool="{tool_id}"]')
+
+
 def _connect_browser(page_ctx, gateway_url, payload):
     page = page_ctx["page"]
-    page.fill("#gatewayUrl", gateway_url)
+    set_gateway(page, gateway_url)
     page.fill("#phoneNumber", payload["phone_number"])
     page.fill("#password", PASSWORD)
     page.click("#connectBtn")
@@ -295,6 +311,7 @@ def test_real_browser_end_to_end_desktop_and_browser_messaging(
         # --- Step 7: real fingerprint verification, via the real
         # browser UI (Bob observes Alice, compares, clicks confirm).
         page.fill("#peerUsername", alice.username)
+        page.press("#peerUsername", "Enter")
         assert _wait_for(
             lambda: alice.username in page.inner_text("#fingerprintDisplay"),
             attempts=200, interval=0.1,
@@ -376,9 +393,13 @@ def test_real_browser_end_to_end_desktop_and_browser_messaging(
         _open_direct(alice, bob_username)
         alice.send_chat_message("Hello from desktop")
 
+        # Attributed to Alice's account: the sender label shows her display name and carries
+        # her handle (display names are not unique; the handle is who sent it).
         assert _wait_for(
-            lambda: "alice" in page.inner_text("#messages").lower()
-            and "Hello from desktop" in page.inner_text("#messages"),
+            lambda: "Hello from desktop" in page.inner_text("#messages")
+            and page.evaluate(
+                "Array.from(document.querySelectorAll('#messages .bubble-sender')).map(e => e.dataset.handle)"
+            ).count(alice.username) >= 1,
             attempts=200, interval=0.1,
         )
 
@@ -406,7 +427,7 @@ def test_real_browser_login_rejected_with_wrong_password(gateway_url, browser_pa
     payload = _register("carol_")
     try:
         page = browser_page["page"]
-        page.fill("#gatewayUrl", gateway_url)
+        set_gateway(page, gateway_url)
         page.fill("#phoneNumber", payload["phone_number"])
         page.fill("#password", "WrongPassword!123")
         page.click("#connectBtn")

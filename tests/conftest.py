@@ -9,6 +9,7 @@ under test does) without ever persisting anything permanently, and
 without needing manual cleanup.
 """
 
+import sys
 import uuid
 
 import pytest
@@ -39,6 +40,48 @@ def db_session():
         session.close()
         outer_transaction.rollback()
         connection.close()
+
+
+@pytest.fixture(autouse=True)
+def _retire_chat_windows_of_finished_test():
+    """
+    Desktop GUI tests deliberately keep their ChatWindow objects alive after
+    the test body (``_KEEP_ALIVE``) so Qt never garbage-collects a window that
+    still has live socket threads. A window kept alive that way outlives its
+    own ClientSession, which the test's fixtures disconnect at teardown. A
+    message or error still in flight for it is then delivered on the NEXT
+    test's Qt event pump, fails against the disconnected session, and
+    ChatWindow.show_error() opens a modal QMessageBox.critical that nothing in
+    a headless run can dismiss -- hanging an unrelated test forever.
+
+    After each test, stop those finished-test windows from raising modals.
+    Only windows that already exist when the test ends are touched (so the
+    running test's own dialogs, patched or real, are unaffected), and nothing
+    is hidden, closed or destroyed.
+    """
+    yield
+
+    widgets = sys.modules.get("PySide6.QtWidgets")
+    chat_window = sys.modules.get("gui.chat_window")
+    if widgets is None or chat_window is None:
+        return
+    app = widgets.QApplication.instance()
+    if app is None:
+        return
+    for window in app.topLevelWidgets():
+        if not isinstance(window, chat_window.ChatWindow):
+            continue
+        if getattr(window, "_retired_by_test_teardown", False):
+            continue
+        window._retired_by_test_teardown = True
+        if "show_error" in vars(window):
+            # The test already replaced show_error on this window itself.
+            continue
+        try:
+            window.session.error_occurred.disconnect(window.show_error)
+        except (RuntimeError, TypeError):
+            pass
+        window.show_error = lambda message: None
 
 
 @pytest.fixture()

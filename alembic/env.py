@@ -11,9 +11,9 @@ from alembic import context
 # regardless of the working directory Alembic is invoked from.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config_server import DATABASE_URL  # noqa: E402
+from config_server import DATABASE_URL, MIGRATION_DATABASE_URL  # noqa: E402
 from database.models.base import Base  # noqa: E402
-from database.models import conversation, conversation_member, message, message_recipient, session, user  # noqa: E402,F401  (registers tables on Base.metadata)
+from database.models import conversation, conversation_member, group_event, message, message_recipient, session, user  # noqa: E402,F401  (registers tables on Base.metadata)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -27,7 +27,9 @@ if config.config_file_name is not None:
 # Single source of truth for the DB URL is config.py / .env, not alembic.ini.
 # '%' is escaped for configparser's interpolation (DB passwords are often
 # URL-encoded and may contain '%xx' sequences, e.g. '%40' for '@').
-config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
+# Migrations run as the schema-owning role when one is configured, so the
+# runtime role never needs DDL rights.
+config.set_main_option("sqlalchemy.url", (MIGRATION_DATABASE_URL or DATABASE_URL).replace("%", "%%"))
 
 # Reuse the application's existing SQLAlchemy Base metadata for autogenerate
 # support instead of maintaining a second, duplicate schema definition.

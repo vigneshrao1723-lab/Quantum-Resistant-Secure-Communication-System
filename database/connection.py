@@ -10,6 +10,12 @@ from sqlalchemy.orm import sessionmaker
 
 from config_server import DATABASE_URL
 
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Copy .env.example to .env and run "
+        "scripts/setup_database_roles.py (the server never falls back to a default login)."
+    )
+
 engine = create_engine(
     DATABASE_URL,
     future=True,

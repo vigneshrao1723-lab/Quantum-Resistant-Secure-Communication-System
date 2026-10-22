@@ -1,23 +1,124 @@
 """
 Input Bar
 
-Contains the message input field and send button.
+The conversation composer: an attachment button, a rounded multi-line message
+field that grows with its content, and a circular send button.
 """
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
-    QWidget,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
-    QLineEdit,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
 )
 
+from gui.icons import toolbar_icon
 from gui.media_recorder_dialog import MediaRecorderDialog
+from gui.styles import COLOR_ON_ACCENT, COLOR_TEXT_MUTED
 
 
-class InputBar(QWidget):
+class ComposerTextEdit(QPlainTextEdit):
+    """
+    Multi-line message field with the small slice of the QLineEdit API the rest
+    of the application already uses (``text()``, ``setText()``,
+    ``setCursorPosition()``, ``returnPressed``), so it is a drop-in replacement.
+
+    Enter sends (``returnPressed``); Shift+Enter inserts a line break. The field
+    is one line tall when empty and grows to ``MAX_LINES`` lines before it
+    starts scrolling, so a long message never hides the conversation above it
+    and a short one never wastes space.
+    """
+
+    returnPressed = Signal()
+
+    MAX_LINES = 6
+    _VERTICAL_PADDING = 4
+
+    def __init__(self):
+        super().__init__()
+
+        self.setObjectName("ComposerInput")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setTabChangesFocus(True)
+        self.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.document().setDocumentMargin(2)
+
+        self.textChanged.connect(self._fit_height)
+        self._fit_height()
+
+    # -- QLineEdit-compatible surface ----------------------------------------
+
+    def text(self):
+        return self.toPlainText()
+
+    def setText(self, text):
+        self.setPlainText(text or "")
+
+    def setCursorPosition(self, position):
+        cursor = self.textCursor()
+        cursor.setPosition(max(0, min(position, len(self.toPlainText()))))
+        self.setTextCursor(cursor)
+
+    def cursorPosition(self):
+        return self.textCursor().position()
+
+    # -- behaviour ------------------------------------------------------------
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (
+            event.modifiers() & Qt.ShiftModifier
+        ):
+            event.accept()
+            self.returnPressed.emit()
+            return
+
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_height()
+
+    def _fit_height(self):
+        line_height = self.fontMetrics().lineSpacing()
+        lines = int(self.document().documentLayout().documentSize().height())
+        lines = max(1, min(lines, self.MAX_LINES))
+        margin = int(self.document().documentMargin()) * 2
+        height = lines * line_height + margin + self._VERTICAL_PADDING
+
+        if self.height() != height or self.minimumHeight() != height:
+            self.setFixedHeight(height)
+
+        if lines >= self.MAX_LINES:
+            self.ensureCursorVisible()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._set_field_focus(True)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._set_field_focus(False)
+
+    def _set_field_focus(self, focused):
+        # The rounded field around this widget carries the visible focus
+        # ring -- see QFrame#ComposerField[focused="true"] in gui/styles.py.
+        field = self.parentWidget()
+        if field is None:
+            return
+        field.setProperty("focused", focused)
+        field.style().unpolish(field)
+        field.style().polish(field)
+
+
+class InputBar(QFrame):
     """
     Message input widget.
 
@@ -55,61 +156,52 @@ class InputBar(QWidget):
 
     def build_ui(self):
 
+        self.setObjectName("Composer")
+
         layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 10, 16, 12)
         layout.setSpacing(10)
+        layout.setAlignment(Qt.AlignBottom)
 
-        # ︎ (VS15, text presentation selector) keeps this rendering
-        # as a plain monochrome glyph -- without it, Windows renders
-        # U+1F4CE in its full-color emoji style, which reads as
-        # out of place next to the app's other flat, single-color
-        # icon glyphs (the arrows/gear elsewhere in this app).
-        self.attach_button = QPushButton("\U0001F4CE︎")
-
-        self.attach_button.setObjectName("IconButton")
-
-        self.attach_button.setFixedSize(44, 44)
-
-        self.attach_button.setStyleSheet("font-size: 20px;")
-
+        self.attach_button = QPushButton()
+        self.attach_button.setObjectName("ComposerButton")
+        self.attach_button.setIcon(toolbar_icon("attach"))
+        self.attach_button.setIconSize(QSize(22, 22))
+        self.attach_button.setFixedSize(40, 40)
         self.attach_button.setCursor(Qt.PointingHandCursor)
-
         self.attach_button.setToolTip("Attach a photo, file, voice, or video message")
+        self.attach_button.setAccessibleName("Attach")
+        self.attach_button.clicked.connect(self._handle_attach_clicked)
 
-        self.attach_button.clicked.connect(
-            self._handle_attach_clicked
+        field = QFrame()
+        field.setObjectName("ComposerField")
+        field.setProperty("focused", False)
+        field_layout = QHBoxLayout(field)
+        field_layout.setContentsMargins(16, 7, 14, 7)
+
+        self.message_input = ComposerTextEdit()
+        self.message_input.setPlaceholderText("Type a message...")
+        self.message_input.setAccessibleName("Message")
+        self.message_input.returnPressed.connect(self.send_message)
+        self.message_input.textChanged.connect(self._update_send_button_state)
+        field_layout.addWidget(self.message_input)
+
+        self.send_button = QPushButton()
+        self.send_button.setObjectName("SendButton")
+        self.send_button.setIcon(
+            toolbar_icon("send", color=COLOR_ON_ACCENT, active_color=COLOR_ON_ACCENT, disabled_color=COLOR_TEXT_MUTED)
         )
-
-        self.message_input = QLineEdit()
-
-        self.message_input.setPlaceholderText(
-            "Type a message..."
-        )
-
-        self.message_input.returnPressed.connect(
-            self.send_message
-        )
-
-        self.message_input.textChanged.connect(
-            self._update_send_button_state
-        )
-
-        self.send_button = QPushButton("Send")
-
-        self.send_button.setFixedHeight(44)
-
-        self.send_button.setFixedWidth(90)
-
+        self.send_button.setIconSize(QSize(20, 20))
+        self.send_button.setFixedSize(40, 40)
+        self.send_button.setCursor(Qt.PointingHandCursor)
+        self.send_button.setToolTip("Send (Enter)")
+        self.send_button.setAccessibleName("Send message")
         self.send_button.setEnabled(False)
+        self.send_button.clicked.connect(self.send_message)
 
-        self.send_button.clicked.connect(
-            self.send_message
-        )
-
-        layout.addWidget(self.attach_button)
-
-        layout.addWidget(self.message_input)
-
-        layout.addWidget(self.send_button)
+        layout.addWidget(self.attach_button, 0, Qt.AlignBottom)
+        layout.addWidget(field, 1)
+        layout.addWidget(self.send_button, 0, Qt.AlignBottom)
 
     # ==========================================================
     # Public Methods
@@ -132,7 +224,7 @@ class InputBar(QWidget):
 
         self.message_input.setText(text or "")
 
-        self.message_input.setCursorPosition(len(self.message_input.text()))
+        self.message_input.moveCursor(QTextCursor.End)
 
     def set_enabled(self, enabled):
         """
@@ -183,7 +275,7 @@ class InputBar(QWidget):
             self.message_input.text().strip()
         )
 
-        self.send_button.setEnabled(has_text)
+        self.send_button.setEnabled(has_text and self.message_input.isEnabled())
 
     def _handle_attach_clicked(self):
         """
@@ -196,13 +288,17 @@ class InputBar(QWidget):
         """
 
         menu = QMenu(self)
-        menu.addAction("\U0001F5BC️ Photo / File").setData("file")
-        menu.addAction("\U0001F3A4 Voice Message").setData("voice")
-        menu.addAction("\U0001F3AC Video Message").setData("video")
+        menu.addAction(toolbar_icon("gallery"), "Photo or file").setData("file")
+        menu.addAction(toolbar_icon("mic"), "Voice message").setData("voice")
+        menu.addAction(toolbar_icon("video"), "Video message").setData("video")
 
-        chosen = menu.exec(self.attach_button.mapToGlobal(
-            self.attach_button.rect().topLeft()
-        ))
+        # Open upward from the button so the menu never falls off the bottom
+        # of the screen (the composer sits at the very bottom of the window).
+        menu_height = menu.sizeHint().height()
+        origin = self.attach_button.mapToGlobal(self.attach_button.rect().topLeft())
+        origin.setY(origin.y() - menu_height - 6)
+
+        chosen = menu.exec(origin)
 
         if chosen is None:
             return

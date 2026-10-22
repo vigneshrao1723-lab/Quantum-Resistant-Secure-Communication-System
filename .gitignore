@@ -118,3 +118,6 @@ _audit/
 # runtime -- any *.keystore file in any directory is a local runtime
 # artifact, never source, never committed.
 *.keystore
+
+# Release archives built by scripts/package_release.py
+dist/

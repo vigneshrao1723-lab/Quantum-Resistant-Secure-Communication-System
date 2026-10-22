@@ -123,6 +123,22 @@ def _tcp_reader_thread(tcp_socket, loop, queue, stop_event):
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
 
+_TEARDOWN_WAIT_SECONDS = 3.0
+
+
+def _wait_for_socket_users(reader_thread, send_lock):
+    """Block (off the event loop) until the reader thread has exited and no
+    send is in flight, or the bounded wait runs out -- never forever."""
+
+    reader_thread.join(timeout=_TEARDOWN_WAIT_SECONDS)
+
+    if send_lock.acquire(timeout=_TEARDOWN_WAIT_SECONDS):
+        send_lock.release()
+
+    if reader_thread.is_alive():
+        logger.warning("TCP reader thread did not exit before the socket was closed.")
+
+
 async def _pump_tcp_to_websocket(websocket, queue):
     while True:
         packet = await queue.get()
@@ -136,7 +152,7 @@ async def _pump_tcp_to_websocket(websocket, queue):
             return
 
 
-async def _pump_websocket_to_tcp(websocket, tcp_socket):
+async def _pump_websocket_to_tcp(websocket, tcp_socket, send_lock):
     async for raw_text in websocket:
 
         if not isinstance(raw_text, str):
@@ -157,8 +173,14 @@ async def _pump_websocket_to_tcp(websocket, tcp_socket):
             logger.warning("Rejected a WebSocket frame that was not a JSON object.")
             continue
 
+        def _send_serialized(packet=packet):
+            # One send at a time, and visible to the teardown below, which
+            # must not close the socket while a send is still using it.
+            with send_lock:
+                send_message(tcp_socket, packet)
+
         try:
-            await asyncio.to_thread(send_message, tcp_socket, packet)
+            await asyncio.to_thread(_send_serialized)
         except (FrameTooLargeError, OSError) as error:
             logger.warning(f"Failed to relay a browser packet to the server: {error}")
             return
@@ -178,6 +200,7 @@ async def handle_browser_connection(websocket):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
     stop_event = threading.Event()
+    send_lock = threading.Lock()
 
     reader_thread = threading.Thread(
         target=_tcp_reader_thread,
@@ -186,20 +209,33 @@ async def handle_browser_connection(websocket):
     )
     reader_thread.start()
 
+    pump_to_browser = asyncio.ensure_future(_pump_tcp_to_websocket(websocket, queue))
+    pump_to_server = asyncio.ensure_future(_pump_websocket_to_tcp(websocket, tcp_socket, send_lock))
+
     try:
-        await asyncio.gather(
-            _pump_tcp_to_websocket(websocket, queue),
-            _pump_websocket_to_tcp(websocket, tcp_socket),
-        )
-    except ConnectionClosed:
-        pass
+        # Whichever direction ends first ends the whole connection. Waiting for BOTH (as this used
+        # to) left the server-side connection open after a browser closed its WebSocket cleanly
+        # (Logout, closing the tab): the user stayed "online" and the server kept the connection
+        # until some unrelated packet made a send fail.
+        await asyncio.wait({pump_to_browser, pump_to_server}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        for pump in (pump_to_browser, pump_to_server):
+            pump.cancel()
+        await asyncio.gather(pump_to_browser, pump_to_server, return_exceptions=True)
+
         stop_event.set()
 
         try:
             tcp_socket.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+
+        # shutdown() wakes the reader and fails any in-flight send, but they
+        # may still be INSIDE the TLS library. Closing the socket (and so
+        # releasing its TLS object) underneath a thread that is using it is a
+        # use-after-free that kills the whole interpreter with a native access
+        # violation on Windows, so wait for both to leave first.
+        await asyncio.to_thread(_wait_for_socket_users, reader_thread, send_lock)
 
         tcp_socket.close()
 

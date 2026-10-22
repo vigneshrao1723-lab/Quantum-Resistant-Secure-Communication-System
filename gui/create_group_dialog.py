@@ -58,7 +58,15 @@ class CreateGroupDialog(QDialog):
 
         layout.addWidget(self.name_input)
 
-        layout.addWidget(QLabel("Members (online users)"))
+        layout.addWidget(QLabel("People to invite"))
+        invite_hint = QLabel(
+            "Each person you check gets an invitation in their Inbox and joins only if they approve it. "
+            "Their secure connection is then set up automatically."
+        )
+        invite_hint.setObjectName("InviteHint")
+        invite_hint.setWordWrap(True)
+        invite_hint.setTextFormat(Qt.PlainText)
+        layout.addWidget(invite_hint)
 
         # UI Finalization Decision 2 -- find and add someone by phone
         # number, online or not, reusing FindUserDialog's exact lookup
@@ -199,8 +207,12 @@ class CreateGroupDialog(QDialog):
 
         self._add_member_row(username)
 
+        # Shown by name and handle (never the phone number), with where they stand: a group key only
+        # reaches someone this account has verified, and the invitation's approval does that.
+        verified = self.session.get_peer_verification_state(username) == "VERIFIED"
         self.search_status_label.setText(
-            f"Added {result['display_name']} (@{username}) -- check the box below to include them."
+            f"Found {result['display_name']} (@{username}) -- check the box below to invite them. "
+            + ("They are verified." if verified else "They will be verified when they approve your invitation.")
         )
 
         self.phone_search_input.clear()

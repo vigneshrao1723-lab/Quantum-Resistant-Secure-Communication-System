@@ -1,0 +1,50 @@
+table,name,area_or_date,files,passed,seconds
+batch,crypto_unit,Cryptography,25,421,65.2
+batch,device_security,Device and identity security,30,284,271.5
+batch,messaging_groups_a,Messaging and groups,28,354,479.5
+batch,messaging_groups_b1,Messaging and groups,11,177,154.2
+batch,messaging_groups_b2,Messaging and groups,11,194,96.8
+batch,mobile,Android client logic,20,104,97.2
+batch,desktop_gui,Desktop application,13,162,22.9
+batch,desktop_gui_b,Desktop application,15,127,83.5
+batch,desktop_gui_lifecycle_a,Desktop application,8,108,13.5
+batch,desktop_gui_lifecycle_b1,Desktop application,5,36,51.7
+batch,desktop_gui_lifecycle_b2,Desktop application,7,43,47.3
+batch,web_a,Website,9,44,105.3
+batch,web_b,Website,5,74,290.2
+batch,web_c,Website,6,45,188.8
+batch,media_interop,Media interoperability,1,15,20.4
+area,Messaging and groups,,,725,
+area,Desktop application,,,476,
+area,Cryptography,,,421,
+area,Device and identity security,,,284,
+area,Website,,,163,
+area,Android client logic,,,104,
+area,Media interoperability,,,15,
+growth,Start of the Desktop/Web completion work,2026-10-20,,1919,
+growth,After the executable and multi-user acceptance work,2026-10-21,,1957,
+growth,"After UI parity, media fixes, group events and attachments",2026-10-21,,2118,
+growth,After late-verification fixes and group invitations,2026-10-22,,2188,
+acceptance,sessions,,,5,
+acceptance,social,,,5,
+acceptance,pairs,,,4,
+acceptance,security_negative,,,4,
+acceptance,attachments,,,3,
+acceptance,message_lifecycle,,,2,
+acceptance,population,,,2,
+acceptance,confidentiality_scan,,,2,
+acceptance,groups,,,1,
+acceptance,devices,,,1,
+acceptance,concurrency,,,1,
+acceptance,desktop_exe_roundtrip,,,1,
+acceptance,reconnect,,,1,
+acceptance,registration_stress,,,1,
+new_tests,test_group_key_late_verification.py,,,9,
+new_tests,test_contact_request_approval_flow.py,,,8,
+new_tests,test_web_late_verification_and_approval.py,,,8,
+new_tests,test_web_group_member_lookup.py,,,6,
+new_tests,test_desktop_website_parity_fixes.py,,,14,
+new_tests,test_group_invitation_flow.py,,,12,
+new_tests,test_web_group_invitations.py,,,3,
+new_tests,test_desktop_group_invitations.py,,,3,
+new_tests,test_desktop_theme_and_navigation_parity.py,,,7,

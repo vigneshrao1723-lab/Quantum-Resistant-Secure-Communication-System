@@ -6,10 +6,12 @@ Application Entry Point
 
 import sys
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from gui.icons import brand_pixmap
 from gui.main_window import MainWindow
-from gui.styles import APP_STYLE
+from gui.styles import apply_theme
 
 
 def main():
@@ -19,9 +21,10 @@ def main():
 
     # Create the Qt application
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(brand_pixmap(256)))
 
-    # Apply the global stylesheet
-    app.setStyleSheet(APP_STYLE)
+    # Apply the global stylesheet and the theme (light, dark, or follow Windows -- Settings > Appearance)
+    apply_theme(app)
 
     # Create and display the main window
     window = MainWindow()

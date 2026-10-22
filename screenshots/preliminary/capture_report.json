@@ -1,0 +1,142 @@
+[
+  {
+    "shot": "website/01_login.png",
+    "ok": true
+  },
+  {
+    "shot": "website/02_register_form.png",
+    "ok": true
+  },
+  {
+    "shot": "website/03_login_error.png",
+    "ok": true
+  },
+  {
+    "shot": "website/04_signed_in_empty.png",
+    "ok": true
+  },
+  {
+    "shot": "website/05_unverified_contact_security_bar.png",
+    "ok": true
+  },
+  {
+    "shot": "website/06_conversation_verified.png",
+    "ok": true
+  },
+  {
+    "shot": "website/07_conversation_recipient_view.png",
+    "ok": true
+  },
+  {
+    "shot": "website/08_message_actions_menu.png",
+    "ok": true
+  },
+  {
+    "shot": "website/08b_chat_settings_menu.png",
+    "ok": true
+  },
+  {
+    "shot": "website/08c_verification_details_own_number.png",
+    "ok": true
+  },
+  {
+    "shot": "website/09_media_gallery.png",
+    "ok": true
+  },
+  {
+    "shot": "website/10a_group_invitations_waiting.png",
+    "ok": true
+  },
+  {
+    "shot": "website/10_group_conversation.png",
+    "ok": true
+  },
+  {
+    "shot": "website/11_group_info_and_management.png",
+    "ok": true
+  },
+  {
+    "shot": "website/12_inbox_verification_request.png",
+    "ok": true
+  },
+  {
+    "shot": "website/13_settings_profile_and_account.png",
+    "ok": true
+  },
+  {
+    "shot": "website/14_settings_linked_devices.png",
+    "ok": true
+  },
+  {
+    "shot": "website/15_dark_theme_settings.png",
+    "ok": true
+  },
+  {
+    "shot": "website/16_phone_login.png",
+    "ok": true
+  },
+  {
+    "shot": "website/17_phone_chat_list.png",
+    "ok": true
+  },
+  {
+    "shot": "website/18_phone_conversation.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/01_login.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/02_register_form.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/03_login_error.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/04_main_window_empty.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/05_find_user_dialog.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/06_chat_unverified_contact.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/07_verify_identity_dialog.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/08_conversation_verified.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/08b_chat_settings.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/09_settings_profile_and_account.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/10_devices_dialog.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/11_inbox_dialog.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/12_group_conversation.png",
+    "ok": true
+  },
+  {
+    "shot": "desktop/13_group_info_dialog.png",
+    "ok": true
+  }
+]

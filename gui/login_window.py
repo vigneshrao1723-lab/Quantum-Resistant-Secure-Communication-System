@@ -6,7 +6,6 @@ connect to the secure chat server.
 """
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
@@ -16,6 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.icons import brand_pixmap
 from gui.styles import COLOR_DANGER, COLOR_TEXT_MUTED
 from security.phone_number import is_valid_phone_number
 
@@ -74,18 +74,10 @@ class LoginWindow(QWidget):
 
         self.logo = QLabel()
 
-        pixmap = QPixmap("gui/resources/logo.png")
-
-        if not pixmap.isNull():
-
-            self.logo.setPixmap(
-                pixmap.scaled(
-                    64,
-                    64,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-            )
+        # Drawn, not loaded: gui/resources/logo.png has been an empty file since the
+        # first commit, which left this spot blank.
+        self.logo.setPixmap(brand_pixmap(48))
+        self.logo.setAccessibleName("Quantum-Resistant Secure Communication logo")
 
         self.logo.setAlignment(Qt.AlignCenter)
 
@@ -138,6 +130,8 @@ class LoginWindow(QWidget):
         self.username_label.setAlignment(Qt.AlignLeft)
 
         self.username_input = QLineEdit()
+        self.username_input.setObjectName("UsernameInput")
+        self.username_input.setAccessibleName("Username")
         self.username_input.setPlaceholderText(
             "Enter your username"
         )
@@ -164,6 +158,8 @@ class LoginWindow(QWidget):
         self.phone_label.setAlignment(Qt.AlignLeft)
 
         self.phone_input = QLineEdit()
+        self.phone_input.setObjectName("PhoneInput")
+        self.phone_input.setAccessibleName("Phone number")
         self.phone_input.setPlaceholderText(
             "+91 98765 43210"
         )
@@ -180,6 +176,8 @@ class LoginWindow(QWidget):
         password_label.setAlignment(Qt.AlignLeft)
 
         self.password_input = QLineEdit()
+        self.password_input.setObjectName("PasswordInput")
+        self.password_input.setAccessibleName("Password")
         self.password_input.setEchoMode(QLineEdit.Password)
         self.password_input.setPlaceholderText(
             "Enter your password"
@@ -197,6 +195,8 @@ class LoginWindow(QWidget):
         self.confirm_password_label.setAlignment(Qt.AlignLeft)
 
         self.confirm_password_input = QLineEdit()
+        self.confirm_password_input.setObjectName("ConfirmPasswordInput")
+        self.confirm_password_input.setAccessibleName("Confirm password")
         self.confirm_password_input.setEchoMode(QLineEdit.Password)
         self.confirm_password_input.setPlaceholderText(
             "Confirm your password"
@@ -235,6 +235,10 @@ class LoginWindow(QWidget):
         # L-1: show_connection_error() puts server-supplied error
         # text in here.
         self.status.setTextFormat(Qt.PlainText)
+
+        # A sentence such as "An account with this phone number already exists. Please log
+        # in." must wrap inside the card, not be clipped at its edge.
+        self.status.setWordWrap(True)
 
         self.status.setAlignment(Qt.AlignCenter)
 
@@ -333,6 +337,19 @@ class LoginWindow(QWidget):
         self.set_connecting(False)
 
         self.status.setText(f"Authentication failed: {message}")
+        self.status.setStyleSheet(
+            f"color: {COLOR_DANGER}; font-size: 9.5pt;"
+        )
+
+    def show_registration_error(self, message):
+        """
+        A refused registration, in the server's own words -- not prefixed with
+        "Authentication failed:", which describes a login and was misleading here.
+        """
+
+        self.set_connecting(False)
+
+        self.status.setText(message)
         self.status.setStyleSheet(
             f"color: {COLOR_DANGER}; font-size: 9.5pt;"
         )

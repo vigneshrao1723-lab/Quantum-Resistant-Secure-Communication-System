@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from client.session import PEER_KEY_STATE_CHANGED
-from gui.styles import COLOR_DANGER
+from gui.styles import COLOR_DANGER, COLOR_PANEL_ALT
 from storage.secure_key_store import KeyStoreError, PEER_STATE_VERIFIED
 
 
@@ -58,11 +58,23 @@ class VerifyIdentityDialog(QDialog):
         self.state = state
         self._verified = False
 
+        # People are shown by display name (not unique); everything below that addresses or
+        # verifies someone still uses the account handle, ``self.username``.
+        lookup = getattr(session, "display_name_for", None)
+        try:
+            shown = lookup(username) if lookup else None
+        except Exception:  # noqa: BLE001
+            shown = None
+        self.name = shown if isinstance(shown, str) and shown else username
+
         self._fingerprint = session.get_peer_fingerprint_for_verification(
             username
         )
 
         self.setWindowTitle("Verify Identity")
+
+        # Wide enough that the 16 fingerprint groups sit on two even rows.
+        self.setMinimumWidth(470)
 
         self.build_ui()
 
@@ -86,34 +98,34 @@ class VerifyIdentityDialog(QDialog):
             layout.addWidget(warning)
 
             explanation = QLabel(
-                f"The key now presented for {self.username} is "
+                f"The key now presented for {self.name} is "
                 f"DIFFERENT from the one you previously verified. "
-                f"This can mean {self.username} reinstalled the app or "
+                f"This can mean {self.name} reinstalled the app or "
                 f"switched devices -- or it can mean someone else is "
                 f"attempting to impersonate them. Protected "
-                f"communication with {self.username} is blocked until "
+                f"communication with {self.name} is blocked until "
                 f"you verify the new fingerprint below."
             )
 
         elif self.state == PEER_STATE_VERIFIED:
 
-            heading = QLabel(f"{self.username} is verified.")
+            heading = QLabel(f"{self.name} is verified.")
             heading.setStyleSheet("font-weight: 700;")
             layout.addWidget(heading)
 
             explanation = QLabel(
-                f"You can re-verify {self.username}'s current "
+                f"You can re-verify {self.name}'s current "
                 f"fingerprint below at any time."
             )
 
         else:
 
-            heading = QLabel(f"{self.username}'s identity is not verified.")
+            heading = QLabel(f"{self.name}'s identity is not verified.")
             heading.setStyleSheet("font-weight: 700;")
             layout.addWidget(heading)
 
             explanation = QLabel(
-                f"Secure messaging with {self.username} is unavailable "
+                f"Secure messaging with {self.name} is unavailable "
                 f"until you verify their identity."
             )
 
@@ -121,7 +133,7 @@ class VerifyIdentityDialog(QDialog):
         layout.addWidget(explanation)
 
         instructions = QLabel(
-            "Compare the fingerprint below with " + self.username +
+            "Compare the fingerprint below with " + self.name +
             " through a channel this application does not control -- "
             "read it aloud on a call, compare it in person, or any "
             "channel other than this app itself. Only confirm if it "
@@ -135,10 +147,49 @@ class VerifyIdentityDialog(QDialog):
         )
         self.fingerprint_label.setTextFormat(Qt.PlainText)
         self.fingerprint_label.setWordWrap(True)
+        # The one thing this dialog asks a person to compare by eye, so it
+        # gets a real fixed-width face (the bare ``monospace`` family does
+        # not resolve to one on Windows, which left it in the UI font) in a
+        # quiet inset panel, and can be selected for copying.
+        self.fingerprint_label.setObjectName("Fingerprint")
+        self.fingerprint_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.fingerprint_label.setStyleSheet(
-            "font-family: monospace; font-size: 13px; font-weight: 700;"
+            '#Fingerprint { font-family: "Cascadia Mono", "Consolas", '
+            '"Courier New", monospace; font-size: 11pt; font-weight: 600; '
+            f"padding: 10px 12px; border-radius: 10px; background: {COLOR_PANEL_ALT}; }}"
         )
         layout.addWidget(self.fingerprint_label)
+
+        # Your own number is what the other person compares THEIR screen against. It is not shown
+        # until asked for: it lives here, next to the comparison it is for, rather than as a
+        # standing panel in Settings.
+        self.show_own_button = QPushButton("Show my safety number")
+        self.show_own_button.setObjectName("SecondaryButton")
+        self.show_own_button.setCursor(Qt.PointingHandCursor)
+        self.show_own_button.clicked.connect(self._toggle_own_number)
+        layout.addWidget(self.show_own_button)
+
+        self.own_number_hint = QLabel(
+            f"Read this to {self.name} when they verify you. It should match the number their "
+            "app shows for you."
+        )
+        self.own_number_hint.setWordWrap(True)
+        self.own_number_hint.setVisible(False)
+        layout.addWidget(self.own_number_hint)
+
+        own = self.session.get_own_fingerprint()
+        self.own_fingerprint_label = QLabel(own if isinstance(own, str) and own else "Not available yet.")
+        self.own_fingerprint_label.setObjectName("OwnSafetyNumber")
+        self.own_fingerprint_label.setTextFormat(Qt.PlainText)
+        self.own_fingerprint_label.setWordWrap(True)
+        self.own_fingerprint_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.own_fingerprint_label.setStyleSheet(
+            '#OwnSafetyNumber { font-family: "Cascadia Mono", "Consolas", '
+            '"Courier New", monospace; font-size: 11pt; font-weight: 600; '
+            f"padding: 10px 12px; border-radius: 10px; background: {COLOR_PANEL_ALT}; }}"
+        )
+        self.own_fingerprint_label.setVisible(False)
+        layout.addWidget(self.own_fingerprint_label)
 
         self.confirm_button = QPushButton("Yes, This Matches -- Verify")
         self.confirm_button.setCursor(Qt.PointingHandCursor)
@@ -159,6 +210,14 @@ class VerifyIdentityDialog(QDialog):
     # ==========================================================
     # Events
     # ==========================================================
+
+    def _toggle_own_number(self, _checked=False):
+        # A plain button (not a checkable one) so assistive technology and UI automation can press it.
+        shown = self.own_fingerprint_label.isHidden()
+        self.show_own_button.setText("Hide my safety number" if shown else "Show my safety number")
+        self.own_number_hint.setVisible(shown)
+        self.own_fingerprint_label.setVisible(shown)
+        self.adjustSize()
 
     def handle_confirm(self):
 

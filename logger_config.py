@@ -3,6 +3,8 @@ Central Logging Configuration
 """
 
 import logging
+import os
+import sys
 from pathlib import Path
 
 
@@ -11,12 +13,22 @@ def setup_logger(logger_name, log_file):
     Create and return a configured logger.
     """
 
-    # Get the project root (where logger_config.py is located)
-    project_root = Path(__file__).resolve().parent
+    if getattr(sys, "frozen", False):
+        # A packaged app may live somewhere that is not writable (for
+        # example Program Files), so its logs go to per-user app data.
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        log_directory = (
+            Path(base) / "QuantumResistantSecureComms" / "logs"
+            if base
+            else Path.home() / ".qrscs" / "logs"
+        )
+    else:
+        # Get the project root (where logger_config.py is located)
+        project_root = Path(__file__).resolve().parent
 
-    # Create logs directory inside the project root
-    log_directory = project_root / "logs"
-    log_directory.mkdir(exist_ok=True)
+        # Create logs directory inside the project root
+        log_directory = project_root / "logs"
+    log_directory.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)

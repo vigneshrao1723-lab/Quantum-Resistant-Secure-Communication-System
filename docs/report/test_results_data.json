@@ -1,0 +1,65 @@
+{
+  "title": "QRSCS automated test results",
+  "run_date": "2026-10-22",
+  "branch": "work/desktop-web-completion-2026-10-20",
+  "environment": "Windows 11, Python 3.12 virtual environment, PostgreSQL 17, Google Chrome (Playwright), PySide6 6.9.1; official runner scripts/run_regression_batches.py",
+  "source_note": "Numbers are copied from the runner's own output of 2026-10-22 (first full run, then the reruns noted below). Nothing here is estimated.",
+  "batches": [
+    {"name": "crypto_unit",             "area": "Cryptography",               "files": 25, "passed": 421, "seconds": 65.2},
+    {"name": "device_security",         "area": "Device and identity security","files": 30, "passed": 284, "seconds": 271.5},
+    {"name": "messaging_groups_a",      "area": "Messaging and groups",       "files": 28, "passed": 354, "seconds": 479.5},
+    {"name": "messaging_groups_b1",     "area": "Messaging and groups",       "files": 11, "passed": 177, "seconds": 154.2},
+    {"name": "messaging_groups_b2",     "area": "Messaging and groups",       "files": 11, "passed": 194, "seconds": 96.8},
+    {"name": "mobile",                  "area": "Android client logic",       "files": 20, "passed": 104, "seconds": 97.2},
+    {"name": "desktop_gui",             "area": "Desktop application",        "files": 13, "passed": 162, "seconds": 22.9},
+    {"name": "desktop_gui_b",           "area": "Desktop application",        "files": 15, "passed": 127, "seconds": 83.5},
+    {"name": "desktop_gui_lifecycle_a", "area": "Desktop application",        "files": 8,  "passed": 108, "seconds": 13.5},
+    {"name": "desktop_gui_lifecycle_b1","area": "Desktop application",        "files": 5,  "passed": 36,  "seconds": 51.7},
+    {"name": "desktop_gui_lifecycle_b2","area": "Desktop application",        "files": 7,  "passed": 43,  "seconds": 47.3},
+    {"name": "web_a",                   "area": "Website",                    "files": 9,  "passed": 44,  "seconds": 105.3},
+    {"name": "web_b",                   "area": "Website",                    "files": 5,  "passed": 74,  "seconds": 290.2},
+    {"name": "web_c",                   "area": "Website",                    "files": 6,  "passed": 45,  "seconds": 188.8},
+    {"name": "media_interop",           "area": "Media interoperability",     "files": 1,  "passed": 15,  "seconds": 20.4}
+  ],
+  "batches_note": "Each row is the final passing run of that batch. web_a and web_b are the reruns (44 and 74 passed); the five desktop batches are the reruns after the last Desktop edit.",
+  "first_full_run": {
+    "passed": 2186, "failed": 1, "errors": 1, "total": 2188,
+    "note": "The first full run of 2026-10-22 had a page-load timeout in a web_a setup fixture and one web_b test whose Login button was still disabled. Each passed 3 of 3 alone and both batches passed in full on the rerun; treated as transient page-load stalls (not reproduced)."
+  },
+  "regression_totals": {"passed": 2188, "failed": 0, "errors": 0, "test_files": 194},
+  "growth": [
+    {"label": "Start of the Desktop/Web completion work", "date": "2026-10-20", "tests": 1919},
+    {"label": "After the executable and multi-user acceptance work", "date": "2026-10-21", "tests": 1957},
+    {"label": "After UI parity, media fixes, group events and attachments", "date": "2026-10-21", "tests": 2118},
+    {"label": "After late-verification fixes and group invitations", "date": "2026-10-22", "tests": 2188}
+  ],
+  "acceptance": {
+    "description": "UI-driven suite: the real Desktop executable and Chrome against an isolated deployment (tests/acceptance).",
+    "passed": 33, "failed": 0, "seconds": 371.77,
+    "modules": [
+      {"name": "sessions", "passed": 5}, {"name": "social", "passed": 5}, {"name": "pairs", "passed": 4},
+      {"name": "security_negative", "passed": 4}, {"name": "attachments", "passed": 3},
+      {"name": "message_lifecycle", "passed": 2}, {"name": "population", "passed": 2},
+      {"name": "confidentiality_scan", "passed": 2}, {"name": "groups", "passed": 1}, {"name": "devices", "passed": 1},
+      {"name": "concurrency", "passed": 1}, {"name": "desktop_exe_roundtrip", "passed": 1},
+      {"name": "reconnect", "passed": 1}, {"name": "registration_stress", "passed": 1}
+    ]
+  },
+  "new_tests_this_round": [
+    {"file": "test_group_key_late_verification.py", "tests": 9},
+    {"file": "test_contact_request_approval_flow.py", "tests": 8},
+    {"file": "test_web_late_verification_and_approval.py", "tests": 8},
+    {"file": "test_web_group_member_lookup.py", "tests": 6},
+    {"file": "test_desktop_website_parity_fixes.py", "tests": 14},
+    {"file": "test_group_invitation_flow.py", "tests": 12},
+    {"file": "test_web_group_invitations.py", "tests": 3},
+    {"file": "test_desktop_group_invitations.py", "tests": 3},
+    {"file": "test_desktop_theme_and_navigation_parity.py", "tests": 7}
+  ],
+  "not_covered": [
+    "Manual acceptance by a person (see docs/owner_manual_test_checklist.md)",
+    "A real microphone or camera (automated runs use synthetic signals and Chrome's fake devices)",
+    "Android on a physical device (sources preserved, not validated)",
+    "The executable on another computer, over a real network, or code-signed"
+  ]
+}

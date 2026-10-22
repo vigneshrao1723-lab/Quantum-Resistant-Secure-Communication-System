@@ -1,11 +1,16 @@
 """
 Status Bar Widget
 
-Displays the current connection status,
-active encryption algorithm, and logged-in user.
+Displays the connection status and the brief, self-clearing security notice.
+
+The encryption algorithm, the signed-in user and their phone number used to sit here on every
+screen. They are account / chat details, not status, so they now live where a person goes to look
+for them -- the Chat settings window (encryption) and Settings (name, handle, phone number). The
+widgets are still created (and kept up to date by ChatWindow) so those screens can read them, but
+they are not part of the bar's layout.
 """
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget,
     QLabel,
@@ -36,6 +41,9 @@ class StatusBarWidget(QWidget):
     of the chat window.
     """
 
+    # (connected) -- lets the window mirror the connection in its sidebar pill.
+    connection_changed = Signal(bool)
+
     def __init__(self):
         super().__init__()
 
@@ -57,11 +65,13 @@ class StatusBarWidget(QWidget):
     def build_ui(self):
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 6, 4, 6)
+        layout.setContentsMargins(16, 6, 16, 6)
 
         self.connection_label = QLabel(
             f"● Disconnected"
         )
+        self.connection_label.setObjectName("ConnectionStatus")
+        self.connection_label.setAccessibleName("Connection status: Disconnected")
         self.connection_label.setTextFormat(Qt.PlainText)
         self.connection_label.setStyleSheet(
             f"color: {COLOR_OFFLINE}; font-weight: 600; font-size: 9.5pt;"
@@ -109,13 +119,11 @@ class StatusBarWidget(QWidget):
 
         layout.addStretch()
 
-        layout.addWidget(self.algorithm_label)
-
-        layout.addSpacing(20)
-
-        layout.addWidget(self.phone_label)
-
-        layout.addWidget(self.user_label)
+        # Kept (parented, hidden) so ChatWindow can still record these values and the Chat
+        # settings / Settings screens can show them; see the module docstring.
+        for detail in (self.algorithm_label, self.phone_label, self.user_label):
+            detail.setParent(self)
+            detail.setVisible(False)
 
     # ==========================================================
     # Public Methods
@@ -126,13 +134,18 @@ class StatusBarWidget(QWidget):
         Update the connection status.
         """
 
+        self.connection_changed.emit(bool(connected))
+
         if connected:
             self.connection_label.setText("● Connected")
+            # The state is part of the accessible name so assistive technology reads it, not just "status".
+            self.connection_label.setAccessibleName("Connection status: Connected")
             self.connection_label.setStyleSheet(
                 f"color: {COLOR_ONLINE}; font-weight: 600; font-size: 9.5pt;"
             )
         else:
             self.connection_label.setText("● Disconnected")
+            self.connection_label.setAccessibleName("Connection status: Disconnected")
             self.connection_label.setStyleSheet(
                 f"color: {COLOR_OFFLINE}; font-weight: 600; font-size: 9.5pt;"
             )

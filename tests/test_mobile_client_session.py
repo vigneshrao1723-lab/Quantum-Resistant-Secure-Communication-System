@@ -534,6 +534,7 @@ def test_mobile_web_direct_messaging_bidirectional(running_server, gateway_url, 
 
         # The browser observes+verifies mobile, through the real UI.
         page.fill("#peerUsername", mobile.username)
+        page.press("#peerUsername", "Enter")
         assert _wait_for(lambda: mobile.username in page.inner_text("#fingerprintDisplay"))
         page.click("#confirmVerifiedBtn")
         assert _wait_for(lambda: "marked VERIFIED" in page.inner_text("#log"))

@@ -15,6 +15,7 @@ from database.models.blocked_user import BlockedUser
 from database.models.conversation import Conversation
 from database.models.conversation_member import ConversationMember
 from database.models.device import Device
+from database.models.group_event import GroupEvent
 from database.models.inbox_notification import InboxNotification
 from database.models.message import Message
 from database.models.message_hidden_for_user import MessageHiddenForUser
@@ -29,6 +30,7 @@ __all__ = [
     "Conversation",
     "ConversationMember",
     "Device",
+    "GroupEvent",
     "InboxNotification",
     "Message",
     "MessageHiddenForUser",

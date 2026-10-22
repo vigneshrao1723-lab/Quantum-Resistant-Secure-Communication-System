@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
 )
 
-from gui.styles import COLOR_ACCENT, COLOR_OFFLINE, COLOR_ONLINE, COLOR_TEXT_MUTED
+from gui.styles import COLOR_ACCENT, COLOR_OFFLINE, COLOR_ON_ACCENT, COLOR_ONLINE, COLOR_TEXT_MUTED
 
 
 class UserRow(QWidget):
@@ -41,7 +41,7 @@ class UserRow(QWidget):
         avatar.setFixedSize(34, 34)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(
-            f"background-color: {COLOR_ACCENT}; color: #FFFFFF; "
+            f"background-color: {COLOR_ACCENT}; color: {COLOR_ON_ACCENT}; "
             "border-radius: 17px; font-weight: 700;"
         )
 

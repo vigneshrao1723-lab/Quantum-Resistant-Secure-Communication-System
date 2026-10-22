@@ -27,3 +27,13 @@ quickjs==1.19.4
 # for tests/test_web_browser_e2e.py -- no Playwright-managed browser
 # download is used or required. Not used by any production code.
 playwright==1.62.0
+
+# --- Windows Desktop executable (scripts/build_desktop_exe.py) ---
+# Packages the Desktop client into a one-folder Windows build. Build-time
+# only: nothing here is imported by the application at run time.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+setuptools==84.2.0

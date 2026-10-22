@@ -185,41 +185,60 @@ def create_chat_packet(
 def create_group_create_packet(
     sender,
     name,
-    member_usernames
+    member_usernames,
+    consent_invitations=False,
 ):
     """
     Ask the server to create a new group conversation. No existing
     packet performs this operation, so this is genuinely new rather
     than a duplicate of anything in the payload pipeline.
+
+    ``consent_invitations`` (additive; a client that does not send it behaves exactly as before): the
+    listed people are INVITED instead of added -- each gets an inbox item and becomes a member only
+    by approving it. See server/client_handler.py::handle_group_create().
     """
 
-    return {
+    packet = {
         "type": "group_create",
         "sender": sender,
         "name": name,
         "members": member_usernames
     }
 
+    if consent_invitations:
+        packet["consent_invitations"] = True
+
+    return packet
+
 
 def create_group_create_result_packet(
     conversation_id,
     name,
     creator,
-    members
+    members,
+    pending_invitations=None,
 ):
     """
     Confirm a group's creation to every currently connected member
     (including the creator), so each client's sidebar and (for the
     creator) group-key distribution can proceed.
+
+    ``pending_invitations`` (additive): the handles that were invited and have not yet approved, when
+    the group was created with consent invitations.
     """
 
-    return {
+    packet = {
         "type": "group_create_result",
         "conversation_id": conversation_id,
         "name": name,
         "creator": creator,
         "members": members
     }
+
+    if pending_invitations is not None:
+        packet["pending_invitations"] = pending_invitations
+
+    return packet
 
 
 def create_group_key_distribution_packet(
@@ -305,7 +324,7 @@ def create_group_leave_packet(sender, conversation_id):
     }
 
 
-def create_group_member_left_packet(conversation_id, username, members):
+def create_group_member_left_packet(conversation_id, username, members, event=None):
     """
     Notify every former member of a group -- both the ones remaining
     and the one who just left -- that `username` left (Phase 7 --
@@ -315,14 +334,24 @@ def create_group_member_left_packet(conversation_id, username, members):
     conversation from its own view -- this doubles as that member's
     only confirmation their leave succeeded, no separate ack packet
     needed. `members` is the remaining active members' usernames.
+
+    `event` (additive) is the server-recorded membership event for this change -- see
+    database/models/group_event.py: {event_id, event_type ("member_left"/"member_removed"),
+    actor, subject, timestamp}. It is built by the server from authenticated identities, never
+    from the request, so a client may render it but can never forge one.
     """
 
-    return {
+    packet = {
         "type": "group_member_left",
         "conversation_id": conversation_id,
         "username": username,
         "members": members
     }
+
+    if event is not None:
+        packet["event"] = event
+
+    return packet
 
 
 def create_group_key_rotation_required_packet(conversation_id, epoch, members):
@@ -394,6 +423,26 @@ def create_direct_key_recovery_request_packet(conversation_id, epochs):
     }
 
 
+def create_group_key_request_packet(conversation_id):
+    """
+    Client -> server: I am an active member of this group but do not hold its current key (for
+    example because the member who distributes it had not yet verified me, or I had not yet
+    verified them, when it was first sent); please ask a connected member to send it again.
+
+    Carries no key material and no identity: the server derives the requester from the
+    authenticated connection and checks active membership itself, then reuses the existing
+    group_key_rotation_required instruction -- see server/client_handler.py::
+    handle_group_key_request(). Whether anything is actually delivered is still decided by the
+    holder's own verification of the requester and the receiver's of the holder; this request
+    only asks again.
+    """
+
+    return {
+        "type": "group_key_request",
+        "conversation_id": conversation_id,
+    }
+
+
 def create_direct_key_redelivery_required_packet(conversation_id, epoch, recipient):
     """
     Server -> the currently-connected partner of a DIRECT conversation:
@@ -449,7 +498,7 @@ def create_group_key_rotation_complete_packet(conversation_id, epoch):
     }
 
 
-def create_group_add_members_packet(sender, conversation_id, member_usernames):
+def create_group_add_members_packet(sender, conversation_id, member_usernames, consent_invitations=False):
     """
     Ask the server to add one or more users to an existing group
     conversation (real-application bug fix, Issue 2 -- Add Members
@@ -459,15 +508,21 @@ def create_group_add_members_packet(sender, conversation_id, member_usernames):
     other group packets, exactly like `group_leave`'s `sender` field.
     """
 
-    return {
+    packet = {
         "type": "group_add_members",
         "sender": sender,
         "conversation_id": conversation_id,
         "members": member_usernames
     }
 
+    # Additive: invite instead of add -- each person becomes a member only by approving in their Inbox.
+    if consent_invitations:
+        packet["consent_invitations"] = True
 
-def create_group_members_added_packet(conversation_id, name, members):
+    return packet
+
+
+def create_group_members_added_packet(conversation_id, name, members, events=None):
     """
     Notify every active member of a group -- both the ones who were
     already there and the ones just added -- of its current,
@@ -479,14 +534,22 @@ def create_group_members_added_packet(conversation_id, name, members):
     latest_message if it did, creates a fresh entry if it didn't), so
     one packet shape serves both audiences with no client-side branch.
     `members` is the complete, updated active-member username list.
+
+    `events` (additive) is the list of server-recorded "member_added" events for this change (one
+    per person added) -- see create_group_member_left_packet()'s note on `event`.
     """
 
-    return {
+    packet = {
         "type": "group_members_added",
         "conversation_id": conversation_id,
         "name": name,
         "members": members
     }
+
+    if events:
+        packet["events"] = events
+
+    return packet
 
 
 def create_read_receipt_packet(conversation_id):
@@ -975,7 +1038,7 @@ def create_message_history_request_packet(conversation_id, is_group):
     }
 
 
-def create_message_history_result_packet(request_id, messages=None, error=None):
+def create_message_history_result_packet(request_id, messages=None, error=None, events=None):
     """
     Server -> client: the result of a message_history_request (D4.3).
     ``messages`` is a list of plain dicts, one per stored message,
@@ -993,14 +1056,22 @@ def create_message_history_result_packet(request_id, messages=None, error=None):
     to read it directly from local blob storage. request_id is echoed
     from the request so ClientSession.send_request()'s pending
     correlation resolves.
+
+    `events` (additive, groups only) are the membership events this member may see, oldest first
+    -- {event_id, event_type, actor, subject, timestamp} -- to be shown in order among the messages.
     """
 
-    return {
+    packet = {
         "type": "message_history_result",
         "request_id": request_id,
         "messages": messages,
         "error": error
     }
+
+    if events:
+        packet["events"] = events
+
+    return packet
 
 
 def create_blob_download_request_packet(message_id):
@@ -1805,7 +1876,7 @@ def create_inbox_list_result_packet(request_id, notifications):
     }
 
 
-def create_inbox_response_packet(notification_id, approve):
+def create_inbox_response_packet(notification_id, approve, consent_invitations=False):
     """
     The recipient's decision on one pending inbox notification.
     ``approve`` True/False -- server-side handling differs by the
@@ -1818,11 +1889,18 @@ def create_inbox_response_packet(notification_id, approve):
     ever records/propagates that outcome.
     """
 
-    return {
+    packet = {
         "type": "inbox_response",
         "notification_id": notification_id,
         "approve": approve,
     }
+
+    # Additive: an admin approving a group_add_request invites the candidate (who must then approve
+    # too) instead of adding them at once.
+    if consent_invitations:
+        packet["consent_invitations"] = True
+
+    return packet
 
 
 def create_inbox_notification_packet(notification):
@@ -1961,6 +2039,40 @@ def create_change_bio_result_packet(request_id, success, error=None):
         "type": "change_bio_result",
         "request_id": request_id,
         "success": success,
+        "error": error,
+    }
+
+
+# ------------------------------------------------------------------
+# Display names. users.username is the account's unique internal handle
+# (what every packet routes on); users.display_name is the name a person
+# chose and is NOT unique -- two people may both be "Vignesh". Clients
+# show display names and keep routing by handle.
+# ------------------------------------------------------------------
+
+MAX_DISPLAY_NAME_LOOKUP = 200
+MAX_DISPLAY_NAME_LENGTH = 64
+
+
+def create_display_names_request_packet(usernames):
+    return {"type": "display_names_request", "usernames": list(usernames)}
+
+
+def create_display_names_result_packet(request_id, names):
+    """``names`` maps handle -> display name for the handles that exist."""
+    return {"type": "display_names_result", "request_id": request_id, "names": names}
+
+
+def create_change_display_name_request_packet(display_name):
+    return {"type": "change_display_name_request", "display_name": display_name}
+
+
+def create_change_display_name_result_packet(request_id, success, display_name=None, error=None):
+    return {
+        "type": "change_display_name_result",
+        "request_id": request_id,
+        "success": success,
+        "display_name": display_name,
         "error": error,
     }
 

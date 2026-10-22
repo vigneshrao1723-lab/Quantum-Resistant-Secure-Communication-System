@@ -375,3 +375,404 @@ unavailable-hardware limitation.
 **Net effect on the matrix**: none of the above changes any row's
 Status. Tally remains 36 PASS, 4 PARTIAL, 0 NOT IMPLEMENTED, 0
 fabricated evidence.
+
+## Reconfirmation — 2026-10-19 (final engineering window)
+
+Every row above was re-checked against the current working tree by running
+the project's own regression batches (`scripts/run_regression_batches.py`'s
+batch definitions) against the real server, the real PostgreSQL database and a
+real Chrome (Playwright), and by a live run of the actual launcher (`run.py`).
+Nothing was mocked at a security boundary. Evidence is limited to what ran:
+
+**Environment.** Python 3.12.10 in a clean virtualenv built from
+`requirements.txt`'s pins (PySide6 6.9.1, Kivy 2.3.1, pytest 8.4.2, Playwright
+1.62.0, quickjs 1.19.4), PostgreSQL 17 (Alembic head `d3f7b9c2e5a1`, no
+migration run), Windows 11. The README's documented interpreter is 3.12; the
+machine's default Python 3.14 with PySide6 6.12 is *not* a supported
+combination (two batches exited `0xC0000409` at interpreter shutdown after every
+test had passed, and Kivy/quickjs were absent) and was not used for acceptance.
+
+| Batch | Files | Passed | Failed | Skipped | Exit |
+|---|---|---|---|---|---|
+| crypto_unit | 22 | 381 | 0 | 0 | 0 |
+| device_security | 27 | 253 | 0 | 0 | 0 |
+| messaging_groups_a | 22 | 302 | 0 | 0 | 0 |
+| messaging_groups_b1 | 11 | 177 | 0 | 0 | 0 |
+| messaging_groups_b2 | 11 | 194 | 0 | 0 | 0 |
+| mobile | 20 | 104 | 0 | 0 | 0 |
+| desktop_gui | 16 | 177 | 0 | 0 | 0 |
+| desktop_gui_lifecycle_a | 8 | 107 | 0 | 0 | 0 |
+| desktop_gui_lifecycle_b1 | 5 | 36 | 0 | 0 | 0 |
+| desktop_gui_lifecycle_b2 | 7 | 43 | 0 | 0 | 0 |
+| web | 7 | 66 | 0 | 0 | 0 |
+| **Total** | **156** | **1840** | **0** | **0** | |
+
+Four test files (`test_epoch_reservation_request_response.py`,
+`test_phase19_23_ux_fixes.py`, `test_phase19_24_desktop_media_gallery.py`,
+`test_phase19_24_typing_indicator.py`) were in no batch and so never ran under
+the documented procedure; they are now included.
+
+**Defects found and fixed this pass** (none in a security control):
+
+- *Test-harness hang (root cause of the long-documented "Desktop GUI batch
+  hangs").* A ChatWindow kept alive by an earlier test received a late
+  message/error after its session was torn down, and `ChatWindow.show_error()`
+  opened a modal `QMessageBox` that nothing headless can dismiss. Fixed with an
+  autouse fixture in `tests/conftest.py` that retires finished-test windows,
+  and `test_phase19_24_desktop_block.py` now asserts the "User is offline"
+  report itself (and that it never reveals the block). `desktop_gui_lifecycle_b2`
+  went from a 900s timeout to 35s; the media-gallery file, documented as
+  unrunnable as a whole, now passes 6/6.
+- *Desktop message bubbles:* the footer painted an opaque band (white-on-white
+  timestamp/read tick on sent bubbles) and the last text line of a wrapped
+  message collided with it, because the hidden "message actions" button changed
+  the footer height after the row was measured. Fixed in `gui/message_widget.py`.
+- *Web contrast:* placeholder text (2.9–3.3:1), sent-bubble timestamps
+  (3.7:1) and white-on-accent text in dark mode (3.5:1) raised to >= 4.5:1 via
+  design tokens only.
+
+**Web batch stability.** The 7-file web batch passed 66/66 on three full runs
+(the last two with the machine held awake). Two further
+full runs failed 2/66 and 1/66 (different tests each time, all at the shared
+"peer public key received" wait), and the same test failed identically on an
+unmodified export of HEAD run under the same conditions, so the failures are
+not attributable to this pass's changes. The failed tests passed when rerun
+in isolation (two of them 3/3). The laptop (on battery, 10-minute idle sleep) was observed to
+sleep and resume several times mid-run -- one earlier web run stalled for 25
+minutes across such events -- so this is recorded as an environmental timing
+sensitivity that was mitigated (system held awake), not proven fixed.
+
+**Live stack.** `run.py` started the TLS server (:5000), web gateway (:8765),
+static web client (:8000) and the Desktop app; the Desktop window was
+responsive; a real Desktop `ClientSession` and a real Chrome session
+authenticated, verified each other's identity, established an ML-KEM session
+key and exchanged messages in both directions with no console or page errors.
+
+**Android.** A debug APK was rebuilt from the current source (sanitized copy:
+no `.env`, `.git` or private keys; patched python-for-android checkout as used
+by the earlier builds): `org.qrscs.qrscs_mobile` 0.1.0 (versionCode 1024100),
+minSdk 24, targetSdk 36, arm64-v8a, permissions INTERNET/RECORD_AUDIO/CAMERA,
+29,544,821 bytes, SHA-256
+`8bb5bb9c42cedbac926b689c9ab6fe206ebba9b94136c455c1764fb4047597b1`. The package
+contains no `.env`/key material and only the public `certs/dev/ca.crt`. **No
+Android device or emulator was attached** (`adb devices -l` empty), so nothing
+about this build was installed or run; the 104 `mobile` software tests above
+are the only evidence for it, and rows 13, 14, 37 and 38 keep their PARTIAL
+status.
+
+**Net effect on the matrix:** none. Tally remains 36 PASS, 4 PARTIAL
+(13/14/37/38, Android voice/video physical validation), 0 NOT IMPLEMENTED.
+
+## Reconfirmation — 2026-10-20 (security hygiene, parity and stability pass)
+
+No row's status above changes: tally remains **36 PASS, 4 PARTIAL** (13, 14, 37,
+38 — Android voice/video, still unvalidated on a physical device, which is
+deferred), 0 NOT IMPLEMENTED. This section records what changed in the
+security posture of the project and the evidence for it. No secret value
+appears in this document, in any log it cites, or in the release archive.
+
+### Security changes made
+
+| Area | Before | Now | Evidence |
+|---|---|---|---|
+| Database login | The server connected as the `postgres` superuser | Runtime role `qrscs_app`: login only; no superuser, createdb, createrole, replication or row-security bypass; SELECT/INSERT/UPDATE/DELETE on the application tables and sequence use only; no DDL, no TRUNCATE, no access to `alembic_version`, cannot create roles, run `ALTER SYSTEM`, `COPY ... PROGRAM` or create databases | `scripts/setup_database_roles.py` (idempotent, verifies as the new roles, prints pass/fail only); **`tests/test_database_least_privilege.py` (5 tests, run on every regression)**; every DB-backed batch passes running as `qrscs_app` |
+| Migrations | Same superuser | Separate role `qrscs_migrator` owns the database and schema objects; Alembic uses `MIGRATION_DATABASE_URL` when set; default privileges grant future tables to `qrscs_app` automatically | `alembic current` through the migrator = head `d3f7b9c2e5a1`; no migration was run |
+| Default login | `config_server.py` fell back to a built-in superuser URL if `DATABASE_URL` was unset | No default: a missing `DATABASE_URL` stops the server with an explicit message | `config_server.py`, `database/connection.py` |
+| Administrator credential | In the project `.env` (archived with the project) | Moved to `~/.qrscs/admin.env` (outside the repository, owner-only ACL), used only by the setup script | script output; `.env` holds only the two role URLs |
+| Obsolete secrets | Two WSL `.env` copies held a database password and JWT secret that no longer work | Secret values replaced by placeholders in both; non-secret settings kept (two expiry settings that my first pass overwrote were restored to the documented defaults 15 / 7) | audit compared hashes without printing values: both differed from the active ones before the change; neither contains a secret now |
+| Source archive | Hand-zipping the folder included `.env` and private keys | `scripts/package_release.py` archives only what Git considers part of the project, refuses secret-shaped names regardless, then validates the finished archive: forbidden names, private-key blocks / cloud keys / JWT-shaped tokens / credentialed database URLs, and **none of this machine's live secret values anywhere**; failure deletes the archive | **`tests/test_release_packaging.py` (23 tests, run on every regression)**; real archive of the final tree: 364 files, 0 env/key/cert/log entries |
+| TLS socket teardown | `web/gateway/gateway.py` and `ClientSession.disconnect()` closed a TLS socket while another thread could still be inside `ssl.read` (a use-after-free) | shutdown, wait for the reader/in-flight send to leave, then close (bounded waits) | a loop that crashed the interpreter with a native access violation at its 5th run completed 14 + 30 runs clean afterwards (see limitations: a crash of the same class still occurred once in a test-server thread) |
+
+### Regression evidence (official runner, Python 3.12 venv, real PostgreSQL and Chrome)
+
+| Batch | Passed | Failed | Skipped |
+|---|---|---|---|
+| crypto_unit | 409 | 0 | 0 |
+| device_security | 253 | 0 | 0 |
+| messaging_groups_a | 302 | 0 | 0 |
+| messaging_groups_b1 | 177 | 0 | 0 |
+| messaging_groups_b2 | 194 | 0 | 0 |
+| mobile | 104 | 0 | 0 |
+| desktop_gui | 197 | 0 | 0 |
+| desktop_gui_lifecycle_a | 107 | 0 | 0 |
+| desktop_gui_lifecycle_b1 | 36 | 0 | 0 |
+| desktop_gui_lifecycle_b2 | 43 | 0 | 0 |
+| web_a | 39 | 0 | 0 |
+| web_b | 58 | 0 | 0 |
+| **Total** | **1919** | **0** | **0** |
+
+The Web batch was split into `web_a` (6 files) and `web_b` (3 files); together
+they cover all 9 Web test files exactly once (checked programmatically: no
+omission, no duplicate, nothing unbatched). No test was removed, skipped or
+weakened. One earlier-in-session figure is superseded: the previous single
+`web` batch had 91 tests before the 6 registration tests were added.
+
+Interruptions, recorded separately from application failures: the first full run
+of this pass lost its Web batch and stalled for ~10 hours when the laptop
+(on battery, 10-minute idle sleep) slept — a session token expired inside
+`test_attachment_from_a_previous_session_still_decrypts`; the batch passed when
+rerun with the machine held awake. In the final run `device_security` was killed
+by a native `Windows fatal exception: access violation` inside `ssl.read` (the
+documented crash class; no test failed, the process died, the runner reported no
+counts) and passed 3/3 on immediate rerun (253 each).
+
+### Remaining known limitations
+
+1. **Intermittent Web timing failures in long single-process runs — UNRESOLVED.**
+   Across 11 full Web-batch runs of this pass's code, 6 passed and 5 had 1–3
+   failures; after the login-race fix below, 4 of 5 passed (the failing run had
+   3 failures: a null WebSocket, a 'disconnected' status and a wait for a draft
+   to save). Every failure was at a connection step shared by many tests, and
+   the same shape occurred on the one run of an unmodified export of HEAD.
+   Fixed with evidence: a login click lost when it landed before `main.js`
+   attached its handlers (2 of 30 page loads before, 0 of 30 after), and the TLS
+   teardown ordering above. Not reproducible in isolation: 40 of 40 held
+   connections, 30 of 30 setups at 0.4 s or less, and no thread/handle growth
+   across a 97-test run. Mitigation: smaller batches and a held-awake machine;
+   the residual sensitivity is **not fixed**.
+2. **Native `ssl.read` access violation** (documented earlier) can still kill a
+   test process; the test-server harness already quarantines what it can.
+3. The Desktop and Android clients keep every group-key epoch; the **Web client
+   keeps only the newest**, so Web cannot show pre-rotation group history.
+4. **Group pictures** do not exist on any platform (schema + protocol change,
+   not started — see `feature_parity_matrix.md`).
+5. **Android physical validation** (voice/video recording, video playback,
+   install and launch of the rebuilt APK) remains deferred; no Android
+   evidence was gathered in this pass.
+6. `postgresql.conf` still has `listen_addresses = '*'` (pg_hba allows only
+   loopback, so it is not reachable from other hosts); not changed because it
+   needs a service restart.
+7. Profile pictures and bios are not end-to-end encrypted (documented design).
+
+## Reconfirmation — 2026-10-21 (Desktop executable, multi-user acceptance, protocol fixes)
+
+Branch `work/desktop-web-completion-2026-10-20`, based on the preservation commit `3861769`. The changes below are
+**uncommitted**; the working tree has not been approved for merge. Status of this section: **automated evidence only — no
+manual acceptance has happened yet.**
+
+### Defects found and fixed (each has a regression test that fails without the fix)
+
+| # | Defect | How it was found | Fix | Test |
+|---|---|---|---|---|
+| 1 | **Login reply distinguished "no such account" from "wrong password".** The wire reply's `errors` carried `User not found.` or `Password verification failed.`, and the Desktop displayed that text, so anyone could learn whether a phone number is registered. | Acceptance scenario (the Desktop's wrong-password text differed from the server's own message) | `server/client_handler.py::handle_login_request` sends the same `{"credentials": "Invalid phone number or password."}` for both. The service still records the distinct reason for its own audit log. **Two existing tests that asserted the old, leaking detail were changed to assert the generic reply** (disclosed on purpose). | `tests/test_login_logout_integration.py::test_a_wrong_password_and_an_unknown_phone_number_look_identical` |
+| 2 | **A repeated send (same `client_message_id`) was delivered twice, and a repeated *group* send broke the sender's connection.** The server tried to record the recipient row a second time, violated its unique key, logged a database error, and relayed again. | Acceptance replay scenario | Duplicates are recognised (`persist_message` marks them) and neither re-recorded nor re-relayed, for direct and group messages. | `tests/test_message_replay_idempotency.py` (3 tests; 2 fail on the previous code) |
+| 3 | **A browser that logged out or closed its tab stayed "online" on the server** until some unrelated packet made the gateway try a send. | Acceptance presence scenario | `web/gateway/gateway.py` ends the connection as soon as either direction ends. | `tests/test_web_gateway_teardown.py` (2 tests; both fail without the fix) |
+| 4 | **About 0.5% of requests sent the instant a WebSocket opened never got a reply** (browser registration/login timeouts; very likely the long-standing intermittent Web failures). | Acceptance registration stress (3 of 60 failed), then reproduced with no browser | Server issues no TLS 1.3 session tickets (`security/tls.py`). | `tests/test_web_gateway_first_request.py` (fails without the fix in 3 of 3 runs) |
+| 5 | **The Website never recovered from a server outage.** Its reconnect re-authenticates over a short-lived socket and waited forever for a reply the gateway could never send, so the first failed attempt hung for good ("Reconnecting" indefinitely). | Acceptance outage scenario | `web/client/app.js::_sendAndReceiveOnce` ends when the socket closes or fails or after 30 s. | `tests/test_web_reconnect_after_outage.py` (fails without the fix: "it is hanging") |
+| 6 | Web client kept only the newest group key, so older group history was unreadable after a rotation; a late older key could also replace the sending key. | Parity audit | Keys kept and persisted per epoch, chosen by the signed `epoch`, never downgraded. | `tests/test_web_group_key_history.py` (the main test fails on the old client with "a message from before the rotation was dropped") |
+
+User-facing fixes that are not security properties: a user can now **see their own safety number** (Desktop and Website Settings);
+Desktop **message and conversation rows and login fields are readable by assistive technology**; the Desktop **brand mark** exists
+(the shipped logo file is empty); after a lost connection the Desktop shows a banner with **Sign in again** (it only said
+"Disconnected"); the Desktop's unverified-contact **header no longer clips** its buttons and badge at the default window size, and its
+**Settings dialog** scrolls instead of pushing Logout/Close off a small screen (the last two found by looking at real screenshots).
+
+### Desktop executable
+`scripts/build_desktop_exe.py` → `dist/desktop/QRSCS-Desktop/QRSCS-Desktop.exe` (PyInstaller 6.22.3, Python 3.12, one folder,
+316 files, with an icon drawn from the application's brand mark). The script validates its own output on every build: no `.env`,
+key, certificate key, log or database file, and no configured live secret value in any file (`tests/test_desktop_exe_build.py`, 11
+tests). It contains only client code (server, database, mobile and test modules are excluded) and the public CA certificate.
+**Not done:** code signing; a run on a clean machine without this development environment; a build from a different checkout.
+The source archive (`scripts/package_release.py`) still builds and validates with every new file (435 files).
+
+### Regression (official runner, Python 3.12 venv, real PostgreSQL and Chrome), 2026-10-21
+
+| Batch | Passed |
+|---|---|
+| crypto_unit | 420 |
+| device_security | 253 |
+| messaging_groups_a | 305 |
+| messaging_groups_b1 | 177 |
+| messaging_groups_b2 | 194 |
+| mobile | 104 |
+| desktop_gui | 207 |
+| desktop_gui_lifecycle_a | 108 |
+| desktop_gui_lifecycle_b1 | 36 |
+| desktop_gui_lifecycle_b2 | 43 |
+| web_a | 44 |
+| web_b | 66 |
+| **Total** | **1,957 passed, 0 failed, 0 skipped** |
+
+1,919 before this work; **+38 tests, none removed, skipped or weakened** (two assertions in `test_login_logout_integration.py` were
+*tightened*, see defect 1). Every `tests/test_*.py` file is in exactly one batch (171 files, checked mechanically). The runner now
+prints per-batch and total counts. The Web batches take about 75 s and 193 s (they took 182 s and 550 s before the gateway teardown fix).
+
+**Web timing sensitivity.** Before the fixes, 5 of 11 full Web-batch runs had 1–3 failures. After them, two rounds of five
+consecutive runs of both Web batches passed (20 of 20 batch runs; 108 tests each time) — round 1 after the TLS fix, round 2 after
+the gateway fix — and the final full regression passed again. If the old failure rate (about 45% per full run) had been unchanged,
+five clean runs in a row would have had a chance of about 5%. This is strong statistical evidence, **not a proof**: the mechanism
+(tickets arriving while the gateway's reader thread is blocked and another thread starts the first write) is an inference from the
+controlled comparison, not something observed directly, and the Website reconnect change (defect 5) was made after round 2.
+
+### Multi-user acceptance (`tests/acceptance/`; built EXE + Chrome; isolated database `qrscs_accept`, role `qrscs_app`)
+
+* **Accounts:** standing populations of 10 (8 Website + 2 Desktop), 20 (17 + 3) and 30 (26 + 4), **every one registered and logged in
+  through the real forms** (10/10, 20/20, 30/30). Each run ends with 65 / 75 / 85 accounts in the database: the population plus the
+  accounts the scenarios create themselves, of which **8 are created by protocol clients** for the authorization tests and the rest
+  through the Website and Desktop registration forms. Registration through the Website form under repetition: 100/100 after the TLS
+  fix (and 200/200 earlier; 3 of 60 failed before).
+* **Scenarios:** 32 (+1 stress test run separately). **32/32 passed at 10, at 20 and at 30 standing accounts**; at 30 the concurrency
+  scenario runs 15 simultaneous conversations (11 Website–Website, 4 Website–Desktop). Per run: ~89–169 messages, ~32–42
+  conversations. Earlier failures were fixed before these runs; the ones that were the harness's own fault are listed in `PROJECT_STATE.md`.
+* **Confidentiality scan (runs last):** nothing the run sent or created appears at rest on the server side. Scanned in the final
+  run: 713,873 bytes of server/gateway logs, 436 database rows across every table (89 encrypted messages), 2 encrypted blobs, against
+  439 patterns (89 message texts, 65 passwords, 285 key-material patterns from the browsers' identity secret keys and conversation
+  keys, 2 attachments), each in plain, hex and base64 form — **0 hits**. The scanner is itself tested against planted values. Desktop
+  key material is in an encrypted key store and is not extracted, so for the Desktop only plaintext and passwords are checked.
+
+### Remaining limitations and residual risks (not hidden)
+
+1. **Account enumeration is closed only for credential errors.** A *locked* or *inactive* account still gets a distinct message, and a
+   login for an unknown number is probably faster than one that runs Argon2 (timing). Neither was changed.
+2. The Desktop **Devices**, **Inbox** and group-member dialogs hold buttons inside list rows that assistive technology cannot reach
+   (and UI Automation cannot drive); covered by widget-level tests and by manual acceptance, not by the UI-driven suite. Desktop
+   sending of attachments (the operating system's file dialog) and Desktop message context menus are not UI-automated either.
+3. The Desktop does **not** reconnect by itself (it does not keep the password); it offers "Sign in again". The Website gives up after
+   about two minutes of failed attempts.
+4. Web **device key sync** sends only a conversation's current key: a newly linked browser device cannot read pre-rotation history.
+5. The executable is **unsigned**; Windows may warn on first run. It has only been run on this machine.
+6. Group pictures remain unimplemented everywhere; Android is paused and unvalidated on hardware (unchanged).
+7. All acceptance traffic is loopback on one machine; real network conditions are not exercised. No manual acceptance has been done.
+
+## Reconfirmation — 2026-10-21, second window (Phase 19.24: Desktop/Website UI parity, chat media, group events and attachments)
+
+Same branch, still **uncommitted**. Status: **automated evidence only — no manual acceptance has happened.** The requirement-by-requirement
+map is `docs/architecture/ui_parity_requirement_map.md`; user-visible behaviour is in `feature_parity_matrix.md`.
+
+### What changed that bears on security
+
+| Area | Change | Why it does not weaken the model | Test |
+|---|---|---|---|
+| **Display names vs identity** | `users.username` remains the unique internal handle every packet is routed and authorized on; `display_name` (already a column) is non-unique and only ever shown. A taken name gets a distinct handle (`name_<6 hex>`). New `display_names_request` / `change_display_name_request` carry names only | No key, signature, route or permission is derived from a display name. A namesake cannot receive another user's message. No destructive migration; existing users untouched | `test_duplicate_display_names.py` (a message to one namesake never reaches the other), `test_desktop_display_names.py` |
+| **Account-exists registration message** | Registration answers "An account with this phone number already exists. Please log in." | Registration already revealed the duplicate (it must refuse it); **login keeps the single generic reply** for unknown number and wrong password | `test_registration_integration.py`, `test_login_logout_integration.py` |
+| **Profile-picture upload** | `security/image_validation.py` checks the format (PNG/JPEG/WebP/GIF), size and 1–8192 px / 40 M-pixel limits **on the server from the image header**, whatever the client claims | The browser/Desktop checks are convenience only; a hostile client is refused the same way. Pictures remain not end-to-end encrypted (documented design) | `test_profile_picture_validation.py`, `test_mobile_settings.py` (now uploads a real PNG; the old fake bytes are correctly refused) |
+| **Reply references** | A reply names the original by its stable message id. The server accepts it only if that message belongs to the **same conversation** the sender can read, drops it otherwise, and stamps the stored id on the relayed packet | A reply cannot be used to probe or quote a message from another conversation; clients never resolve a reply by matching text | `test_reply_reference_integrity.py` |
+| **Website refuses to send to a changed key** | `sendMessage` / `sendAttachment` refuse a peer in the KEY_CHANGED state until it is re-verified; the "Verified" line disappears the moment the key changes | Trust is not silently preserved across a key change (Desktop already behaved this way) | `test_web_messenger_layout_and_parity.py` |
+| **Group membership events** | New table `group_events` (migration `e8c2a6d4f1b9`). The server writes a row in the **same transaction** as the membership change, using the authenticated actor and the member from its own records (snapshot of the handles). Delivered only to current members and only for events since they joined (a rejoin resets the start); once, in order | A client cannot inject or forge an event; text in a packet is never trusted; non-members and removed members receive nothing | `test_group_membership_events.py`, `test_desktop_group_events.py`, `test_web_group_attachments_and_events.py` |
+| **Group attachments** | Website gained attach/record in the group composer. Same pipeline as before: **one `messages` row + `message_recipients`**, existing payload adapters, the group key and attachment encryption; blobs are client-side ciphertext; history and blob download are membership-gated | No plaintext group key or attachment reaches the server; a removed member or a non-member can neither fetch nor decrypt; a retry is idempotent by `client_message_id` | `test_group_attachments.py`, `test_desktop_group_attachments_gui.py`, `test_web_group_attachments_and_events.py` |
+| **Desktop voice/video** | The recorder now states its format (AAC/MP4 voice, H.264+AAC/MP4 video) and the player plays **the decrypted bytes held in memory (a `QBuffer`; nothing is written to disk for playback)**; the encrypted send path is unchanged | Encryption in transit and at rest is unchanged; undecodable media shows an error and does nothing else | `test_media_playback_interop.py` (Chrome↔Qt in both directions through the server) |
+| **Gateway address field** | Collapsed under "Connection settings" rather than removed | No change to what the page may connect to; TLS and origin rules are the gateway's | `test_web_chat_settings_and_recorder.py` |
+
+### Tests changed (disclosed; none weakened or removed)
+
+Each changed because the behaviour they described was *deliberately* changed by a requirement, and each still asserts the replacement
+behaviour: typing a name in the Website search box no longer opens a chat (28 sites now press Enter); own-safety-number and profile-picture
+tests now use their new locations; the mobile settings test uses a real PNG because the server now validates; the Website lifecycle suite's
+"Establish key" helper tolerates the key already being established and the pin label reads "Pinned by you". The acceptance drivers read the
+own safety number through the Verify Identity window. The `desktop_gui` regression batch was split in two (`desktop_gui`, `desktop_gui_b`)
+because one process after ~170 Qt tests hit the documented PySide6 resource-accumulation access violation (every file passes alone);
+the timeout was not changed.
+
+### Regression (official runner, Python 3.12 venv, real PostgreSQL and Chrome), 2026-10-21 second window
+
+| Batch | Passed |
+|---|---|
+| crypto_unit | 421 |
+| device_security | 284 |
+| messaging_groups_a | 325 |
+| messaging_groups_b1 | 177 |
+| messaging_groups_b2 | 194 |
+| mobile | 104 |
+| desktop_gui | 162 |
+| desktop_gui_b | 103 |
+| desktop_gui_lifecycle_a | 108 |
+| desktop_gui_lifecycle_b1 | 36 |
+| desktop_gui_lifecycle_b2 | 43 |
+| web_a | 44 |
+| web_b | 74 |
+| web_c (new) | 28 |
+| media_interop (new) | 15 |
+| **Total** | **2,118 passed, 0 failed, 0 skipped** (1,957 before this window) |
+
+185 test files, each in exactly one batch (checked mechanically). An earlier full run of this window had 3 Website failures (the
+test helper clicked a button that is hidden once the key exists; a pin label) and one Desktop batch crash (above); both were fixed and the
+complete run was repeated from the start.
+
+### Limits and things not verified (not hidden)
+
+1. **Real microphone/camera were never used.** Recorder tests use Chrome's fake devices and Qt synthetic tone/test-pattern inputs; audibility
+   was proven by decoding (sample energy), not by a person listening. The manual checklist covers a real recording.
+2. **Group events and attachments for removed members** are covered at the server and in both clients; the owner should still try
+   add → remove → re-add by hand.
+3. A group attachment sent by a Website member to a group containing only Android members is not validated (Android is paused; no device).
+4. The Desktop "Request to add a member" button (non-admin) only creates a request; the server decides, and the admin approves in the Inbox.
+5. Server-side image validation reads the header: it bounds size and dimensions but is not a malware scan; pictures are not encrypted.
+6. Unchanged limits from the section above still apply (unsigned EXE, loopback only, enumeration closed for credential errors only).
+
+
+## Reconfirmation — 2026-10-22 (group member addition, contact-request approval, key follow-through)
+
+Same branch, still **uncommitted**; automated evidence only. Reported by the owner during manual acceptance: a person never
+spoken to could not be added to a group and read it; the approval workflow did not finish securing the connection.
+
+| # | Defect (root cause) | Fix | Test |
+|---|---|---|---|
+| 1 | **A group member added before verification never got the key.** `_distribute_group_key()` (Desktop) and `_distributeGroupKey()` (Website) skip a recipient who is not verified (correct) but forgot the skip; nothing re-sent the key once verification happened. A member's own late verification of the holder was not recovered either: the existing recovery request is for direct conversations only | The skip is remembered and retried after the explicit verification (or when an already-verified member's identity is first seen). A member who verifies the holder late sends `group_key_request` (new, additive packet) which reuses `group_key_rotation_required` | `tests/test_group_key_late_verification.py` (9; the first five failed before the fix) |
+| 2 | **The Website never completed the requester's half of an approved request** (the Desktop did) and never secured the connection | `_completeRequesterSideVerification()` + `secureDirectConnection()`, with honest `establishing` / `ready` / `failed` reporting | `tests/test_web_late_verification_and_approval.py` (8) |
+| 3 | **Approving, or auto-completing, a changed identity re-trusted it** — `get_peer_fingerprint_for_verification()` returns the NEW, never-compared fingerprint for a KEY_CHANGED peer, so both the approver's Approve and the requester's automatic completion would have verified it | Both refuse for KEY_CHANGED on Desktop and Website; the person must verify again by hand | `tests/test_contact_request_approval_flow.py` (8; the requester-side one failed before the fix) |
+| 4 | Phone number entered when adding to a group was not resolved or shown | Looked up, shown by name and @handle with its verification state before Add; unknown numbers add nothing; a phone number is never sent as a username; **Ask to verify** sends a verification request without opening a conversation | `tests/test_web_group_member_lookup.py` (6) |
+| 5 | A group member could not tell why a group was unreadable | Group info (Website and Desktop) shows each member's verification state, a **Verify** action, and a notice while this account lacks the group key | the files above |
+
+**Authorization of the new packet.** `handle_group_key_request()` derives the requester from the authenticated socket, requires
+ACTIVE membership of that group (a non-member, a removed member and a malformed id are all silent, server-log-only rejections),
+sends only the existing rotation instruction for the current epoch with the requester as the sole recipient, and asks the admin
+only (see `inbox_approval_workflow.md` §4b for why). The holder still wraps a key only for a VERIFIED identity and the receiver
+still accepts one only from a VERIFIED sender and only with a valid ML-DSA signature; the server relays ciphertext it cannot read.
+A member removed before being verified is never sent the key (the retry re-checks membership). Tests cover each of these.
+
+**Regression run after these changes** (official runner, Python 3.12, real PostgreSQL and Chrome): messaging_groups_a 341,
+messaging_groups_b1 177, messaging_groups_b2 194, device_security 284, desktop_gui 162, desktop_gui_b 117,
+desktop_gui_lifecycle_a 108, _b1 36, _b2 43, web_a 44, web_c 42 — all passed. web_b: 73 passed, **1 failed**
+(`test_web_bio_can_be_edited_and_is_seen_by_desktop`): a race inside the test (it waited for the server to hold the bio and then
+read the page's hint without waiting for the page) that passed 2 of 3 reruns before and 6 of 6 after the test was changed to wait
+for the page; nothing in the bio path was touched. Two changes were made after the batches ran (the admin-only selection above,
+and that test), so the batches were **not** repeated in full afterwards: the 57 group/inbox tests and the 14 new Website tests were.
+The unchanged mobile, crypto_unit and media_interop batches were not run this round.
+
+**Limits (not hidden).** A person who is offline has no observable identity and cannot be verified, so cannot receive the key until
+they are online and both sides have verified. If the admin is offline, a member's key request waits until the admin is back or the
+next verification. The Desktop establishes the direct session key at the first message (existing design), not at approval. A
+verification request does not carry the group it was made from. No manual acceptance of any of this has happened.
+
+
+## Reconfirmation — 2026-10-22, third part (joining a group by invitation; Desktop look and navigation)
+
+Same branch, still **uncommitted**; automated evidence only.
+
+### Group membership now needs the person's own approval (new `group_invitation` inbox type; no migration)
+
+* `inbox_notifications.type` is an unconstrained `String(32)`, so the new value needs no migration; `status` gains `expired`.
+* **Authorization.** Only the recipient (the invitee) can decide an invitation; the inviter, an outsider and a bogus id are
+  indistinguishable and rejected silently. Approval re-checks, at that moment, that the invitation is not stale (14 days) and
+  that the inviter is still an active member, and re-applies the block check in both directions; otherwise it is marked expired
+  and adds nobody. A second decision on the same item is a no-op.
+* **Compatibility.** The behaviour is selected by an additive `consent_invitations` flag sent by the Desktop and Website; a client
+  that does not send it (Android, the existing session-level API) keeps the immediate add. An invitee on Android is not
+  validated (see `inbox_approval_workflow.md` §4c).
+* **Trust is not manufactured.** Approving an invitation verifies the inviter only from the identity the approving client has itself
+  observed, never from the notification; it refuses (and sends nothing) if that identity was not observed or its key changed.
+  The inviter's side does the same when the approval arrives. This reuses, and does not widen, what a verification request already
+  did. Keys are still only wrapped for, and accepted from, a VERIFIED identity.
+* **Key holder.** `_dispatch_pending_rotation_if_needed()` now asks the group's admin first: members invited this way have verified
+  the admin, not necessarily one another, so a non-admin distributing a new epoch could not reach them all.
+
+| Test | Result |
+|---|---|
+| `tests/test_group_invitation_flow.py` (12): only approvers join; deny/ignore; duplicate and repeat decisions; outsider/inviter cannot decide; blocks; expiry; inviter left; non-admin needs admin then candidate; admin deny invites nobody; changed identity refused; legacy immediate add unchanged; messages both ways after approval | passed |
+| `tests/test_web_group_invitations.py` (3), `tests/test_desktop_group_invitations.py` (3): the Inbox item, toast/notice, badge and Approve/Deny through the real windows, Website↔Desktop and Website↔Website | passed |
+
+### Desktop look and navigation (Website parity)
+
+A light and a dark theme from the Website's own tokens (`gui/styles.py`; chosen in Settings → Appearance, applied at the next start;
+automated offscreen runs ignore a saved choice so they stay deterministic), the rail with a name under each icon and Log out, a
+connection pill, All/Unread/Direct/Groups chips, the search box that looks a phone number or @handle up on Enter (typing only filters),
+the list showing a handle only for namesakes, a non-blocking notice banner, and a Website-style Chat settings menu, gallery, file/voice
+cards and picture editor (earlier this day). `tests/test_desktop_theme_and_navigation_parity.py` (7) and `tests/test_desktop_website_parity_fixes.py` (14).
+Two old assertions changed deliberately: the rail is no longer icon-only; the Website's group tests that assumed an immediate add now approve the invitation.
+
+**Regression for this part** (official runner, Python 3.12, real PostgreSQL and Chrome): crypto_unit 421, device_security 284, messaging_groups_a 354,
+messaging_groups_b1 177, messaging_groups_b2 194, mobile 104, desktop_gui 162, desktop_gui_b 127, desktop_gui_lifecycle_a 108, _b1 36, _b2 43, web_a 44,
+web_b 74, web_c 45, media_interop 15 = **2,188 passed**. The first full run had two Website page-load failures (`web_a`: a `Page.goto` timeout in a setup
+fixture; `web_b`: the Login button still disabled), each passing 3 of 3 alone and both batches passing in full on a rerun. The UI-driven acceptance suite on the
+rebuilt executable: **33 passed**, with the Desktop member's approval done through the real Desktop Inbox. Not run by anyone: manual acceptance, Android,
+a real microphone or camera.

@@ -314,7 +314,10 @@ def test_missing_public_key_keeps_composer_enabled_for_a_new_conversation(
     # Exactly what handle_find_user() does after a successful search.
     alice_window.open_conversation(_direct_summary(bob_payload["username"]))
 
-    assert alice_window.chat_partner_label.text() == bob_payload["username"]
+    # The header shows the name Bob is known by (his display name once it has been looked
+    # up, his handle until then); the handle itself stays the conversation's identity.
+    assert alice_window.chat_partner_label.text() == alice_window.name_for(bob_payload["username"])
+    assert alice_window._current_direct_peer_username == bob_payload["username"]
 
     # BUG -- Offline First Contact: establish_session_key() can now
     # always generate a key locally, regardless of public-key

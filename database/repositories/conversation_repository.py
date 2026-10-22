@@ -446,6 +446,9 @@ class ConversationRepository(BaseRepository):
             elif row.left_at is not None:
 
                 row.left_at = None
+                # A rejoining member's membership starts again now: group events (and anything else
+                # that is shown "from when you joined") must not include the time they were out.
+                row.joined_at = _utc_now()
 
                 affected.append(user_id)
 

@@ -19,7 +19,7 @@ profile-picture-specific.
 """
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -30,9 +30,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.styles import COLOR_PANEL_ALT, COLOR_TEXT_MUTED
+from gui.styles import COLOR_PANEL_ALT, COLOR_TEXT, COLOR_TEXT_MUTED
 
-VIEWPORT_SIZE = 320
+VIEWPORT_SIZE = 280  # the same square the Website's picture editor uses
 OUTPUT_SIZE = 512
 _ZOOM_MIN = 100  # percent of "fit" scale
 _ZOOM_MAX = 400
@@ -65,6 +65,8 @@ class _CropCanvas(QWidget):
 
         self.setFixedSize(VIEWPORT_SIZE, VIEWPORT_SIZE)
         self.setCursor(Qt.OpenHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAccessibleName("Picture position. Use the arrow keys to move it, plus and minus to zoom.")
         self._dragging = False
         self._drag_start_pos = QPointF()
         self._drag_start_offset = QPointF()
@@ -85,7 +87,20 @@ class _CropCanvas(QWidget):
     def paintEvent(self, event):  # noqa: N802 (Qt override)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.Antialiasing)
         self._paint_onto(painter, self.scale, VIEWPORT_SIZE)
+
+        # Dim everything outside the circle and ring it: the circle is what people will see (every
+        # avatar is round). Only the preview is dimmed -- the saved picture is the clean square.
+        inset = 2.0
+        outside = QPainterPath()
+        outside.addRect(QRectF(0, 0, VIEWPORT_SIZE, VIEWPORT_SIZE))
+        circle = QRectF(inset, inset, VIEWPORT_SIZE - 2 * inset, VIEWPORT_SIZE - 2 * inset)
+        outside.addEllipse(circle)
+        painter.fillPath(outside, QColor(15, 16, 22, 140))
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(circle)
         painter.end()
 
     def _paint_onto(self, painter: QPainter, scale: float, viewport_size: int):
@@ -136,6 +151,25 @@ class _CropCanvas(QWidget):
             self._dragging = False
             self.setCursor(Qt.OpenHandCursor)
 
+    # Keyboard: arrow keys move the picture, + and - zoom (as on the Website).
+    def keyPressEvent(self, event):  # noqa: N802
+        step = 12 / self.scale
+        moves = {Qt.Key_Left: (-step, 0), Qt.Key_Right: (step, 0), Qt.Key_Up: (0, -step), Qt.Key_Down: (0, step)}
+        if event.key() in moves:
+            dx, dy = moves[event.key()]
+            self.offset = QPointF(self.offset.x() + dx, self.offset.y() + dy)
+            self._clamp_offset()
+            self.update()
+        elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.zoom_requested(+10)
+        elif event.key() in (Qt.Key_Minus, Qt.Key_Underscore):
+            self.zoom_requested(-10)
+        else:
+            super().keyPressEvent(event)
+
+    def zoom_requested(self, delta):
+        """Overridden by the dialog, which owns the zoom slider."""
+
 
 class ImageCropDialog(QDialog):
     """
@@ -146,15 +180,22 @@ class ImageCropDialog(QDialog):
     def __init__(self, source_pixmap: QPixmap, parent=None):
         super().__init__(parent)
 
-        self.setWindowTitle("Crop Profile Picture")
+        self.setWindowTitle("Adjust your picture")
         self._result = None
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 18)
         layout.setAlignment(Qt.AlignCenter)
         layout.setSpacing(12)
 
-        hint = QLabel("Drag to reposition. Use the slider to zoom.")
-        hint.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 9pt;")
+        title = QLabel("Adjust your picture")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color: {COLOR_TEXT}; font-size: 13pt; font-weight: 700;")
+        layout.addWidget(title)
+
+        hint = QLabel("Drag to position it, and use the slider to zoom. The circle is what people will see.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 9.5pt;")
         hint.setAlignment(Qt.AlignCenter)
         layout.addWidget(hint)
 
@@ -166,16 +207,18 @@ class ImageCropDialog(QDialog):
         canvas_layout = QVBoxLayout(canvas_frame)
         canvas_layout.setContentsMargins(0, 0, 0, 0)
         self.canvas = _CropCanvas(source_pixmap)
+        self.canvas.zoom_requested = lambda delta: self.zoom_slider.setValue(self.zoom_slider.value() + delta)
         canvas_layout.addWidget(self.canvas)
         layout.addWidget(canvas_frame, alignment=Qt.AlignCenter)
 
         zoom_row = QHBoxLayout()
         zoom_label = QLabel("Zoom")
-        zoom_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 9pt;")
+        zoom_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 9.5pt;")
         zoom_row.addWidget(zoom_label)
         self.zoom_slider = QSlider(Qt.Horizontal)
         self.zoom_slider.setRange(_ZOOM_MIN, _ZOOM_MAX)
         self.zoom_slider.setValue(_ZOOM_MIN)
+        self.zoom_slider.setAccessibleName("Zoom")
         self.zoom_slider.valueChanged.connect(self._on_zoom_changed)
         zoom_row.addWidget(self.zoom_slider)
         layout.addLayout(zoom_row)
@@ -189,7 +232,7 @@ class ImageCropDialog(QDialog):
         cancel_button.clicked.connect(self.reject)
         button_row.addWidget(cancel_button)
 
-        save_button = QPushButton("Save")
+        save_button = QPushButton("Save picture")
         save_button.setCursor(Qt.PointingHandCursor)
         save_button.clicked.connect(self._handle_save)
         button_row.addWidget(save_button)
