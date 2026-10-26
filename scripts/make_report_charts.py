@@ -16,7 +16,7 @@ into docs/report/:
 No third-party plotting library is needed: the charts are plain SVG. PNG copies are rendered with the
 Chrome that Playwright already uses for the Website tests (skip them with --no-png).
 
-    & "C:\\Users\\Vignesh T\\venvs\\qrscs312\\Scripts\\python.exe" scripts\\make_report_charts.py
+    python scripts\\make_report_charts.py
 """
 
 import argparse

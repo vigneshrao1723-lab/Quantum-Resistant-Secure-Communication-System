@@ -46,6 +46,7 @@ new dependency is introduced for this.
 
 import datetime
 import ipaddress
+import sys
 from pathlib import Path
 
 from cryptography import x509
@@ -53,9 +54,16 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from config import TLS_CERT_SANS
+ROOT = Path(__file__).resolve().parent.parent
 
-CERTS_DIR = Path(__file__).resolve().parent.parent / "certs" / "dev"
+# Running ``python scripts/generate_dev_certs.py`` puts scripts/ (not the
+# repository root) on sys.path, so ``config`` would not be importable.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from config import TLS_CERT_SANS  # noqa: E402
+
+CERTS_DIR = ROOT / "certs" / "dev"
 
 CA_VALIDITY_DAYS = 730  # ~2 years
 SERVER_VALIDITY_DAYS = 365  # ~1 year

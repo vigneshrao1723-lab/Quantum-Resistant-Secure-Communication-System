@@ -3,7 +3,7 @@ Check this computer's microphone, speakers and the Desktop app's recording and p
 
 Run it yourself, in a terminal, with the project's Python 3.12 environment:
 
-    & "C:\\Users\\Vignesh T\\venvs\\qrscs312\\Scripts\\python.exe" scripts\\audio_selftest.py
+    python scripts\\audio_selftest.py
 
 It plays a short tone (so you can check you hear it), then records three seconds from each
 microphone (so speak, or clap, when told to) with the same recorder settings the Desktop app uses,

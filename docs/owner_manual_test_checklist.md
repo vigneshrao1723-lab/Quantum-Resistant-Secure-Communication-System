@@ -10,8 +10,8 @@ hardware. Anything not ticked is treated as a defect to fix.
 2. In PowerShell:
 
 ```powershell
-cd C:\Project\Quantum-Resistant-Secure-Communication-System
-$py = "C:\Users\Vignesh T\venvs\qrscs312\Scripts\python.exe"
+cd <your clone of the repository>
+$py = ".\venv\Scripts\python.exe"   # the python.exe of your repository venv (README, step 2)
 & $py run.py                      # leave open. Website: http://127.0.0.1:8000. Close the extra Desktop window it opens.
 ```
 

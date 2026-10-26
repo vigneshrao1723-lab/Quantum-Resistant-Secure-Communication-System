@@ -28,6 +28,25 @@ quickjs==1.19.4
 # download is used or required. Not used by any production code.
 playwright==1.62.0
 
+# --- Mobile client unit tests (tests/test_mobile_*.py, tests/test_phase19_24_mobile_*.py) ---
+# These tests import the Kivy client (mobile/) directly, so the `mobile`
+# regression batch cannot even be collected without Kivy. Kivy 2.3.1 is the
+# version buildozer.spec pins for the Android build. Nothing here is imported by
+# the Desktop, Website, gateway or server, and the Android build is paused:
+# skip these lines if you will not run the mobile tests.
+kivy==2.3.1
+Kivy-Garden==0.1.5
+kivy-deps.angle==0.4.0
+kivy_deps.glew==0.3.2
+kivy_deps.sdl2==0.8.0
+docutils==0.23
+filetype==1.2.0
+requests==2.34.2
+urllib3==2.8.0
+idna==3.20
+charset-normalizer==3.5.2
+certifi==2026.10.18
+
 # --- Windows Desktop executable (scripts/build_desktop_exe.py) ---
 # Packages the Desktop client into a one-folder Windows build. Build-time
 # only: nothing here is imported by the application at run time.
