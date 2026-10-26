@@ -114,9 +114,32 @@ def test_server_config_does_not_duplicate_shared_network_settings():
 
 
 def test_defaults_preserve_localhost_behavior():
-    assert config.SERVER_HOST == "127.0.0.1"
-    assert config.SERVER_BIND_HOST == "127.0.0.1"
-    assert config.SERVER_PORT == 5000
+    """The built-in defaults, checked in a clean process so they do not
+    depend on this machine's .env (a developer may legitimately set
+    SERVER_PORT there when 5000 is taken)."""
+    code = (
+        "import os\n"
+        "for name in ('SERVER_HOST', 'SERVER_BIND_HOST', 'SERVER_PORT'):\n"
+        "    os.environ.pop(name, None)\n"
+        "import dotenv\n"
+        "dotenv.load_dotenv = lambda *args, **kwargs: False\n"
+        "import config\n"
+        "assert config.SERVER_HOST == '127.0.0.1'\n"
+        "assert config.SERVER_BIND_HOST == '127.0.0.1'\n"
+        "assert config.SERVER_PORT == 5000\n"
+        "print('ok')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
 
 
 def test_bind_host_defaults_to_loopback_not_all_interfaces():
@@ -323,7 +346,7 @@ def test_shared_config_imports_without_any_server_credentials():
         "os.environ.pop('DATABASE_URL', None)\n"
         "os.environ.pop('JWT_SECRET_KEY', None)\n"
         "import config\n"
-        "assert config.SERVER_PORT == 5000\n"
+        "assert isinstance(config.SERVER_PORT, int)\n"
         "assert not hasattr(config, 'DATABASE_URL')\n"
         "assert not hasattr(config, 'JWT_SECRET_KEY')\n"
         "print('ok')\n"

@@ -1,31 +1,73 @@
 # Project state and hand-off
 
 Kept current at each checkpoint. Facts only: every result below names the command or test that produced it.
-Anything not listed as verified is not verified.
+Anything not listed as verified is not verified. The first section is the current state; everything after "History" is dated and may be out of date.
 
-## Branches
+## Current state (2026-10-26)
 
-| Branch | Purpose | Commit |
+### Branches (verified with `git ls-remote --heads origin` on 2026-10-26)
+
+| Branch | Purpose | Remote head |
 |---|---|---|
-| `master` | Baseline; unchanged by this work | `22a6a73` |
-| `preservation/android-desktop-web-baseline-2026-10-20` | Safety checkpoint of everything before the Desktop/Website completion work, including all Android sources. **Do not delete.** Pushed to `origin`; remote hash verified with `git ls-remote` and by reading the remote tree | `3861769` (`38617690cc7437a789cc7c0252d0d8a151d6fbae`) |
-| `work/desktop-web-completion-2026-10-20` | Active branch for the Desktop executable and Website work | based on `3861769`; the Phase 19.24 work is **committed and pushed to `origin`** (commit `eb886fd`, 2026-10-22) |
-| `origin/main` | An older, unrelated 10-commit prototype history (RSA-era, 38 files; no common ancestor with `master`). Untouched; nothing merged from it | `a97ceb5` |
+| `master` | **Default branch.** Merge commit of pull request #1 (`work/desktop-web-completion-2026-10-20` into `master`) | `8f376f4` |
+| `work/desktop-web-completion-2026-10-20` | Active Desktop/Website/setup branch. Everything up to `b6a6e42` is already contained in `master`; the handoff/dependency fixes below are on this branch only until a new pull request is merged | `git ls-remote --heads origin` |
+| `preservation/android-desktop-web-baseline-2026-10-20` | Safety checkpoint of everything before the Desktop/Website completion work, including all Android sources. **Do not delete.** Unchanged | `3861769` |
+| `main` | An older, unrelated prototype history on the remote (no common ancestor with `master`). Untouched; nothing merged from it | `a97ceb5` |
 
+History of `master`: `22a6a73` (previous baseline) -> merge `8f376f4` (brings in `3861769` preservation checkpoint, `eb886fd` Phase 19.24, `b6a6e42` state note).
 Remote: `https://github.com/vigneshrao1723-lab/Quantum-Resistant-Secure-Communication-System`
-Preservation branch: `.../tree/preservation/android-desktop-web-baseline-2026-10-20`
 
-## Scope
+A teammate who clones gets `master`; the setup fixes below reach `master` only when the owner merges this work branch.
 
-Active: Desktop application and its Windows executable, Website, multi-user acceptance testing. **Paused:** Android (sources
-preserved and unchanged; no hardware validation done). Phase 20 has not been started.
+### Scope
 
-**Gate:** automated testing is complete and the applications are ready for **manual acceptance**
-(`docs/owner_manual_test_checklist.md`, with `docs/manual_acceptance_checklist.md` as the full reference). The work branch has been committed and pushed (`eb886fd`); nothing has been merged into `master` or `main`, and the preservation branch is unchanged. No manual acceptance has happened.
+Active: Desktop application and its Windows executable, Website (+ WebSocket gateway), server, database setup, GitHub handoff and clone reproducibility.
+**Paused: Android/APK** (sources preserved and unchanged, no hardware validation, not built or tested in this phase). Phase 20 has not been started.
 
-**For the owner now:** the short ordered checklist with a result sheet is `docs/owner_manual_test_checklist.md`; the test-result values and charts for
-the project report are in `docs/report/` (`test_results_summary.md`, `test_results_values.csv`, `charts/*.png|svg`; regenerate with
-`python scripts/make_report_charts.py`).
+Manual acceptance by the owner is still the gate for any further release step (`docs/owner_manual_test_checklist.md`; full reference `docs/manual_acceptance_checklist.md`). Report data for the project report: `docs/report/`.
+
+### Handoff / fresh-clone audit (2026-10-26)
+
+Done from a fresh clone of `master` (`8f376f4`) in a scratch directory, with a new Python 3.12.10 venv, a throwaway PostgreSQL 17.11 cluster (own data directory, port 55432 -- the owner's database and roles were not touched), a new `.env`, new TLS certificates, on Windows 11. The fixes below were applied to the clone as a patch.
+
+| Step | Result |
+|---|---|
+| `pip install -r requirements.txt -r requirements-dev.txt` on 3.12.10, then `pip check` | VERIFIED: installs, no broken requirements |
+| `python -m alembic upgrade head` on the empty database | VERIFIED: 17 migrations, head `e8c2a6d4f1b9` |
+| `scripts/setup_database_roles.py` after the migrations | VERIFIED: 12 of 12 checks pass, re-run is idempotent, Alembic works as `qrscs_migrator` |
+| `scripts/generate_dev_certs.py` | VERIFIED (after fix 2) |
+| `python run.py` (server, gateway, Website, Desktop window) on alternate ports | VERIFIED: all four start; the Desktop window opens |
+| Website: two accounts register, log in, verify each other, establish a key and exchange a message each way (Chrome, headless) | VERIFIED |
+| `python scripts/build_desktop_exe.py` | VERIFIED: builds and self-validates (314 files; the owner's last build reported 316 -- difference not investigated) |
+| Regression batch `crypto_unit` | VERIFIED: 421 passed. The other 14 batches were **not** run in the clone (stopped on request) |
+| After fix 6: Kivy installs, `pip check` clean, the 8 Kivy test files collect (35 tests, not run) | VERIFIED |
+| Desktop sign-in / messaging driven in the clone; the acceptance suite; the built executable launched; a second physical computer | **NOT VERIFIED** |
+
+Defects found and fixed:
+
+1. **README order was wrong**: `setup_database_roles.py` before `alembic upgrade head` crashes on an empty database (after creating the roles and losing their passwords). The README now migrates first; the script now refuses, changing nothing, if the schema is missing.
+2. `python scripts/generate_dev_certs.py` failed with `No module named 'config'` (repository root not on `sys.path`). Fixed in the script.
+3. `.env.example` pre-filled `MIGRATION_DATABASE_URL` with `REPLACE_PASSWORD`, which Alembic would have tried to use, and `DATABASE_URL` did not match the bootstrap step. Both corrected; JWT issuer/audience now carry their real defaults.
+4. `run.py` ignored `SERVER_PORT`, hard-coded the Website/gateway ports, and reported success when another program already held a port. It now reads `SERVER_PORT`, offers `--web-port`, `--gateway-port`, `--no-desktop`, and checks `.env`, certificates and ports first.
+5. `tests/test_configuration_separation.py` asserted the default port 5000 against the machine's real `.env`, so changing `SERVER_PORT` (the documented port-conflict fix) failed two tests. Now independent of `.env`.
+6. **`kivy` is imported by 8 mobile test files and pinned in `buildozer.spec` but was declared in neither requirements file**; the `mobile` regression batch could not even be collected on a fresh install. Kivy 2.3.1 and its resolved dependencies are now in `requirements-dev.txt` (test-only; Android itself untouched).
+7. The owner's checklists and two script docstrings hard-coded the owner's personal venv path and clone folder; now generic.
+
+Dependency inventory (source imports vs manifests): every third-party package imported by production code (PySide6, SQLAlchemy, alembic, psycopg2, argon2-cffi, PyJWT, pycryptodome, cryptography, kyber-py, python-dotenv, websockets) is in `requirements.txt`. Test/build-only packages (pytest, quickjs, playwright, PyInstaller, Kivy) are in `requirements-dev.txt`. `prompt_toolkit` is imported only by the unused terminal prototype (`utils/terminal_ui.py`, no supported entry point) and is deliberately not declared. No `pyproject.toml`, lock file, CI configuration or frontend package manifest exists (the Website has no build step or npm dependency); the two pinned requirements files are the single source. System prerequisites that pip cannot install: PostgreSQL 17, Python 3.12, Git, and Chrome (tests only). No system FFmpeg is needed.
+
+Latest test counts, recorded on the owner's machine and **not re-run in this audit**: 2,188 passed over 15 regression batches and 33 acceptance tests passed (2026-10-22, see the history below).
+
+### Needs the owner
+
+* Review and merge the work branch into `master` (pull request) so a fresh clone receives the fixes above.
+* Follow the README on a second Windows computer; sign in on the Desktop and Website and send messages (the NOT VERIFIED items).
+* Manual acceptance round 2 (`docs/owner_manual_test_checklist.md`).
+
+---
+
+# History (superseded by the section above)
+
+The checkpoints below are dated records of earlier work. Statements in them about what was merged, uncommitted or pushed describe **that** moment only; the branch and merge state is the table above.
 
 ## Checkpoint 2026-10-22 (third part) — joining a group by invitation; the Desktop adopts the Website's look and navigation
 

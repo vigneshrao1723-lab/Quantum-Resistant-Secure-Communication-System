@@ -209,6 +209,7 @@ Quantum-Resistant-Secure-Communication-System/
 ├── payload/                   # File/text payload adapters
 ├── utils/                    # Wire protocol, request/response registry, helpers
 ├── gui/                      # PySide6 windows/widgets (chat, login, dialogs)
+├── web/                      # Website: client/ (static HTML/JS) and gateway/ (WebSocket -> server bridge)
 ├── scripts/                  # Dev tooling (e.g. certificate generation)
 ├── certs/                     # Development TLS certificates
 ├── benchmark/                 # Performance benchmarking scripts
@@ -218,7 +219,8 @@ Quantum-Resistant-Secure-Communication-System/
 ├── config.py                  # Client-side configuration
 ├── config_server.py            # Server-side configuration (JWT, storage root, etc.)
 ├── logger_config.py
-├── main.py                     # GUI application entry point
+├── main.py                     # Desktop application entry point
+├── run.py                      # Combined launcher: server + gateway + Website + Desktop
 ├── requirements.txt             # Runtime dependencies
 ├── requirements-dev.txt          # Test + benchmark dependencies
 ├── README.md
@@ -247,98 +249,169 @@ The project has completed a multi-slice migration moving client-local database/s
 
 Earlier foundational work (multi-client TCP communication, username-based sessions, AES/RSA/Kyber cryptography, PostgreSQL-backed persistence, TLS transport, JWT authentication) predates and underlies this migration series and remains in place.
 
-**D8 status note**: the D8 commit is on `master` but, as of this document, `master` has not been pushed to `origin`, and there are further uncommitted, in-progress changes on top of it to `client/session.py`, `server/client_handler.py`, and `tests/tls_test_support.py` addressing an intermittent TLS test-harness instability. Treat D8 as committed but not yet fully closed out.
+**D8 status note**: D8 and everything after it, through Phase 19.24 (the Desktop/Website completion work), is merged into `master` (pull request #1, merge commit `8f376f4`) and pushed to `origin`. The earlier intermittent TLS test-harness instability was addressed by the Phase 19.24 work. See [`PROJECT_STATE.md`](PROJECT_STATE.md) for the current branch heads and verification record.
 
-**Origin-authentication hardening (post-D8, in progress on top of the same branch)**: subsequent work added ML-DSA-65 origin authentication across the protocol — public-identity announcements, chat messages, Kyber group/direct-key distribution, and RSA session-key delivery each now require a valid signature, verified against a locally held, explicitly human-verified peer identity, before being trusted or installed. This also closed a confirmed vulnerability in which an unauthenticated legacy Kyber session-key packet shape could have been used by a malicious server to install an attacker-chosen key (`client/session.py::handle_session_key()`; that packet shape is now rejected outright, before any decryption). This work is committed on top of D8 but predates any formal slice numbering in this table — see [Security Model](#security-model) for what it actually provides.
+**Origin-authentication hardening (post-D8, complete)**: subsequent work added ML-DSA-65 origin authentication across the protocol — public-identity announcements, chat messages, Kyber group/direct-key distribution, and RSA session-key delivery each now require a valid signature, verified against a locally held, explicitly human-verified peer identity, before being trusted or installed. This also closed a confirmed vulnerability in which an unauthenticated legacy Kyber session-key packet shape could have been used by a malicious server to install an attacker-chosen key (`client/session.py::handle_session_key()`; that packet shape is now rejected outright, before any decryption). This work is committed on top of D8 but predates any formal slice numbering in this table — see [Security Model](#security-model) for what it actually provides.
 
 ---
 
 ## Testing
 
-The suite currently collects **1,541 tests** across 120 files (`pytest --collect-only -q`, reconfirmed during Phase 19.17 — all 1,541 pass). This count changes as work continues — treat it as a snapshot, not a maintained guarantee; run `pytest --collect-only -q` yourself for the exact current figure rather than trusting this number indefinitely.
+The most recent complete run of the regression runner (`python scripts/run_regression_batches.py`, 15 batches, owner's machine, 2026-10-22) passed **2,188 tests**, and the Desktop-executable + Website acceptance suite passed 33 (see [`PROJECT_STATE.md`](PROJECT_STATE.md)). Treat these as a dated snapshot; `pytest --collect-only -q` gives the current count.
 
-Tests require a running local PostgreSQL instance and a `DATABASE_URL` pointing at it (see [Installation / Setup](#installation--setup)) — `tests/conftest.py` wraps each test in a transaction that's rolled back on teardown, so no test data persists, but a real database connection is required for the suite to run at all (SQLite is not supported).
+Tests require a running local PostgreSQL instance and a `DATABASE_URL` pointing at it (see [Getting Started on Windows](#getting-started-on-windows)) — `tests/conftest.py` wraps each test in a transaction that's rolled back on teardown, so no test data persists, but a real database connection is required for the suite to run at all (SQLite is not supported).
 
-Install the test dependencies (see below) and run the suite with:
-
-```bash
-pytest -q
-```
+Install `requirements-dev.txt` and follow [Running tests](#running-tests) (focused commands and the batch runner). Do not run one bare `pytest` over the whole tree on Windows.
 
 Performance measurements for the ML-DSA-65 signature primitive (key generation/signing/verification) are documented separately — see [ML-DSA Benchmark](docs/benchmark/ml_dsa_benchmark.md). For a reproducible walkthrough of the malicious-relay/security-rejection defense (and an FYP presentation guide built on it), see [Security Rejection Demonstration](docs/demo/security_rejection_demo.md) and [FYP Presentation Guide](docs/demo/fyp_presentation_guide.md).
 
 ---
 
-## Installation / Setup
+## Getting Started on Windows
 
-Clone the repository:
+This is the one supported setup path for **Windows 10/11 (64-bit)**. Commands are for **PowerShell** run from the repository root. The steps were followed from a fresh clone of `master` (results and exact versions: [`PROJECT_STATE.md`](PROJECT_STATE.md)).
 
-```bash
+### What you need installed first
+
+| Requirement | Version | Notes |
+|---|---|---|
+| Python | **3.12.x** (tested 3.12.10) | Install from python.org with the *py launcher*. **Not 3.13 / 3.14**: the dependencies are pinned for 3.12 (e.g. PySide6 6.9.1). |
+| PostgreSQL | **17** (tested 17.11) | Includes `psql`. Remember the password you give the `postgres` user. The server does **not** work with SQLite. |
+| Git | any recent | |
+| Google Chrome | optional | Only for the Website browser tests / acceptance suite. The Website itself is plain HTML/JS. |
+
+Things that are deliberately **not in the repository** and must be created on every machine: PostgreSQL itself and its database, `.env` (secrets), `certs/` (TLS keys), the virtual environment `venv/`, the built executable `dist/`, and each user's key store under `%LOCALAPPDATA%\QuantumResistantSecureComms`. No external service, FFmpeg, Node.js or system certificate tool is needed (audio/video playback uses the FFmpeg plugin bundled inside PySide6).
+
+### 1. Clone
+
+```powershell
 git clone https://github.com/vigneshrao1723-lab/Quantum-Resistant-Secure-Communication-System.git
 cd Quantum-Resistant-Secure-Communication-System
 ```
 
-Create and activate a virtual environment (Python 3.12):
+`master` is the default branch. (The remote also has an old, unrelated `main` branch — ignore it.)
 
-```bash
-python -m venv venv
-venv\Scripts\activate        # Windows
+### 2. Virtual environment and dependencies
+
+```powershell
+py -3.12 -m venv venv
+venv\Scripts\Activate.ps1
+python --version                       # must print Python 3.12.x
+python -m pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-Install runtime dependencies, and — if you'll be running tests or the benchmark — the development dependencies too:
+* `requirements.txt` = everything needed to **run** the server, gateway, Website and Desktop. `requirements-dev.txt` adds the test tools, Playwright (browser tests), PyInstaller (executable build) and Kivy (mobile unit tests only). Install both unless you only want to run the application.
+* If PowerShell refuses to run `Activate.ps1`: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`, or use `venv\Scripts\activate.bat` from cmd.
+* Open a new terminal later? Activate the venv again. Every command below uses the `python` of the activated venv.
 
-```bash
-pip install -r requirements.txt
-pip install -r requirements-dev.txt   # tests (pytest) + benchmark; skip for a pure runtime install
+### 3. Create the database
+
+```powershell
+& "C:\Program Files\PostgreSQL\17\bin\psql.exe" -U postgres -c "CREATE DATABASE qrscs;"
 ```
 
-### PostgreSQL
+(`psql` asks for the `postgres` password; you can type just `psql` if PostgreSQL's `bin` folder is on your PATH.)
 
-The server requires a running local PostgreSQL instance — SQLite is not supported (`config_server.py` rejects a `sqlite` URL at startup). Install PostgreSQL 17 (or another recent PostgreSQL version), then create an empty database for the project:
+### 4. Create `.env` (local secrets — never commit it)
 
-```sql
-CREATE DATABASE qrscs;
+```powershell
+Copy-Item .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(64))"
 ```
 
-### Environment configuration
+Open `.env` in an editor and set:
 
-Copy the template and fill in real local values — **`.env` holds real database credentials and the JWT signing secret and must never be committed** (it's already covered by `.gitignore`):
+* `JWT_SECRET_KEY` — the random value just printed (the server refuses to start with the placeholder).
+* `DATABASE_URL` — the **administrator** login for this one-time setup: `postgresql+psycopg2://postgres:<postgres-password>@localhost:5432/qrscs` (percent-encode special characters in the password, e.g. `@` → `%40`).
 
-```bash
-cp .env.example .env
+Leave the rest as it is; `MIGRATION_DATABASE_URL` stays commented out. `.env` is covered by `.gitignore`.
+
+### 5. TLS certificates (local development CA)
+
+```powershell
+python scripts/generate_dev_certs.py
 ```
 
-Set `JWT_SECRET_KEY` to a real random value (see the generation command inside `.env.example`) — the server refuses to start with the built-in development placeholder — and, for the one-time bootstrap below, point `DATABASE_URL` at the database you just created using an administrator login:
+Creates `certs/dev/` (`ca.crt`, `ca.key`, `server.crt`, `server.key`; SANs `127.0.0.1` and `localhost`, gitignored). Re-run it to renew. To reach the server from another computer, set `TLS_CERT_SANS` (see `.env.example`) before generating. Details: [TLS transport](docs/architecture/tls_transport.md).
 
+### 6. Create the database schema
+
+```powershell
+python -m alembic upgrade head
+python -m alembic current              # should end with: e8c2a6d4f1b9 (head)
 ```
-DATABASE_URL=postgresql+psycopg2://<admin-user>:<admin-password>@localhost:5432/qrscs
-```
 
-**The server never runs as a database superuser.** Create the least-privilege roles it runs with:
+Run this **before** step 7 (still as the administrator login from step 4). It applies all 17 migrations to the empty database.
 
-```bash
+### 7. Least-privilege database roles
+
+```powershell
 python scripts/setup_database_roles.py
 ```
 
-This creates `qrscs_app` (the runtime login: read/write on the application tables, no schema changes, no superuser rights) and `qrscs_migrator` (owns the schema; used only by Alembic), writes their random passwords into `.env` as `DATABASE_URL` and `MIGRATION_DATABASE_URL`, moves the administrator credential out of the project folder to `~/.qrscs/admin.env`, and verifies the restrictions. It is safe to re-run (`--rotate` issues new passwords). There is deliberately no default `DATABASE_URL`: if it is missing the server stops instead of guessing a login.
+The server never runs as a superuser. This creates `qrscs_app` (runtime: read/write on the application tables, no schema changes) and `qrscs_migrator` (owns the schema; used by Alembic), rewrites `DATABASE_URL` / `MIGRATION_DATABASE_URL` in `.env` with their random passwords, moves the administrator login to `%USERPROFILE%\.qrscs\admin.env` (outside the repository), and prints a `[PASS]` line for each permission check. It stops without changing anything if step 6 was skipped, and is safe to re-run (`--rotate` issues new passwords). Future schema upgrades: `python -m alembic upgrade head` again (it now uses the migrator role).
 
-### Database schema
+### 8. Start everything
 
-Apply the Alembic migrations to the database you just created:
-
-```bash
-alembic upgrade head
+```powershell
+python run.py
 ```
 
-Alembic connects with `MIGRATION_DATABASE_URL` (the schema-owning role) when it is set, so the runtime role never needs DDL rights.
+`run.py` is the supported combined launcher. It checks `.env`, the certificates and the ports first, then starts, in order:
 
-### TLS certificates
+| Component | Command it runs | Address |
+|---|---|---|
+| Secure chat server (TLS) | `python -m server.server` | `127.0.0.1:5000` (`SERVER_PORT` in `.env`) |
+| Web gateway (WebSocket → server) | `python -m web.gateway.gateway` | `ws://127.0.0.1:8765` |
+| Website (static files) | `python -m http.server 8000 --directory web/client` | **http://127.0.0.1:8000** |
+| Desktop application | `python main.py` | a window |
 
-Development TLS certificates are generated locally and are **not committed** (`certs/` is gitignored — see `docs/architecture/tls_transport.md`):
+Press **Ctrl+C** in that terminal to stop everything. Options: `--no-desktop` (no Desktop window), `--web-port N`, `--gateway-port N` (when 8000 / 8765 are taken; the Website address is then printed with a `?gateway=ws://127.0.0.1:N` suffix). To run the pieces yourself, start the first three commands in separate activated terminals, then `python main.py`.
 
-```bash
-python scripts/generate_dev_certs.py
+### 9. Create two accounts and send a message
+
+1. In the Desktop window (or the Website) choose **Create an account** and enter a display name, a **phone number** (7–15 digits, e.g. `+91 98765 43210` — this is what you sign in with) and a password of at least 12 characters with upper-case, lower-case, a digit and a special character. Create a second account the same way.
+2. **Second Desktop instance:** open another activated terminal and run `python main.py` (not `run.py`, which would try to start a second server). Sign in with the *other* account — two windows signed in as the *same* account share one key file. For a second Website user use another browser profile or a private window.
+3. In one window search for the other person (phone number or @handle) and open the chat. Both sides compare the **safety number** and confirm it, then press **Establish key**. Messaging is intentionally blocked until the identity is verified. Send a message each way.
+
+The full owner checklist is in [`docs/owner_manual_test_checklist.md`](docs/owner_manual_test_checklist.md) and [`docs/manual_acceptance_checklist.md`](docs/manual_acceptance_checklist.md).
+
+### Running tests
+
+All tests use the real PostgreSQL from your `.env` (each test is rolled back); SQLite is not supported. Start small:
+
+```powershell
+python -m pytest tests/test_aes.py tests/test_kyber.py tests/test_ml_dsa.py -q          # pure crypto, no database
+python -m pytest tests/test_user_repository.py tests/test_database_least_privilege.py -q # needs the database and step 7
+python -m pytest tests/test_configuration_separation.py -q
 ```
+
+The whole regression suite (15 curated batches, several minutes to an hour; the Website batches need Chrome, the `mobile` batch needs Kivy from `requirements-dev.txt`):
+
+```powershell
+python scripts/run_regression_batches.py            # all batches, with counts
+python scripts/run_regression_batches.py --list     # show the batches
+python scripts/run_regression_batches.py --batch crypto_unit
+```
+
+Do not run a bare `pytest` over everything in one process on Windows; the batch runner exists because that is unreliable (see [testing strategy](docs/architecture/testing_strategy.md)). The acceptance suite is described under [Acceptance tests](#acceptance-tests-separate-from-the-regression-batches).
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `DATABASE_URL must be set…` or `JWT_SECRET_KEY must be set…` | No `.env`, or the placeholder is still there. Repeat step 4. Run commands from the repository root. |
+| `ModuleNotFoundError` for PySide6, sqlalchemy, kyber_py, websockets… | The venv is not activated, or the install was skipped / used another Python. Check `python --version` (3.12.x) and `python -c "import sys; print(sys.prefix)"` (must be the `venv` folder), then re-run step 2. |
+| `password authentication failed` / `connection refused` on port 5432 | Wrong password in `DATABASE_URL`, PostgreSQL service not running (`Get-Service postgresql*`), or a different port. Percent-encode `@`, `:`, `/`, `#`, `%` in the password. |
+| `relation "users" does not exist` | Migrations not applied: `python -m alembic upgrade head`. |
+| `setup_database_roles.py`: "no application schema yet" | Run step 6 first. |
+| `setup_database_roles.py`: "not a superuser" or WARNING about the role | `DATABASE_URL` in `.env` is not the administrator login. Put it back (step 4), or set `QRSCS_ADMIN_DATABASE_URL`; use `--rotate` if roles exist from an earlier attempt. |
+| `FileNotFoundError` for `server.crt` / "TLS … not found" | Run step 5. |
+| TLS certificate verify failed / hostname mismatch | The address in `SERVER_HOST` is not in the certificate's SANs: set `TLS_CERT_SANS`, regenerate, restart. After regenerating, rebuild the executable (it bundles `ca.crt`). |
+| `Port 5000 … already in use` | Another program or an earlier run holds it. Stop it, set another `SERVER_PORT` in `.env`, or use `run.py --web-port` / `--gateway-port` for the Website ports. Find the owner: `Get-NetTCPConnection -LocalPort 5000 -State Listen`. |
+| Website says it cannot connect | The gateway is not running, or the page's *Connection settings* gateway address differs from the gateway's port. |
+| Windows blocks `QRSCS-Desktop.exe` ("Windows protected your PC", Smart App Control, Application Control) | The executable is **unsigned**. Choose *More info → Run anyway*, retry once (a freshly built file was blocked once and ran on the next attempt), or run the Desktop from source with `python main.py`. |
+| Two Desktop windows fail to rebuild the executable | Windows locks files of a running executable; close all `QRSCS-Desktop` windows before `python scripts/build_desktop_exe.py`. |
 
 ### Packaging a source archive
 
@@ -353,25 +426,9 @@ It archives only what Git considers part of the project (so everything in `.giti
 
 ---
 
-## Running the Application
-
-Start the server (must be run as a module from the repository root, due to its internal package-relative imports):
-
-```bash
-python -m server.server
-```
-
-Start the client GUI (from the repository root):
-
-```bash
-python main.py
-```
-
-Multiple client instances can be run concurrently against the same server for multi-user testing.
-
 ### Windows Desktop executable
 
-Build the Desktop client into a one-folder Windows application (inside the project's Python 3.12 virtual environment, with `requirements-dev.txt` installed):
+Build the Desktop client into a one-folder Windows application (inside the activated Python 3.12 virtual environment, with `requirements-dev.txt` installed, after step 5 so `certs/dev/ca.crt` exists; close any running `QRSCS-Desktop` window first):
 
 ```bash
 python scripts/build_desktop_exe.py
@@ -381,13 +438,15 @@ The result is `dist/desktop/QRSCS-Desktop/QRSCS-Desktop.exe`; distribute the who
 
 ### Acceptance tests (separate from the regression batches)
 
-`tests/acceptance/` drives the **built executable** and the **Website in Chrome** through their real user interfaces against an isolated PostgreSQL database (`qrscs_accept`, created by `scripts/acceptance_db.py`, least-privilege roles). Build the executable first, then:
+`tests/acceptance/` drives the **built executable** and the **Website in Chrome** through their real user interfaces against an isolated PostgreSQL database (`qrscs_accept`, created by `scripts/acceptance_db.py` with the roles from step 7 and the administrator login that step saved in `%USERPROFILE%\.qrscs\admin.env`). Needs Chrome. Build the executable first, then:
 
 ```bash
 python -m pytest tests/acceptance -p no:cacheprovider
 ```
 
-### Android
+### Android (paused)
+
+**Android/APK work is paused**: the sources under `mobile/` and the Buildozer files are preserved unchanged (also on the `preservation/android-desktop-web-baseline-2026-10-20` branch) and nothing in the Desktop/Website setup above needs them.
 
 Building the Android APK requires WSL2 (Buildozer/python-for-android have no native Windows target). From inside an already-provisioned WSL2 environment (see `docs/architecture/mobile_client.md`'s "Phase 19.7" section for the one-time SDK/NDK/JDK setup):
 
@@ -411,7 +470,7 @@ This swaps in the Android entrypoint (`mobile/android_main.py`), runs Buildozer,
 
 Message-level digital signatures and explicit (non-TOFU) out-of-band peer verification, previously listed here as gaps, are now implemented — see [Security Model](#security-model). The following remain known, unaddressed gaps in the current implementation (not a committed roadmap):
 
-- A GUI surface for the backend's peer-verification and security-rejection state (fingerprint dialogs, verification badges, rejection notifications) — the backend exposes this (`ClientSession.security_rejection`, `confirm_peer_verification()`), but no UI consumes it yet.
+- (Resolved) The peer-verification and security-rejection state now has a GUI on both Desktop and Website (safety-number dialogs, verification badges, rejection notices).
 - Non-repudiation as a stronger guarantee than "a valid signature proves possession of the signing key" — no revocation or dispute-resolution mechanism exists around ML-DSA signatures.
 - A message/blob deletion lifecycle (`encrypted_blob_store.delete_blob()` exists but is currently unused in any production code path).
 - Traffic/metadata privacy protections.

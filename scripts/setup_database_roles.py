@@ -141,6 +141,17 @@ def main() -> int:
         print("ERROR: the administrator credential is not a superuser; nothing changed.", file=sys.stderr)
         return 2
 
+    # The grants below name tables that only exist once the schema has been
+    # migrated. Stop before changing anything (a role created here whose
+    # password then never reached .env would be unusable) and say what to do.
+    cur.execute("SELECT to_regclass('public.alembic_version') IS NOT NULL "
+                "AND to_regclass('public.users') IS NOT NULL")
+    if not cur.fetchone()[0]:
+        print(f"ERROR: database {dbname!r} has no application schema yet; nothing changed.\n"
+              "       Run `alembic upgrade head` first (with DATABASE_URL still set to the\n"
+              "       administrator login), then run this script.", file=sys.stderr)
+        return 2
+
     ident = sql.Identifier
     new_passwords: dict[str, str] = {}
 

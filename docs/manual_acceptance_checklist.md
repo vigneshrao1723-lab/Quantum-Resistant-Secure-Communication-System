@@ -17,8 +17,8 @@ screen is 1536 x 864 (logical pixels).
 support. In PowerShell:
 
 ```powershell
-cd C:\Project\Quantum-Resistant-Secure-Communication-System
-$py = "C:\Users\Vignesh T\venvs\qrscs312\Scripts\python.exe"
+cd <your clone of the repository>
+$py = ".\venv\Scripts\python.exe"   # the python.exe of your repository venv (README, step 2)
 ```
 
 | Step | Command | Expected |
