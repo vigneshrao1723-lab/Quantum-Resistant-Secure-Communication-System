@@ -3,6 +3,79 @@
 Kept current at each checkpoint. Facts only: every result below names the command or test that produced it.
 Anything not listed as verified is not verified. The first section is the current state; everything after "History" is dated and may be out of date.
 
+## Final validation (2026-11-15)
+
+Run on the owner's laptop on 2026-11-15, the day before the interview. This section is newer than "Current state (2026-10-26)" below and supersedes its test counts; nothing below it was edited. Every result names the command that produced it. Anything not listed here as verified is not verified.
+
+### F1-F8 (definitions from the owner's hand-over)
+
+| ID | Item | Status | Where (verified in the code, and by tests) |
+|---|---|---|---|
+| F1 | Device ids must be canonical UUIDs | Fixed | `client/session.py:154` `_is_device_id()`; `web/client/app.js:90` `isDeviceId()` |
+| F2 | Wrong target (device id and fingerprint) rejected | Fixed | `client/session.py` `handle_device_key_sync()` (`WRONG_RECEIVER`); `web/client/app.js` `wrong_receiver` |
+| F3 | Epoch must be a real integer (bool, string, float and values below 1 rejected) | Fixed | `client/session.py:1967`; `web/client/app.js:2731` |
+| F4 | The Website never overwrites a key it already holds for an epoch | Fixed | `web/client/app.js:1504-1513` (`_installSessionKey`) |
+| F5 | Replay freshness of key-sync packages | **NOT fixed (open)** | The signed key-sync payload carries no nonce or timestamp (`crypto/device_protocol.py:184` `canonical_device_key_sync_payload`; `web/client/app.js:2762`) |
+| F6 | No plaintext or key material in logs | Fixed and audited | Every f-string log call in client, server and gateway, and the Website's `this.log` calls, was read; `tests/test_cross_device_review_fixes.py:400` |
+| F7 | The safety-number dialog defaults to "No" | Fixed | `gui/device_management_dialog.py:288-289` |
+| F8 | Epoch upper bound 4294967295, checked before signature verification and before the key store is touched | Fixed | `client/session.py:151,1967`; `web/client/app.js:95,2731` |
+
+Committed as `f43a0b9` on `work/desktop-web-completion-2026-10-20` and pushed (fast-forward). `master` and the preservation branch were not touched.
+
+### Results (current runs only)
+
+| What | Command | Result |
+|---|---|---|
+| Focused F1-F8 tests | `pytest` on `test_cross_device_*`, `test_device_key_sync*`, `test_epoch_and_domain_security`, `test_device_identity`; and the two `test_web_cross_device_*_e2e` files | 93 passed (non-Website) + 9 passed (Website e2e) |
+| Full regression, run 1 | `python scripts/run_regression_batches.py` | 2,186 passed, 4 failed. All four passed when re-run alone, and their batch passed 177/177 on re-run. Not reproduced; the cause was not established (another project's test and server processes were running at the time). |
+| Full regression, run 2 | `python scripts/run_regression_batches.py` (15 batches, with the four new test files added to `BATCHES`) | **2,244 passed, 0 failed**, 2,177 s. The new files add 54 collected tests (4 + 41 + 1 + 8) |
+| Desktop build | `scripts/build_desktop_exe.py` on the pinned venv | 314 files; the package validator passed; the old build was copied to `qrscs-artifacts/backup-20261115` first |
+| Acceptance suite against the fresh exe | `python -m pytest tests/acceptance` on the isolated database `qrscs_accept` | **33 passed of 33** (295 s). With Smart App Control on, the same suite gave 8 passed, 24 errors (all blocked, see below) and 1 failed (a precondition of the confidentiality scan that needs the exe scenarios) |
+| Demo stack cold start | `scripts/start_demo.py`, then logins through the real apps | Listening in 7 s; Website HTTP 200; server TLS 1.3 verified against the dev CA; Website login restored the browser's identity; Desktop logged in twice with an app restart and no new key store was created; 0 server errors |
+| Release archive | `scripts/package_release.py` | `dist/qrscs-source-20261115.zip`, 513 files, `--verify` OK (source only, not the exe) |
+
+Tests were run against an isolated PostgreSQL database (`qrscs_accept`, and `qrscs_demo` for the demo), never the development database `qrscs`, on the pinned interpreter `venvs\qrscs312` (the repository's own `venv\` has no `kivy`, `quickjs` or `PyInstaller`).
+
+Not yet committed at the time of writing: `scripts/run_regression_batches.py` (adds the four new test files) and the new scripts `start_demo`, `stop_demo`, `seed_demo_accounts` (`.py`/`.cmd`), `launch_desktop_fallback.cmd` and `open_demo_website.cmd`.
+
+### Limitation: Windows Smart App Control blocks the unsigned executable
+
+With Smart App Control on, Windows refuses to start `QRSCS-Desktop.exe` (`OSError [WinError 4551]`, Code Integrity event 3077). Both the 29 Oct build and the 15 Nov build are `NotSigned`. The owner turned Smart App Control off on 2026-11-15; it cannot be turned on again without resetting Windows. On a machine where it is on, either run the Desktop from source with `scripts/launch_desktop_fallback.cmd` (the virtual environment's `pythonw.exe` is signed by the Python Software Foundation), or sign the executable with a certificate Windows trusts. A self-signed certificate does not satisfy Smart App Control.
+
+### Still open
+
+* **F5**: replay freshness is not addressed (above).
+* **V6e (revoked-device reconnect)**: recorded as a known limitation by the label in the owner's hand-over. Its defect description is not in this repository and it was **not reproduced or re-tested in this run (NOT VERIFIED)**. No backend behaviour was changed. The related, tested rule is in `docs/architecture/multi_device_identity.md:445` (a revoked device cannot bind a session on reconnect).
+* A second physical computer was not used: **NOT VERIFIED**.
+
+### Code review of five questions (read-only; nothing was changed)
+
+| # | Question | Verdict | Evidence |
+|---|---|---|---|
+| 1 | AES-GCM nonce | PASS | Fresh random 12-byte nonce per encryption, `crypto/aes.py:63,126` (`get_random_bytes`); the Website uses `crypto.getRandomValues` (`web/client/crypto.js:306`). There is no counter, so a repeat is not impossible, only negligible (about 2^-33 after 2^32 messages under one key); no per-key message limit exists in the code. **Finding:** `AESCipher(key=None)` silently uses a fixed, public 32-byte key (`crypto/aes.py:36-37`); every Desktop call site checks for `None` first (`client/session.py:2529, 2684, 2763, 2937, 3004, 3808, 6827`), the mobile client was not checked. |
+| 2 | PQC libraries | ML-KEM-768: FAIL as a production claim. ML-DSA-65: NOT VERIFIED | ML-KEM-768 is `kyber-py==1.2.0` (`requirements.txt:15`, `crypto/kyber.py:22`). Its own packaged documentation says "Under no circumstances should this be used for cryptographic applications", calls itself an educational tool, and says the code is not constant time and not designed against side-channel attacks. ML-DSA-65 is the `cryptography` 49.0.0 `mldsa` module (`crypto/ml_dsa.py:28`, backed by OpenSSL through the library's Rust bindings); the installed files contain no production-readiness statement for ML-DSA specifically. The Website uses `@noble/post-quantum` (`web/client/crypto.js:20-21`), whose documentation was not checked. |
+| 3 | Desktop reconnect after a server restart | FAIL (it does not reconnect by itself) | `client/receiver.py` ends the receive loop and emits `connection_changed(False)`; the Desktop shows a banner "...until you sign in again" with a "Sign in again" button (`gui/chat_window.py:851-876`); there is no reconnect loop in `client/` or `gui/`. The Website does reconnect by itself (`web/client/app.js:540-596`). Pinned by `tests/acceptance/test_reconnect.py` (passed). |
+| 4 | Website key sync: all earlier epochs or only the current one | NOT VERIFIED | By code, "blank = all" sends every epoch the browser holds (`syncAllConversationKeysToDevice`, `web/client/app.js:2656-2672`, called from `web/client/main.js:5587`); typing a conversation id sends only the current epoch, always labelled "direct" (`main.js:5592`). No test syncs two or more epochs of one conversation (the tests assert `sent >= 1` for a single key). |
+| 5 | Do login or registration reveal which accounts exist? | PASS for login replies; FAIL for the rest | A wrong password and an unknown phone number get the same reply (`server/client_handler.py:3976-3982`; `test_a_wrong_password_and_an_unknown_phone_number_look_identical` passed). Not hidden: locked and inactive accounts have their own messages (`auth/authentication_service.py:275, 285`); registration says a phone number already has an account (`:51, :138`) and a username is taken (`:618, :625`). Timing: an unknown phone returns before any password hash is checked (`:257-267` against `:289`), so the paths differ; the size of the difference was **not measured**. |
+
+### Known limitations recorded by the code review (none fixed; no code was changed)
+
+* **`AESCipher` default key** (`crypto/aes.py:36-37`): `AESCipher(key=None)` silently uses a fixed, public 32-byte key instead of raising. Every Desktop call site checks for `None` before constructing the cipher (`client/session.py:2529, 2684, 2763, 2937, 3004, 3808, 6827`), so it is not reachable there today; the mobile client was not checked. `tests/test_aes.py:33` relies on the fallback, so removing it means changing that test too.
+* **The Desktop does not reconnect by itself** after the server restarts: the receive loop ends (`client/receiver.py`) and the person must click "Sign in again" (`gui/chat_window.py:851-876`). The Website does reconnect by itself (`web/client/app.js:540-596`). The behaviour is pinned by `tests/acceptance/test_reconnect.py`.
+* **Account enumeration is not fully closed.** A wrong password and an unknown phone number get the same login reply (tested), but: a locked or inactive account gets its own message (`auth/authentication_service.py:275, 285`); registration says a phone number already has an account and that a username is taken (`:51, :138, :618, :625`); and an unknown phone number returns before any password hash is checked (`:257-267` against `:289`), so response timing can differ. The size of the timing difference was not measured.
+* **Website multi-epoch key sync is untested.** By code, "blank = all" sends every epoch the browser holds (`web/client/app.js:2656-2672`, `web/client/main.js:5587`), but no test syncs two or more epochs of one conversation (the tests assert `sent >= 1`), so earlier group epochs reaching another device is not verified. Typing a conversation id sends only the current epoch and always labels it "direct" (`web/client/main.js:5592`).
+* **`scripts/stop_demo.py` can report a failure after a successful stop.** Observed once: `taskkill /T` exited non-zero because some child processes had already exited, so the script printed an error and returned 3 although the stack and its ports were gone; the leftover record `logs/demo/stack.json` was removed by the next stop run. Earlier stop runs exited 0. The fix (treat the stop as done once the recorded root process is gone and the ports are free) was not applied in this documentation-only pass.
+
+### PostgreSQL exposure
+
+`listen_addresses = '*'` (`postgresql.conf`), so PostgreSQL 17 listens on all interfaces (`0.0.0.0:5432` and `[::]:5432`), **not** on loopback only. `pg_hba.conf` allows only `127.0.0.1/32`, `::1/128` and local connections (all `scram-sha-256`), so a remote client could open a connection but not authenticate. No enabled inbound Windows Firewall rule for port 5432 or PostgreSQL was found; reachability from another host was not tested (NOT VERIFIED). A Docker container belonging to another project also publishes host port 5432; `scripts/start_demo.py` reports that clash and pins the demo stack to `127.0.0.1`. Deliberately unchanged until after the interview; the minimal fix is `listen_addresses = 'localhost'` plus a service restart.
+
+### Demo deployment (this laptop is the server)
+
+Start with `scripts/start_demo.cmd` (checks the PostgreSQL service and ports 5000, 8765 and 8010, then runs `run.py --no-desktop --web-port 8010` against the demo database `qrscs_demo`); stop with `scripts/stop_demo.cmd`. The demo accounts `demo_alice` (Desktop) and `demo_bob` (Website, Chrome profile `~/.qrscs/demo-chrome-bob`, opened by `scripts/open_demo_website.cmd`) were created through the real applications; their phone numbers and passwords are in `~/.qrscs/demo_accounts.txt`, outside the repository.
+
+---
+
 ## Current state (2026-10-26)
 
 ### Branches (verified with `git ls-remote --heads origin` on 2026-10-26)
