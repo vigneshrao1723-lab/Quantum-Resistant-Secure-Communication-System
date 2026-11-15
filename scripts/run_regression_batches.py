@@ -289,6 +289,8 @@ BATCHES: dict[str, list[str]] = {
     # (every one of these passes standalone).
     "desktop_gui_lifecycle_b1": [
         "tests/test_device_management.py",
+        "tests/test_cross_device_history.py",
+        "tests/test_cross_device_review_fixes.py",
         "tests/test_peer_profile_picture_viewing.py",
         "tests/test_phase19_24_desktop_ui_wiring.py",
         "tests/test_phase19_24_desktop_mute.py",
@@ -310,6 +312,8 @@ BATCHES: dict[str, list[str]] = {
     # sanctioned remedy for long-process accumulation; no test was removed or weakened.
     "web_a": [
         "tests/test_web_browser_e2e.py",
+        "tests/test_web_cross_device_history_e2e.py",
+        "tests/test_web_cross_device_review_fixes_e2e.py",
         "tests/test_web_client_crypto_interop.py",
         "tests/test_web_feature_completion_e2e.py",
         "tests/test_web_gateway_interop.py",
