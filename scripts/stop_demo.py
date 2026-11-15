@@ -11,6 +11,7 @@ If the record is missing it only reports what is listening on 5000 / 8765 / 8010
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 import subprocess
@@ -34,6 +35,12 @@ def listeners(port):
         if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING" and parts[1].rsplit(":", 1)[-1] == str(port):
             found.add(int(parts[4]))
     return found
+
+
+def pid_alive(pid):
+    """True while a process with this id exists (``tasklist`` CSV: image, pid, ...)."""
+    out = run(["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"])
+    return any(len(row) > 1 and row[1] == str(int(pid)) for row in csv.reader(out.splitlines()))
 
 
 def command_line(pid):
@@ -66,8 +73,15 @@ def main():
           and "run.py" in cmd and "--no-desktop" in cmd):
         print(f"Stopping the demo stack (pid {pid}) and the processes it started...")
         out = subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, text=True)
-        if out.returncode != 0:
-            print("ERROR: taskkill failed:", re.sub(r"\s+", " ", out.stdout + out.stderr).strip(), file=sys.stderr)
+        # taskkill /T works through the whole tree and exits non-zero with "no running instance" for
+        # children that already ended when their parent was killed. That is not a failure. What decides
+        # success is that the recorded root process is gone (and, below, that the ports are free).
+        gone_by = time.monotonic() + 10
+        while pid_alive(pid) and time.monotonic() < gone_by:
+            time.sleep(0.2)
+        if pid_alive(pid):
+            print(f"ERROR: could not stop pid {pid}:", re.sub(r"\s+", " ", out.stdout + out.stderr).strip(),
+                  file=sys.stderr)
             return 3
     else:
         print(f"ERROR: pid {pid} is not this repository's run.py (it is something else now); refusing to kill it.",
