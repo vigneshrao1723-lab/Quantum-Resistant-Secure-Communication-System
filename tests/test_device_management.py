@@ -19,7 +19,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 import client.session as client_session_module
 from client.session import ClientSession
@@ -85,6 +85,11 @@ def test_device_management_dialog_enrolls_this_device_on_first_open(running_serv
         _delete(payload["username"])
 
 
+def _confirm_safety_numbers(monkeypatch):
+    # Authorizing a device now asks the person to confirm its safety number.
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes))
+
+
 def test_device_management_dialog_authorizes_pending_device(running_server, monkeypatch, tmp_path):
     """Two devices of the same account: the first (bootstrap-
     AUTHORIZED) device's dialog sees the second (PENDING) device and
@@ -92,6 +97,7 @@ def test_device_management_dialog_authorizes_pending_device(running_server, monk
     tests/test_device_identity.py already proves, exercised here
     through the actual dialog action handler."""
 
+    _confirm_safety_numbers(monkeypatch)
     payload = _register("dm_auth_")
     first = _new_device_session(running_server, monkeypatch, payload, tmp_path / "first")
     second = _new_device_session(running_server, monkeypatch, payload, tmp_path / "second")
@@ -129,6 +135,7 @@ def test_device_management_dialog_revokes_authorized_device(running_server, monk
     sees the button in the first place (own_state gating in
     _refresh()), though the server would reject the call regardless."""
 
+    _confirm_safety_numbers(monkeypatch)
     payload = _register("dm_revoke_")
     first = _new_device_session(running_server, monkeypatch, payload, tmp_path / "first")
     second = _new_device_session(running_server, monkeypatch, payload, tmp_path / "second")

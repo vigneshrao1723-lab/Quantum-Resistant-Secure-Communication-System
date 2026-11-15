@@ -34,12 +34,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from gui.styles import COLOR_CLASSICAL, COLOR_DANGER, COLOR_ONLINE, COLOR_TEXT_MUTED
+from storage.secure_key_store import PEER_STATE_VERIFIED
 
 _STATE_COLORS = {
     "AUTHORIZED": COLOR_ONLINE,
@@ -63,6 +65,8 @@ class DeviceManagementDialog(QDialog):
         self._status_label = QLabel("")
         self._status_label.setWordWrap(True)
 
+        self._bound_while_authorized = False
+
         self._device_list = QListWidget()
 
         refresh_button = QPushButton("Refresh")
@@ -79,8 +83,18 @@ class DeviceManagementDialog(QDialog):
         button_row.addStretch()
         button_row.addWidget(close_button)
 
+        own_number = self.session.get_own_fingerprint()
+        self._own_number_label = QLabel(
+            f"This device's safety number (read it to the other device when it asks you to compare):\n"
+            f"{own_number or 'Not available yet.'}"
+        )
+        self._own_number_label.setWordWrap(True)
+        self._own_number_label.setTextFormat(Qt.PlainText)
+        self._own_number_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Devices enrolled on this account"))
+        layout.addWidget(self._own_number_label)
         layout.addWidget(self._device_list)
         layout.addWidget(self._status_label)
         layout.addLayout(button_row)
@@ -148,6 +162,23 @@ class DeviceManagementDialog(QDialog):
         )
         viewer_is_authorized = own_state == "AUTHORIZED"
 
+        # Enrollment bound this connection while the device was still
+        # PENDING; once another device authorizes it, bind again so the
+        # server will relay key packages to it.
+        if viewer_is_authorized and not self._bound_while_authorized:
+            try:
+                bind_result = self.session.bind_device_session()
+            except Exception as error:  # noqa: BLE001
+                bind_result = {"success": False, "error": str(error)}
+
+            if bind_result.get("success"):
+                self._bound_while_authorized = True
+            else:
+                self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+                self._status_label.setText(
+                    bind_result.get("error") or "Could not bind this device to the connection."
+                )
+
         self._device_list.clear()
 
         for device in devices:
@@ -196,6 +227,28 @@ class DeviceManagementDialog(QDialog):
             )
             detail_row.addWidget(authorize_button)
 
+        if viewer_is_authorized and not is_self and state == "AUTHORIZED":
+            if self.session.get_peer_verification_state(device_id) == PEER_STATE_VERIFIED:
+                send_keys_button = QPushButton("Send keys")
+                send_keys_button.setToolTip(
+                    "Send this device's conversation keys to that verified device so it can read your history."
+                )
+                send_keys_button.setCursor(Qt.PointingHandCursor)
+                send_keys_button.clicked.connect(
+                    lambda checked=False, d=device: self._handle_send_keys(d)
+                )
+                detail_row.addWidget(send_keys_button)
+            else:
+                verify_button = QPushButton("Verify")
+                verify_button.setToolTip(
+                    "Compare this device's safety number with the one it shows, to trust it with your keys."
+                )
+                verify_button.setCursor(Qt.PointingHandCursor)
+                verify_button.clicked.connect(
+                    lambda checked=False, d=device: self._handle_verify(d)
+                )
+                detail_row.addWidget(verify_button)
+
         if viewer_is_authorized and state == "AUTHORIZED":
             revoke_button = QPushButton("Revoke")
             revoke_button.setObjectName("DangerButton")
@@ -216,9 +269,47 @@ class DeviceManagementDialog(QDialog):
     # Actions
     # ==========================================================
 
+    def _confirm_safety_number(self, title, device, fingerprint, consequence):
+        """Ask the person to compare ``fingerprint`` -- computed here from the device's keys, not
+        taken from the server -- with the number the OTHER device shows for itself. "No" is the
+        default, so pressing Enter never trusts a device."""
+
+        name = device.get("device_name") or device.get("device_id")
+
+        answer = QMessageBox.question(
+            self,
+            title,
+            f"Check that \"{name}\" shows exactly this as its own safety number:\n\n"
+            f"{fingerprint}\n\n"
+            "Where to find it on that device: Website - open a contact's safety details and choose "
+            "\"Show my safety number\"; Desktop - open this Devices window (\"This device's safety number\") "
+            "or Verify identity on a contact (\"Your safety number\").\n\n"
+            f"If it differs in any way, choose No. {consequence}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        return answer == QMessageBox.Yes
+
     def _handle_authorize(self, device):
+        device_id = device.get("device_id")
+
         try:
-            result = self.session.authorize_device(device.get("device_id"), device.get("fingerprint"))
+            fingerprint = self.session.observe_own_device(device)
+        except Exception as error:  # noqa: BLE001
+            self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+            self._status_label.setText(str(error))
+            return
+
+        if not self._confirm_safety_number(
+            "Authorize device", device, fingerprint,
+            "Authorizing lets this device sign in as you and request your conversation keys.",
+        ):
+            return
+
+        try:
+            self.session.confirm_device_peer_verification(device_id, fingerprint)
+            result = self.session.authorize_device(device_id, fingerprint)
         except Exception as error:  # noqa: BLE001
             self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
             self._status_label.setText(str(error))
@@ -231,6 +322,56 @@ class DeviceManagementDialog(QDialog):
         else:
             self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
             self._status_label.setText(result.get("error") or "Could not authorize device.")
+
+    def _handle_verify(self, device):
+        device_id = device.get("device_id")
+        name = device.get("device_name") or device_id
+
+        try:
+            fingerprint = self.session.observe_own_device(device)
+        except Exception as error:  # noqa: BLE001
+            self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+            self._status_label.setText(str(error))
+            return
+
+        if not self._confirm_safety_number(
+            "Verify device", device, fingerprint,
+            "A verified device can be sent your conversation keys.",
+        ):
+            return
+
+        try:
+            self.session.confirm_device_peer_verification(device_id, fingerprint)
+        except Exception as error:  # noqa: BLE001
+            self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+            self._status_label.setText(str(error))
+            return
+
+        self._status_label.setStyleSheet(f"color: {COLOR_ONLINE};")
+        self._status_label.setText(f"Verified {name}.")
+        self._refresh()
+
+    def _handle_send_keys(self, device):
+        device_id = device.get("device_id")
+        name = device.get("device_name") or device_id
+
+        try:
+            self.session.observe_own_device(device)
+            sent, failures = self.session.sync_all_conversation_keys_to_device(device_id)
+        except Exception as error:  # noqa: BLE001
+            self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+            self._status_label.setText(str(error))
+            return
+
+        if failures:
+            self._status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+            self._status_label.setText(
+                f"Sent {sent} key(s) to {name}; {len(failures)} could not be sent "
+                f"({failures[0][2] or 'rejected'}). Is {name} online and bound?"
+            )
+        else:
+            self._status_label.setStyleSheet(f"color: {COLOR_ONLINE};")
+            self._status_label.setText(f"Sent {sent} conversation key(s) to {name}.")
 
     def _handle_revoke(self, device):
         try:

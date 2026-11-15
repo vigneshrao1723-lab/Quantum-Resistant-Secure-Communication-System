@@ -1035,7 +1035,7 @@ def test_load_conversation_history_returns_placeholder_without_session_key(
         history = alice.load_conversation_history(bob_payload["username"])
 
         assert len(history) == 1
-        assert history[0]["text"] == "Message unavailable (encrypted in a previous session)"
+        assert history[0]["text"] == client_session_module._UNDECRYPTABLE_PLACEHOLDER
     finally:
         alice.disconnect()
         _delete_user(alice_payload["username"])

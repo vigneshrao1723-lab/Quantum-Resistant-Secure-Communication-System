@@ -136,9 +136,39 @@ from utils.protocol import (
 from utils.request_registry import PendingRequestRegistry, RequestTimeoutError
 
 # Placeholder shown for a historical message that cannot be decrypted
-# with the currently cached AES session key (e.g. it was encrypted in
-# a previous run, under a key that no longer exists in memory).
-_UNDECRYPTABLE_PLACEHOLDER = "Message unavailable (encrypted in a previous session)"
+# or origin-verified on THIS device: its AES session key and/or the
+# signing identity that authenticated it are not held in this device's
+# local key store (e.g. the conversation was held on another device or
+# in the Website, or the key store here is new). Keys are per device;
+# the server never holds them, so nothing can be recovered from here.
+_UNDECRYPTABLE_PLACEHOLDER = (
+    "Message unavailable on this device "
+    "(its keys are held by another device or an earlier session)"
+)
+
+
+# The signed key-sync payload carries the epoch as an unsigned 32-bit field.
+_MAX_KEY_EPOCH = 2**32 - 1
+
+
+def _is_device_id(value):
+    """
+    True only for a canonical 36-character UUID string, the form the
+    server issues device ids in. Peer trust state is looked up by a
+    bare identifier string, shared between contacts (usernames) and
+    this account's own devices (device ids); usernames are at most 32
+    characters (users.username is String(32)), so accepting only a
+    36-character UUID as a device id means a device id -- which the
+    server chooses in a device list -- can never name a contact.
+    """
+
+    if not isinstance(value, str) or len(value) != 36:
+        return False
+
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
 
 # Server-Untrusted Identity Verification, Stage 2: a purely in-memory,
 # session-local peer-verification state, layered on top of
@@ -525,6 +555,11 @@ class ClientSession(QObject):
         # enroll_device() -- see that method's own docstring for why
         # this is session-local, not yet persisted.
         self.device_id = None
+
+        # Signing keys of this account's OTHER devices that this device
+        # has explicitly verified, resolved lazily while loading history
+        # (see _verified_own_device_signing_keys()); reset on every load.
+        self._history_own_device_keys = None
 
         # BUG 1 -- local encrypted key store, opened at login.
         # None until unlocked (or if unlocking failed); key_store_error
@@ -1691,19 +1726,141 @@ class ClientSession(QObject):
         public key with KeyManager (add_public_key()) so wrap_key_
         for_member()/encapsulation can target this device_id, exactly
         like an ordinary peer's public key already is registered by
-        handle_public_key()."""
+        handle_public_key().
+
+        ``device_id`` must be a UUID (see _is_device_id()), so a device
+        entry can never be recorded under a contact's name. If this
+        device was already VERIFIED under a different identity, the
+        disagreement is flagged KEY_CHANGED by observe_peer_identity()
+        and the stored encryption key is left as it was."""
+
+        if not _is_device_id(device_id):
+            raise ValueError("A device id must be a UUID.")
+
+        identity_disagrees = self._is_verified_identity_mismatch(
+            device_id, kem_public_key_wire, ml_dsa_public_key
+        )
 
         self.observe_peer_identity(device_id, kem_public_key_wire, ml_dsa_public_key)
-        self.key_manager.add_public_key(device_id, kem_public_key_wire)
+
+        if not identity_disagrees:
+            self.key_manager.add_public_key(device_id, kem_public_key_wire)
 
     def confirm_device_peer_verification(self, device_id, fingerprint):
         self.confirm_combined_peer_verification(device_id, fingerprint)
 
-    def sync_conversation_key_to_device(self, target_device_id, conversation_id, package_type="direct"):
+    def observe_own_device(self, device):
         """
-        Wrap this client's own current key for ``conversation_id`` for
-        delivery to ``target_device_id`` (one of this SAME account's
-        other devices) and send it. Reuses KeyManager.
+        Observe one of this account's OTHER devices from a
+        list_devices() entry and return its fingerprint, computed here
+        from the key material itself (never the server's own
+        ``fingerprint`` field), for the person to compare with the one
+        the other device shows. The device stays UNVERIFIED until
+        confirm_device_peer_verification() is called.
+        """
+
+        device_id = device.get("device_id")
+
+        self.observe_device_peer_identity(
+            device_id,
+            device.get("kem_public_key"),
+            base64.b64decode(device.get("ml_dsa_public_key") or "", validate=True),
+        )
+
+        return self.get_peer_fingerprint_for_verification(device_id)
+
+    def sync_all_conversation_keys_to_device(self, target_device_id):
+        """
+        Send EVERY conversation key epoch this device holds to
+        ``target_device_id`` (one of this account's own devices, which
+        must already be device-peer VERIFIED), one signed package each
+        through sync_conversation_key_to_device() -- so every check
+        the server and the receiver make for a single key applies to
+        each one. Returns ``(sent_count, failures)`` where each failure
+        is ``(conversation_id, epoch, reason)``; one rejected package
+        never stops the rest.
+        """
+
+        group_ids = {
+            summary.conversation_id
+            for summary in self.conversation_store.get_all()
+            if summary.is_group
+        }
+
+        sent = 0
+        failures = []
+
+        for conversation_id, epochs in sorted(self.key_manager.export_conversation_keys().items()):
+            package_type = "group" if conversation_id in group_ids else "direct"
+
+            for epoch in sorted(epochs):
+                result = self.sync_conversation_key_to_device(
+                    target_device_id, conversation_id, package_type, epoch=epoch
+                )
+
+                if result.get("success"):
+                    sent += 1
+                else:
+                    failures.append((conversation_id, epoch, result.get("error")))
+
+        return sent, failures
+
+    def _verified_own_device_signing_keys(self):
+        """
+        ML-DSA public keys of this account's OTHER devices that this
+        device has explicitly device-peer VERIFIED -- the only keys,
+        besides its own, that can authenticate a message "you" sent.
+        A message sent from your other device is signed by that
+        device's key, not this one's.
+
+        The device list comes from the server but only nominates
+        candidates: a key is returned only if this device's own local
+        verification state holds it as VERIFIED (a person compared its
+        fingerprint), resolved from that local state, never from the
+        server's copy. Cached for the current history load.
+        """
+
+        if self._history_own_device_keys is not None:
+            return self._history_own_device_keys
+
+        keys = []
+
+        try:
+            devices = self.list_devices()
+        except (OSError, RequestTimeoutError) as error:
+            self.logger.warning(
+                f"Could not list this account's devices to verify own history: {error}"
+            )
+            devices = []
+
+        for device in devices:
+            device_id = device.get("device_id")
+
+            if (
+                not _is_device_id(device_id)
+                or device_id == self.device_id
+                or device.get("state") != "AUTHORIZED"
+            ):
+                continue
+
+            if not self._peer_key_is_verified(device_id):
+                continue
+
+            key = self._resolve_trusted_signing_key(device_id)
+
+            if key is not None:
+                keys.append(key)
+
+        self._history_own_device_keys = keys
+
+        return keys
+
+    def sync_conversation_key_to_device(self, target_device_id, conversation_id, package_type="direct", epoch=None):
+        """
+        Wrap this client's own key for ``conversation_id`` (its
+        current epoch, unless ``epoch`` names a specific one it holds)
+        for delivery to ``target_device_id`` (one of this SAME
+        account's other devices) and send it. Reuses KeyManager.
         wrap_key_for_member() completely unchanged -- the identical
         KEM-then-DEM (ML-KEM encapsulate + AES-256-GCM) composition
         ordinary group-key distribution already uses; no new
@@ -1713,12 +1870,17 @@ class ClientSession(QObject):
         session_key()'s identical guard for ordinary peers.
         """
 
+        if not _is_device_id(target_device_id):
+            raise ValueError("A device id must be a UUID.")
+
         if not self._peer_key_is_verified(target_device_id):
             raise PeerNotVerifiedError(
                 target_device_id, self.get_peer_verification_state(target_device_id)
             )
 
-        epoch = self.key_manager.current_epoch(conversation_id)
+        if epoch is None:
+            epoch = self.key_manager.current_epoch(conversation_id)
+
         key_bytes = self.key_manager.get_key(conversation_id, epoch=epoch)
 
         if key_bytes is None:
@@ -1770,11 +1932,43 @@ class ClientSession(QObject):
         source_device_id = packet.get("source_device_id")
         conversation_id = packet.get("conversation_id")
 
-        if not source_device_id or not conversation_id:
+        if not _is_device_id(source_device_id) or not conversation_id:
             self._report_security_rejection(
                 SecurityRejectionReason.MALFORMED_PACKET, source_device_id, conversation_id
             )
             return SecurityRejectionReason.MALFORMED_PACKET
+
+        # The package must be addressed to THIS device, by id and by
+        # the fingerprint of this device's own identity. Checked here,
+        # explicitly, rather than left to the later decryption failing
+        # for a package wrapped for some other device.
+        own_fingerprint = self.get_own_fingerprint()
+
+        if (
+            self.device_id is None
+            or packet.get("target_device_id") != self.device_id
+            or own_fingerprint is None
+            or packet.get("target_fingerprint") != own_fingerprint
+        ):
+            self._report_security_rejection(
+                SecurityRejectionReason.WRONG_RECEIVER, source_device_id, conversation_id
+            )
+            return SecurityRejectionReason.WRONG_RECEIVER
+
+        # Only an integer from 1 to 2**32 - 1 is a valid epoch: not a
+        # bool, float or string, which the signed payload's int()
+        # coercion would otherwise accept, and not a value the payload's
+        # unsigned 32-bit field cannot represent (the Website's encoder
+        # wraps such a value to a smaller one, so a rewritten epoch
+        # could still verify). Checked before the signature is verified
+        # and before anything touches the key store.
+        epoch = packet.get("epoch")
+
+        if type(epoch) is not int or not 1 <= epoch <= _MAX_KEY_EPOCH:
+            self._report_security_rejection(
+                SecurityRejectionReason.INVALID_EPOCH, source_device_id, conversation_id
+            )
+            return SecurityRejectionReason.INVALID_EPOCH
 
         if not self._peer_key_is_verified(source_device_id):
             reason = self._sender_trust_rejection_reason(source_device_id)
@@ -1792,7 +1986,6 @@ class ClientSession(QObject):
 
         target_device_id = packet.get("target_device_id")
         target_fingerprint = packet.get("target_fingerprint")
-        epoch = packet.get("epoch") or 1
         package_type = packet.get("package_type")
         encapsulation = packet.get("encapsulation")
         wrapped_key = packet.get("wrapped_key")
@@ -2340,7 +2533,7 @@ class ClientSession(QObject):
         )
 
         if payload_type == PayloadType.TEXT:
-            self.logger.info(f"SENT (Encrypted): {envelope.ciphertext}")
+            self.logger.info(f"SENT (Encrypted): {len(envelope.ciphertext)} characters of ciphertext")
         else:
             self.logger.info(
                 f"SENT (Encrypted {payload_type}): {len(envelope.ciphertext)} "
@@ -2860,6 +3053,7 @@ class ClientSession(QObject):
         """
 
         self.last_history_events = []
+        self._history_own_device_keys = None
 
         if self.current_conversation_id is None:
             return []
@@ -3625,8 +3819,10 @@ class ClientSession(QObject):
 
         if envelope.payload_type == PayloadType.TEXT:
 
+            # Metadata only: the decrypted text must never reach a log.
             self.logger.info(
-                f"RECEIVED: {sender}: {decrypted_content}"
+                f"RECEIVED: text message from {sender} "
+                f"({len(decrypted_content)} characters)"
             )
 
             self.conversation_store.record_message(
@@ -3996,6 +4192,11 @@ class ClientSession(QObject):
         peer-resolved one -- otherwise every message this user ever
         sent would fail its own signature check the moment it was
         loaded back from history, which would be a bug, not security.
+        A message this account sent from ANOTHER of its devices is
+        signed by that device's key; if this device's own key does not
+        verify it, the keys of this account's other devices that this
+        device has explicitly VERIFIED are tried too (see
+        _verified_own_device_signing_keys()) -- no other key is.
 
         Returns True only if the signature verified successfully.
         """
@@ -4012,7 +4213,18 @@ class ClientSession(QObject):
             )
             return False
 
-        if entry.get("is_own"):
+        is_own = bool(entry.get("is_own"))
+
+        # Whether a row is "mine" is the server's claim; a message I
+        # sent always carries my own username as its sender.
+        if is_own and sender != self.username:
+            self.logger.warning(
+                f"SECURITY: rejected a historical message flagged as "
+                f"sent by this account but claiming sender {sender}."
+            )
+            return False
+
+        if is_own:
             signing_public_key = self.key_manager.ml_dsa.export_public_key()
         else:
             signing_public_key = self._resolve_trusted_signing_key(sender)
@@ -4054,10 +4266,8 @@ class ClientSession(QObject):
             conversation_id = entry.get("conversation_id")
             purpose = MESSAGE_PAYLOAD_PURPOSE
 
-        try:
-            signature = base64.b64decode(signature_b64, validate=True)
-
-            verified = verify_message_payload(
+        def verify_with(public_key):
+            return verify_message_payload(
                 sender,
                 receiver,
                 conversation_id,
@@ -4066,9 +4276,23 @@ class ClientSession(QObject):
                 entry.get("content_metadata"),
                 entry.get("epoch"),
                 signature,
-                signing_public_key,
+                public_key,
                 purpose=purpose,
             )
+
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+
+            verified = verify_with(signing_public_key)
+
+            # A message "you" sent from another of this account's
+            # devices is signed by that device's key, not this one's.
+            # Only after this device's own key fails, and only against
+            # other devices this device has explicitly verified.
+            if not verified and is_own:
+                verified = any(
+                    verify_with(key) for key in self._verified_own_device_signing_keys()
+                )
 
         except (TypeError, ValueError) as error:
             self.logger.warning(

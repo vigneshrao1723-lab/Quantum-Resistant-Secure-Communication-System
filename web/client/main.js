@@ -5580,8 +5580,15 @@ document.getElementById("revokeDeviceBtn").addEventListener("click", async () =>
 
 document.getElementById("syncKeyBtn").addEventListener("click", async () => {
   const targetDeviceId = document.getElementById("targetDeviceId").value;
-  const conversationId = document.getElementById("syncConversationId").value;
+  const conversationId = document.getElementById("syncConversationId").value.trim();
   try {
+    if (!conversationId) {
+      // Blank = every conversation key this device holds.
+      const { sent, failures } = await session.syncAllConversationKeysToDevice(targetDeviceId);
+      appendLog(`Synced ${sent} conversation key(s) to device ${targetDeviceId}${failures.length ? `; ${failures.length} could not be sent (${failures[0].reason})` : ""}.`);
+      toast(failures.length ? `Synced ${sent} key(s); ${failures.length} failed` : `Synced ${sent} conversation key(s)`, failures.length ? "error" : "success");
+      return;
+    }
     await session.syncConversationKeyToDevice(targetDeviceId, conversationId, "direct");
     appendLog(`Synced conversation ${conversationId} to device ${targetDeviceId}.`);
     toast("Conversation key synced", "success");

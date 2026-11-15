@@ -831,7 +831,16 @@ def test_load_conversation_history_returns_placeholder_without_session_key(
         recipient_view.disconnect()
 
     assert len(history) == 1
-    assert history[0]["text"] == "Message unavailable (encrypted in a previous session)"
+    assert history[0]["text"] == client_session_module._UNDECRYPTABLE_PLACEHOLDER
+
+
+def test_placeholder_explains_the_keys_are_on_another_device():
+    # The text must say what is actually true -- the keys are not on
+    # THIS device -- not imply a recoverable "previous session".
+    text = client_session_module._UNDECRYPTABLE_PLACEHOLDER
+
+    assert "this device" in text
+    assert "another device" in text
 
 
 def test_load_conversation_history_decrypts_with_cached_session_key(
@@ -877,6 +886,65 @@ def test_load_conversation_history_decrypts_with_cached_session_key(
 
     assert len(history) == 1
     assert history[0]["text"] == plaintext
+
+
+def test_history_is_unavailable_on_a_new_device_but_intact_where_the_keys_are(
+    sender_and_recipient, running_server, monkeypatch
+):
+    """
+    A stored message must (1) read correctly where its key and the
+    sender's observed identity are held, (2) fail SAFELY -- placeholder,
+    never plaintext or garbage -- on a device that holds neither (a new
+    key store, e.g. the same account first signed in on the Desktop
+    after being used in the Website) or only a WRONG key, and (3) stay
+    stored unchanged, so it reads again wherever the right keys exist.
+    """
+
+    _state, port = running_server
+    monkeypatch.setattr(client_session_module, "SERVER_PORT", port)
+
+    sender_sock, sender_name, sender_id = sender_and_recipient["sender"]
+    recipient_sock, recipient_name, recipient_id = sender_and_recipient["recipient"]
+
+    session_key = b"K" * 32
+    plaintext = "readable only where the keys are"
+
+    packet, sender_signing_public_key = _signed_chat_packet(
+        sender_name,
+        recipient_name,
+        AESCipher(session_key).encrypt(plaintext),
+        datetime.now(timezone.utc).isoformat(),
+    )
+    _send(sender_sock, packet)
+    _recv_until(recipient_sock, lambda p: p.get("type") == "chat")
+    _wait_for_conversation_length(sender_id, recipient_id, 1)
+
+    def history_with(key, observed_identity):
+        view = _make_connected_session(sender_and_recipient["recipient_payload"])
+        try:
+            _open_direct_chat(view, sender_name)
+            if key is not None:
+                view.key_manager.store_key(view.current_conversation_id, key)
+            if observed_identity is not None:
+                view._observed_peer_signing_public_keys[sender_name] = observed_identity
+            return view.load_conversation_history(sender_name)
+        finally:
+            view.disconnect()
+
+    placeholder = client_session_module._UNDECRYPTABLE_PLACEHOLDER
+
+    # (1) the device that holds the key and the sender's identity
+    assert history_with(session_key, sender_signing_public_key)[0]["text"] == plaintext
+
+    # (2a) a new device: no key, no observed identity
+    assert history_with(None, None)[0]["text"] == placeholder
+
+    # (2b) identity known but the key is missing, then a WRONG key
+    assert history_with(None, sender_signing_public_key)[0]["text"] == placeholder
+    assert history_with(b"Z" * 32, sender_signing_public_key)[0]["text"] == placeholder
+
+    # (3) nothing above altered the stored message
+    assert history_with(session_key, sender_signing_public_key)[0]["text"] == plaintext
 
 
 # ----------------------------------------------------------------------

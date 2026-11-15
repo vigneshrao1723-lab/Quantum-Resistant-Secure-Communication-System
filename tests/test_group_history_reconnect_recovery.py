@@ -608,9 +608,7 @@ def test_direct_history_placeholder_after_restart_is_not_an_auth_error(
             fresh_session.disconnect()
 
         assert len(history) == 1
-        assert history[0]["text"] == (
-            "Message unavailable (encrypted in a previous session)"
-        )
+        assert history[0]["text"] == client_session_module._UNDECRYPTABLE_PLACEHOLDER
         assert "expired" not in history[0]["text"].lower()
     finally:
         sender_sock.close()

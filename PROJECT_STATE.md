@@ -9,15 +9,15 @@ Anything not listed as verified is not verified. The first section is the curren
 
 | Branch | Purpose | Remote head |
 |---|---|---|
-| `master` | **Default branch.** Merge commit of pull request #1 (`work/desktop-web-completion-2026-10-20` into `master`) | `8f376f4` |
-| `work/desktop-web-completion-2026-10-20` | Active Desktop/Website/setup branch. Everything up to `b6a6e42` is already contained in `master`; the handoff/dependency fixes below are on this branch only until a new pull request is merged | `git ls-remote --heads origin` |
+| `master` | **Default branch.** Includes the merged pull request from `work/desktop-web-completion-2026-10-20` (`merge pull request #2`) | `594a9d0` |
+| `work/desktop-web-completion-2026-10-20` | The merged Desktop/Website/setup work branch; its setup/dependency fixes are now contained in `master` via the PR merge | `2805318` |
 | `preservation/android-desktop-web-baseline-2026-10-20` | Safety checkpoint of everything before the Desktop/Website completion work, including all Android sources. **Do not delete.** Unchanged | `3861769` |
 | `main` | An older, unrelated prototype history on the remote (no common ancestor with `master`). Untouched; nothing merged from it | `a97ceb5` |
 
-History of `master`: `22a6a73` (previous baseline) -> merge `8f376f4` (brings in `3861769` preservation checkpoint, `eb886fd` Phase 19.24, `b6a6e42` state note).
+History of `master`: `22a6a73` (earlier baseline) -> `8f376f4` (merge PR #1) -> `594a9d0` (merge PR #2, bringing in `2805318` / the fresh-clone setup fixes).
 Remote: `https://github.com/vigneshrao1723-lab/Quantum-Resistant-Secure-Communication-System`
 
-A teammate who clones gets `master`; the setup fixes below reach `master` only when the owner merges this work branch.
+A fresh clone of `master` now includes the work-branch fixes because the PR has already been merged; the work branch is preserved and kept for reference.
 
 ### Scope
 

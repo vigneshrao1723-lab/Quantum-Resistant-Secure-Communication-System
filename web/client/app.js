@@ -78,8 +78,21 @@ const SECURITY_REJECTION_MESSAGES = {
   invalid_signature: "it failed authentication",
   malformed_packet: "it was malformed",
   decryption_failure: "it could not be processed safely",
+  wrong_receiver: "it was not addressed to this device",
+  invalid_epoch: "it carried an invalid key epoch",
   other_security_rejection: "it failed a security check",
 };
+
+// A device id is a canonical 36-character UUID. Peer trust is looked up by a bare identifier shared
+// between contacts (usernames, at most 32 characters) and this account's own devices, so accepting
+// only a UUID here means a device entry -- which the server chooses -- can never name a contact.
+const DEVICE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isDeviceId(value) {
+  return typeof value === "string" && DEVICE_ID_PATTERN.test(value);
+}
+
+// The signed key-sync payload carries the epoch as an unsigned 32-bit field.
+const MAX_KEY_EPOCH = 2 ** 32 - 1;
 
 export class WebClientSession {
   constructor({
@@ -230,6 +243,7 @@ export class WebClientSession {
     // a restored session resolves to the SAME device_id rather than
     // minting a new device every login.
     this.deviceId = null;
+    this._historyOwnDeviceKeys = null; // see _verifiedOwnDeviceSigningKeys()
 
     // Phase 19.24 -- Mute: conversationId -> {mutedUntil: string|null}
     // (an ISO-8601 UTC timestamp, or the literal "forever"). LOCAL
@@ -1487,7 +1501,17 @@ export class WebClientSession {
       history = new Map();
       this.keyHistory.set(conversationId, history);
     }
-    if (Number.isInteger(epoch)) history.set(epoch, key);
+    // Never replace the key already held for an epoch (mirrors KeyManager.store_key()): a repeated
+    // or conflicting delivery for the same epoch changes nothing.
+    if (Number.isInteger(epoch)) {
+      const existing = this.sessionKeys.get(conversationId);
+      const held = history.get(epoch) || (existing && existing.epoch === epoch ? existing.key : null);
+      if (held) {
+        history.set(epoch, held);
+        return;
+      }
+      history.set(epoch, key);
+    }
 
     const current = this.sessionKeys.get(conversationId);
     if (current && Number.isInteger(current.epoch) && Number.isInteger(epoch) && epoch < current.epoch) return;
@@ -1968,6 +1992,7 @@ export class WebClientSession {
     if (result.error) throw new Error(result.error);
 
     const messages = result.messages || [];
+    this._historyOwnDeviceKeys = null;
     let loadedCount = 0;
     let seen = this._renderedMessageIds.get(conversationId);
     if (!seen) { seen = new Set(); this._renderedMessageIds.set(conversationId, seen); }
@@ -2045,6 +2070,10 @@ export class WebClientSession {
           }
         }
 
+        // Whether a row is "mine" is the server's claim; a message I sent always carries my own
+        // username as its sender.
+        if (entry.is_own && entry.sender !== this.username) { release(); continue; }
+
         const signingPublicKey = entry.is_own
           ? this.signingKeypair.publicKey
           : this.peers.get(entry.sender)?.signingKey;
@@ -2081,6 +2110,14 @@ export class WebClientSession {
                 entry.payload_type || "text", ciphertext, entry.content_metadata, entry.epoch
               );
           verified = C.verifyPayload(signature, payload, signingPublicKey);
+          // A message "you" sent from another of this account's devices is signed by
+          // that device's key, not this one's: only after this device's own key fails,
+          // and only against other devices this one has explicitly verified.
+          if (!verified && entry.is_own) {
+            for (const deviceKey of await this._verifiedOwnDeviceSigningKeys()) {
+              if (C.verifyPayload(signature, payload, deviceKey)) { verified = true; break; }
+            }
+          }
         } catch {
           verified = false;
         }
@@ -2526,6 +2563,7 @@ export class WebClientSession {
   // what canonicalDeviceEnrollmentPayload()/fingerprintCombinedIdentity()
   // both expect.
   async observeDevicePeerIdentity(deviceId, kemPublicKeyWire, mlDsaPublicKeyB64) {
+    if (!isDeviceId(deviceId)) throw new Error("A device id must be a UUID.");
     const mlDsaPublicKey = C.base64ToBytes(mlDsaPublicKeyB64);
     const peer = await this._upsertPeerObservation(deviceId, kemPublicKeyWire, mlDsaPublicKey);
     this.log(`Observed device ${deviceId} (state: ${peer.state}).`);
@@ -2575,12 +2613,18 @@ export class WebClientSession {
   // cryptographic construction. Requires the target device to already
   // be device-peer VERIFIED, mirroring establishSessionKey()'s
   // identical guard for ordinary peers.
-  async syncConversationKeyToDevice(targetDeviceId, conversationId, packageType) {
+  //
+  // `epoch` names a specific past or current epoch this client holds;
+  // omitted, the current one is sent (unchanged behavior).
+  async syncConversationKeyToDevice(targetDeviceId, conversationId, packageType, epoch) {
+    if (!isDeviceId(targetDeviceId)) throw new Error("A device id must be a UUID.");
     if (!this.isPeerVerified(targetDeviceId)) {
       throw new Error(`Device ${targetDeviceId} is not VERIFIED -- cannot synchronize a key to it.`);
     }
     const sessionInfo = this.sessionKeys.get(conversationId);
-    if (!sessionInfo) throw new Error(`No key held for conversation ${conversationId} to synchronize.`);
+    const syncEpoch = epoch === undefined ? sessionInfo?.epoch : epoch;
+    const syncKey = epoch === undefined ? sessionInfo?.key : this._keyForEpoch(conversationId, epoch);
+    if (!syncKey) throw new Error(`No key held for conversation ${conversationId} to synchronize.`);
 
     const targetPeer = this.peers.get(targetDeviceId);
     const targetFingerprint = targetPeer.fingerprint;
@@ -2588,21 +2632,71 @@ export class WebClientSession {
     const targetKemPublicKeyRaw = C.base64ToBytes(targetPeer.kemWire);
     const { cipherText, sharedSecret } = C.kemEncapsulate(targetKemPublicKeyRaw);
     const encapsulationB64 = C.bytesToBase64(cipherText);
-    const wrappedKeyB64 = C.encryptForWire(sharedSecret, C.bytesToBase64(sessionInfo.key));
+    const wrappedKeyB64 = C.encryptForWire(sharedSecret, C.bytesToBase64(syncKey));
 
     const payload = C.canonicalDeviceKeySyncPayload(
       this.username, this.deviceId, targetDeviceId, targetFingerprint,
-      conversationId, sessionInfo.epoch, packageType || "direct", encapsulationB64, wrappedKeyB64
+      conversationId, syncEpoch, packageType || "direct", encapsulationB64, wrappedKeyB64
     );
     const signature = C.signPayload(this.signingKeypair.secretKey, payload);
 
     const result = await this._sendRequest(P.createDeviceKeySyncPacket(
-      targetDeviceId, targetFingerprint, conversationId, sessionInfo.epoch,
+      targetDeviceId, targetFingerprint, conversationId, syncEpoch,
       packageType || "direct", encapsulationB64, wrappedKeyB64, C.bytesToBase64(signature)
     ));
     if (!result.success) throw new Error(result.error || "Device key sync failed.");
     this.log(`Synchronized conversation ${conversationId} to device ${targetDeviceId}.`);
     return result;
+  }
+
+  // Mirrors ClientSession.sync_all_conversation_keys_to_device(): every
+  // key epoch this client holds, one signed package each through
+  // syncConversationKeyToDevice(), so every check made for a single key
+  // applies to each. One rejected package never stops the rest.
+  async syncAllConversationKeysToDevice(targetDeviceId) {
+    if (!this.isPeerVerified(targetDeviceId)) {
+      throw new Error(`Device ${targetDeviceId} is not VERIFIED -- cannot synchronize keys to it.`);
+    }
+    const conversationIds = new Set([...this.sessionKeys.keys(), ...this.keyHistory.keys()]);
+    let sent = 0;
+    const failures = [];
+    for (const conversationId of conversationIds) {
+      const epochs = new Set(this.keyHistory.get(conversationId)?.keys() || []);
+      const current = this.sessionKeys.get(conversationId);
+      if (current && Number.isInteger(current.epoch)) epochs.add(current.epoch);
+      const packageType = this.groups.has(conversationId) ? "group" : "direct";
+      for (const epoch of [...epochs].sort((a, b) => a - b)) {
+        try {
+          await this.syncConversationKeyToDevice(targetDeviceId, conversationId, packageType, epoch);
+          sent += 1;
+        } catch (error) {
+          failures.push({ conversationId, epoch, reason: error.message });
+        }
+      }
+    }
+    return { sent, failures };
+  }
+
+  // Mirrors ClientSession._verified_own_device_signing_keys(): signing keys
+  // of this account's OTHER devices that THIS device has explicitly
+  // verified -- the only keys, besides its own, that can authenticate a
+  // message "you" sent. The server's device list only nominates
+  // candidates; a key is used only if this device's own peer state holds
+  // that device as VERIFIED. Cached for the current history load.
+  async _verifiedOwnDeviceSigningKeys() {
+    if (this._historyOwnDeviceKeys) return this._historyOwnDeviceKeys;
+    const keys = [];
+    try {
+      for (const device of await this.listDevices()) {
+        if (!isDeviceId(device.device_id) || device.device_id === this.deviceId || device.state !== "AUTHORIZED") continue;
+        const peer = this.peers.get(device.device_id);
+        if (peer && peer.state === "VERIFIED" && peer.signingKey) keys.push(peer.signingKey);
+      }
+    } catch (error) {
+      this.log(`Could not list this account's devices to verify own history: ${error.message}`);
+    }
+    this._historyOwnDeviceKeys = keys;
+    return keys;
   }
 
   // Receive wrapped conversation/group key material pushed from
@@ -2612,12 +2706,30 @@ export class WebClientSession {
   // peer VERIFIED -> resolve trusted signing key from LOCAL state
   // only -> verify signature -> THEN decapsulate/decrypt -> install.
   async _handleDeviceKeySync(packet) {
-    if (packet.target_device_id !== this.deviceId) return; // routing noise, not a security event
-
     const { source_device_id: sourceDeviceId, conversation_id: conversationId, encapsulation, wrapped_key: wrappedKeyB64, epoch } = packet;
 
-    if (!sourceDeviceId || !conversationId) {
+    if (!isDeviceId(sourceDeviceId) || !conversationId) {
       this._reportSecurityRejection("malformed_packet", sourceDeviceId, conversationId);
+      return;
+    }
+
+    // Addressed to THIS device, by id and by the fingerprint of this device's own identity --
+    // checked explicitly rather than left to a later decryption failure.
+    if (
+      !this.deviceId
+      || packet.target_device_id !== this.deviceId
+      || packet.target_fingerprint !== await this.ownFingerprint()
+    ) {
+      this._reportSecurityRejection("wrong_receiver", sourceDeviceId, conversationId);
+      return;
+    }
+
+    // Only an integer from 1 to 2**32 - 1 is a valid epoch (not a boolean or string, which the signed
+    // payload's own coercion could otherwise let through, and not a value its unsigned 32-bit field
+    // cannot hold: u32be() wraps one, so a rewritten epoch would still verify) -- before the
+    // signature or any key state. A JSON 2.0 parses to the integer 2 and cannot be told apart.
+    if (!Number.isInteger(epoch) || epoch < 1 || epoch > MAX_KEY_EPOCH) {
+      this._reportSecurityRejection("invalid_epoch", sourceDeviceId, conversationId);
       return;
     }
 
@@ -2644,17 +2756,11 @@ export class WebClientSession {
       return;
     }
 
-    // packet.sender is the SERVER-authenticated source username,
-    // injected by server/device_handler.py::handle_device_key_sync()
-    // when relaying (relay_packet["sender"] = user.username) -- never
-    // client-claimed. Structurally always equal to this.username in
-    // practice (device_key_sync is only ever relayed between two
-    // devices of the SAME account -- the server itself enforces
-    // target_device.user_id == user.id), but read from the packet
-    // rather than assumed, exactly like every other sender field this
-    // client verifies.
+    // The package is bound to THIS account: the signed payload names this client's own username,
+    // never a username taken from the relayed packet (device_key_sync is only ever sent between
+    // two devices of the same account).
     const payload = C.canonicalDeviceKeySyncPayload(
-      packet.sender, sourceDeviceId, this.deviceId, packet.target_fingerprint,
+      this.username, sourceDeviceId, this.deviceId, packet.target_fingerprint,
       conversationId, epoch, packet.package_type, encapsulation, wrappedKeyB64
     );
 
